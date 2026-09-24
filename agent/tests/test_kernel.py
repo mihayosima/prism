@@ -17,6 +17,7 @@ from agent.api import (
     EventBus,
     MissingDependencyError,
     ServiceNotFoundError,
+    Services,
     plugin,
 )
 
@@ -261,7 +262,7 @@ def test_set_overrides_provided_service():
 def _bus() -> tuple[Context, EventBus]:
     root = Context(name="t")
     ev = EventBus()
-    root.provide("events", ev)
+    root.provide(Services.EVENTS, ev)
     return root, ev
 
 

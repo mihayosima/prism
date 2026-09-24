@@ -22,6 +22,7 @@ from .errors import (
     ServiceNotFoundError,
     TeardownError,
 )
+from .services_catalog import Services
 
 _MISSING: Any = object()
 
@@ -200,9 +201,9 @@ class Context:
     def on(self, name: str, handler: Callable, *,
            prepend: bool = False, once: bool = False) -> Callable[[], bool]:
         """注册事件监听器，绑定当前作用域（teardown 对称移除）。"""
-        events = self.get("events")
+        events = self.get(Services.EVENTS)
         if events is None or not hasattr(events, "on"):
-            raise ServiceNotFoundError("events", self._name,
+            raise ServiceNotFoundError(Services.EVENTS, self._name,
                                        action="ctx.on（事件总线未装配为 events 服务）")
         dispose = events.on(self, name, handler, prepend=prepend, once=once)
         self.effect(dispose)

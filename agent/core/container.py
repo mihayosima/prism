@@ -18,6 +18,7 @@ from .context import Context
 from .errors import AgentError, CyclicDependencyError, MissingDependencyError
 from .events_catalog import REQUIRED_SUBSCRIBER_EVENTS
 from .event_wiring import _verify_event_wiring
+from .services_catalog import Services
 
 
 def _coerce_list(value: Any) -> tuple[str, ...]:
@@ -291,7 +292,7 @@ class Container:
             self._assembled = True
             # P3：capability 接缝接线校验（装配期 fail-fast）+
             #     同源注入 bus.required_seams（运行期 waterfall 守卫）。
-            bus = self._root.get("events")
+            bus = self._root.get(Services.EVENTS)
             if bus is not None:
                 bus.required_seams = self._wiring_required()
                 if self._verify_wiring:

@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from agent.api import AgentError, CapabilityNotImplemented, Events, plugin
+from agent.api import AgentError, CapabilityNotImplemented, Events, Services, plugin
 
 
 class LlmProvider(Protocol):
@@ -278,8 +278,8 @@ class LlmPlugin:
 
     name = "agent.llm"
     layer = "system"
-    provides = ["llm"]
-    inject = ["events"]
+    provides = [Services.LLM]
+    inject = [Services.EVENTS]
 
     async def apply(self, ctx) -> None:
         cfg = ((ctx.config or {}).get("agent") or {}).get("llm") or {}
@@ -300,7 +300,7 @@ class LlmPlugin:
         else:
             provider = PlaceholderLlm(name_)
             model = model or name_
-        ctx.provide("llm", LlmService(provider, model))
+        ctx.provide(Services.LLM, LlmService(provider, model))
 
 
 __all__ = ["LlmPlugin", "LlmResult", "LlmService", "LlmProvider", "PlaceholderLlm", "_tokens"]

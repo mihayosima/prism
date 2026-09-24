@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from agent.api import plugin
+from agent.api import Services, plugin
 
 
 class AgentDriver(Protocol):
@@ -84,11 +84,11 @@ class Loop:
 
     name = "agent.loop"
     layer = "system"
-    provides = ["loop"]
-    inject = ["tasks", "events"]
+    provides = [Services.LOOP]
+    inject = [Services.TASKS, Services.EVENTS]
 
     async def apply(self, ctx) -> None:
-        ctx.provide("loop", ProduceDriver())
+        ctx.provide(Services.LOOP, ProduceDriver())
 
 
 __all__ = ["AgentDriver", "Loop", "ProduceDriver", "RunResult"]

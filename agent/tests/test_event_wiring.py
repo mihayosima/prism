@@ -19,7 +19,7 @@ import pathlib
 
 import pytest
 
-from agent.api import Container, EventBus, Events
+from agent.api import Container, EventBus, Events, Services
 from agent.core.errors import EventWiringError
 from agent.core.events_catalog import Events as _Events, REQUIRED_SUBSCRIBER_EVENTS
 from agent.sys.events_plugin import EventsPlugin
@@ -87,7 +87,7 @@ def test_assemble_verifies_wiring():
     from agent.profiles import build_agent
     c = build_agent()                       # 默认 verify_wiring=True
     _run(c.assemble())
-    bus = c.root.get("events")
+    bus = c.root.get(Services.EVENTS)
     # LLM_PRE_CALL 由 guard + budget 挂（≥1）；TASKS_PRE_EXECUTE 由 guard 挂（≥1）
     assert len(bus.listeners(Events.LLM_PRE_CALL)) >= 1
     assert len(bus.listeners(Events.TASKS_PRE_EXECUTE)) >= 1

@@ -20,7 +20,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from agent.api import AgentError, CapabilityNotImplemented, Events, plugin
+from agent.api import AgentError, CapabilityNotImplemented, Events, Services, plugin
 from agent.sys.audit import _now_iso, durable
 
 PLAN_SYSTEM = (
@@ -93,7 +93,7 @@ class ChatDriver:
         prior = history[:-1]              # 除本条外的最近历史 → 作为会话上下文喂给模型
         # 多步 ReAct（plugins.react，目录插件）：装配了则**委托**；缺省回退下方单步路径。
         # 契约不变：chat 只经 ctx.has("react") 感知其存在，不 import 其实现。
-        if ctx.has("react"):
+        if ctx.has(Services.REACT):
             return await self._send_via_react(ctx, message, session_id, prior)
         try:
             plan = await self._plan(ctx, message, prior)
@@ -114,7 +114,7 @@ class ChatDriver:
         reply_error = error if error is not None else (
             None if evidence.get("ok") else evidence.get("error"))
         # 记忆（长期）：本轮对话/决策喂给 memory（LLM 提取，guard/budget 照生效；失败不破坏主链路）
-        if ctx.has("memory"):
+        if ctx.has(Services.MEMORY):
             try:
                 await ctx.memory.remember(ctx, {
                     "user": message, "reply": text, "plan": plan, "evidence": evidence,
@@ -154,7 +154,7 @@ class ChatDriver:
             raise
         text = res.text or "（无回复）"
         await self._append(ctx, session_id, "assistant", text)
-        if ctx.has("memory"):
+        if ctx.has(Services.MEMORY):
             try:
                 await ctx.memory.remember(ctx, {
                     "user": message, "reply": text,
@@ -174,14 +174,14 @@ class ChatDriver:
     # ---------- 短期记忆：会话转写（session-scoped 历史） ----------
 
     async def _append(self, ctx, session_id: str, role: str, content: str) -> None:
-        if ctx.get("db") is None:
+        if ctx.get(Services.DB) is None:
             return
         await ctx.db.execute(
             ctx, "INSERT INTO agent_messages(session_id, role, content, at) VALUES (?,?,?,?)",
             (session_id, role, content, _now_iso()))
 
     async def _history(self, ctx, session_id: str, limit: int = HISTORY_LIMIT) -> list[dict]:
-        if ctx.get("db") is None:
+        if ctx.get(Services.DB) is None:
             return []
         rows = await ctx.db.query(
             ctx, "SELECT role, content FROM agent_messages WHERE session_id=?"
@@ -189,7 +189,7 @@ class ChatDriver:
         return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
     async def history(self, ctx, session_id: str = "default", limit: int = 100) -> list[dict]:
-        if ctx.get("db") is None:
+        if ctx.get(Services.DB) is None:
             return []
         rows = await ctx.db.query(
             ctx, "SELECT seq, role, content, at FROM agent_messages WHERE session_id=?"
@@ -197,17 +197,17 @@ class ChatDriver:
         return [dict(r) for r in rows]
 
     async def reset(self, ctx, session_id: str = "default") -> int:
-        if ctx.get("db") is None:
+        if ctx.get(Services.DB) is None:
             return 0
         rows = await ctx.db.query(
             ctx, "SELECT COUNT(*) AS n FROM agent_messages WHERE session_id=?", (session_id,))
         await ctx.db.execute(ctx, "DELETE FROM agent_messages WHERE session_id=?", (session_id,))
-        if ctx.has("events"):
+        if ctx.has(Services.EVENTS):
             await ctx.events.emit(Events.CHAT_RESET, {"session_id": session_id})
         return rows[0]["n"]
 
     async def _memory_block(self, ctx, query: str) -> str:
-        if not ctx.has("memory"):
+        if not ctx.has(Services.MEMORY):
             return ""
         try:
             return await ctx.memory.context(ctx, query, limit=5)
@@ -321,12 +321,12 @@ class Chat:
     name = "agent.chat"
     version = "0.1.0"
     layer = "business"
-    provides = ["chat"]
-    inject = ["llm", "tasks", "events", "db"]
+    provides = [Services.CHAT]
+    inject = [Services.LLM, Services.TASKS, Services.EVENTS, Services.DB]
     description = "对话驱动：意图规划 → 执行(guard) → LLM 解说"
 
     async def apply(self, ctx) -> None:
-        ctx.provide("chat", ChatDriver())
+        ctx.provide(Services.CHAT, ChatDriver())
 
 
 __all__ = ["Chat", "ChatDriver", "ChatReply"]

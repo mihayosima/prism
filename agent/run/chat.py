@@ -17,6 +17,7 @@ import json
 import sys
 import uuid
 
+from agent.api import Services
 from agent.profiles import build_agent
 from agent.sys.progress import tap_progress
 
@@ -539,7 +540,7 @@ async def _serve(args: argparse.Namespace) -> int:
 
     @app.get("/api/status")
     async def _status() -> dict:
-        svc = c.root.get("llm")
+        svc = c.root.get(Services.LLM)
         budget_cfg = ((c.root.config or {}).get("agent") or {}).get("budget") or {}
         return {"provider_label": getattr(svc, "provider_label", "?"),
                 "model": getattr(svc, "_model", "?"),
@@ -580,7 +581,7 @@ async def _serve(args: argparse.Namespace) -> int:
     @app.get("/api/memory")
     async def _memory() -> dict:
         # 记忆是目录插件（plugins.memory）：未启用 → 友好降级，不裸崩
-        if not c.root.has("memory"):
+        if not c.root.has(Services.MEMORY):
             return {"enabled": False, "stats": {"by_kind": {}, "total": 0}, "rows": []}
         stats = await c.root.memory.stats(c.root)
         rows = await c.root.db.query(

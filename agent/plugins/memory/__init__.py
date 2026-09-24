@@ -24,7 +24,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Any
 
-from agent.api import CapabilityNotImplemented, Events, plugin
+from agent.api import CapabilityNotImplemented, Events, Services, plugin
 from agent.sys.audit import _now_iso, durable
 
 logger = logging.getLogger("plugins.memory")
@@ -320,8 +320,8 @@ class Memory:
     name = "plugins.memory"
     version = "0.1.0"
     layer = "system"
-    provides = ["memory"]
-    inject = ["db", "events", "llm"]
+    provides = [Services.MEMORY]
+    inject = [Services.DB, Services.EVENTS, Services.LLM]
     tables = ("agent_memories", "agent_entities", "agent_memory_edges")
     description = "记忆：LLM 提取(过 guard/budget) → 打分衰减 → recall/context 注入"
 
@@ -333,7 +333,7 @@ class Memory:
             MemorySearch(half_life_days=float(cfg.get("half_life_days", 14.0)),
                          access_hl_days=float(cfg.get("access_hl_days", 7.0))),
         )
-        ctx.provide("memory", driver)
+        ctx.provide(Services.MEMORY, driver)
 
 
 __all__ = ["Memory", "MemoryItem", "MemoryDriver", "MemoryExtractor", "MemorySearch",

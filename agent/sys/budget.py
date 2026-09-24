@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from agent.api import Events, plugin
+from agent.api import Events, Services, plugin
 from agent.sys.audit import _now_iso
 from agent.sys.llm import _tokens
 
@@ -19,8 +19,8 @@ class Budget:
 
     name = "agent.budget"
     layer = "system"
-    provides = ["budget"]
-    inject = ["events", "db", "llm"]
+    provides = [Services.BUDGET]
+    inject = [Services.EVENTS, Services.DB, Services.LLM]
 
     async def apply(self, ctx) -> None:
         cfg = ((ctx.config or {}).get("agent") or {}).get("budget") or {}
@@ -55,7 +55,7 @@ class Budget:
             def _reset_session(_payload: dict) -> None:      # 同步：emit 内联执行，立即生效
                 ctx.state["budget_spent"] = 0
             ctx.on(Events.CHAT_RESET, _reset_session)
-        ctx.provide("budget", self)
+        ctx.provide(Services.BUDGET, self)
 
 
 __all__ = ["Budget"]

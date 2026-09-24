@@ -23,6 +23,7 @@ from agent.core.errors import (
 )
 from agent.core.events import EventBus
 from agent.core.events_catalog import Events, all_events, EVENT_MODE, REQUIRED_SUBSCRIBER_EVENTS
+from agent.core.services_catalog import ALL as SERVICE_KEYS, Services
 
 __all__ = [
     "__version__",
@@ -34,6 +35,9 @@ __all__ = [
     # context
     "Context",
     "State",
+    # services
+    "Services",
+    "SERVICE_KEYS",
     # events
     "EventBus",
     "Events",

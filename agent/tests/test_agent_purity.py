@@ -46,6 +46,21 @@ def test_core_never_imports_engine():
     assert not bad, f"内核 import 了引擎: {bad}"
 
 
+def test_core_never_imports_sys_or_plugins():
+    """K0 分层守卫：内核（core + 唯一出口 api）不得反向依赖 sys / plugins。
+
+    解耦的硬约束——内核是纯机制，不得获知业务/系统插件的具体实现位置。
+    """
+    bad: list[tuple[str, str]] = []
+    for fp in _core_py_files():
+        text = fp.read_text(encoding="utf-8")
+        for pat in ("from agent.sys", "from agent.plugins",
+                    "import agent.sys", "import agent.plugins"):
+            if pat in text:
+                bad.append((fp.name, pat))
+    assert not bad, f"内核反向依赖 sys/plugins: {bad}"
+
+
 def test_core_files_only_in_core_and_api():
     """内核实现只应存在于 agent/core 与 agent/api（出口）；sys/plugins 等不得 import core 内部。"""
     allowed = {fp.name for fp in _core_py_files()}

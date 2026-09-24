@@ -11,7 +11,7 @@ import asyncio
 
 import pytest
 
-from agent.api import Events
+from agent.api import Events, Services
 from agent.profiles import build_agent
 from agent.sys.progress import tap_progress
 
@@ -55,7 +55,7 @@ def test_tap_progress_degrades_without_react(tmp_path):
         await c.assemble()
         await c.start()
         try:
-            assert not c.root.has("react")
+            assert not c.root.has(Services.REACT)
             async with tap_progress(c.root) as q:
                 await c.root.events.emit(Events.TASKS_POST_EXECUTE,
                                          {"task": "agent.ping", "caller": "test"})

@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from agent.api import AgentError, CapabilityNotImplemented
+from agent.api import AgentError, CapabilityNotImplemented, Services
 from agent.profiles import build_agent
 
 
@@ -41,7 +41,7 @@ def test_storage_migrations_idempotent_restart(tmp_path):
         await c.teardown()
         c2 = build_agent(config={"db_path": path})
         await c2.assemble()          # 再次装配幂等，不重复建表
-        assert c2.root.has("db")
+        assert c2.root.has(Services.DB)
         await c2.teardown()
 
     _run(s())

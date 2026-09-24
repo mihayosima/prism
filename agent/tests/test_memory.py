@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from agent.api import Services
 from agent.profiles import build_agent
 from agent.sys.plugin_manager import PluginManager
 
@@ -156,9 +157,9 @@ def test_teardown_no_residue(tmp_path):
     async def s():
         await c.assemble()
         await c.root.memory.add(c.root, kind="fact", content="temp")
-        assert c.root.has("memory")
+        assert c.root.has(Services.MEMORY)
         await c.teardown()
-        assert not c.root.has("memory")                       # 服务回收（表仍在库中，数据保留）
+        assert not c.root.has(Services.MEMORY)                       # 服务回收（表仍在库中，数据保留）
         await c.teardown()
 
     _run(s())
@@ -170,7 +171,7 @@ def test_disabled_memory_not_assembled_and_chat_still_works(tmp_path):
 
     async def s():
         await c.assemble()
-        assert not c.root.has("memory")                       # 未装配
+        assert not c.root.has(Services.MEMORY)                       # 未装配
         reply = await c.root.chat.send(c.root, "帮我整理上周的会议记录")
         assert reply.ok                                       # 无记忆也不影响主链路
         rows = await c.root.db.query(c.root, "SELECT COUNT(*) AS n FROM agent_memories")

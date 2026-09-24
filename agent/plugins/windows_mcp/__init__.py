@@ -15,7 +15,7 @@ import json
 import logging
 import os
 
-from agent.api import plugin
+from agent.api import Services, plugin
 from agent.sys.mcp_client import McpStdioClient
 
 logger = logging.getLogger("agent.plugins.windows_mcp")
@@ -49,7 +49,7 @@ class WindowsMcp:
     name = "plugins.windows_mcp"
     version = "0.1.0"
     layer = "business"
-    provides = ["windows_mcp"]
+    provides = [Services.WINDOWS_MCP]
     description = "windows-mcp-server 工具桥（MCP stdio → agent tool_call）"
 
     def __init__(self):
@@ -64,7 +64,7 @@ class WindowsMcp:
             tools = await client.list_tools()
         except Exception as exc:  # noqa: BLE001 —— 起不来诚实报，不拖垮装配
             logger.warning("windows_mcp 启动失败: %s", exc)
-            ctx.provide("windows_mcp", self)
+            ctx.provide(Services.WINDOWS_MCP, self)
             ctx.state.setdefault("windows_mcp_error", str(exc))
             return
         self._client = client
@@ -82,7 +82,7 @@ class WindowsMcp:
                                handler=self._make_handler(t.get("name")),
                                owner=self.name,
                                description=f"windows-mcp: {t.get('description') or t.get('name')}")
-        ctx.provide("windows_mcp", self)
+        ctx.provide(Services.WINDOWS_MCP, self)
         ctx.effect(self._close)
 
     def _make_handler(self, tool_name: str):

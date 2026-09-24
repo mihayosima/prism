@@ -10,7 +10,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-from agent.api import AgentError, plugin
+from agent.api import AgentError, Services, plugin
 from agent.tables import MIGRATIONS
 
 logger = logging.getLogger("agent.storage")
@@ -102,13 +102,13 @@ class Storage:
 
     name = "agent.storage"
     layer = "system"
-    provides = ["db", "migrations"]
+    provides = [Services.DB, "migrations"]
 
     async def apply(self, ctx) -> None:
         db_path = (ctx.config or {}).get("db_path", "data/agent.db")
         db = SqliteDb(db_path)
         await db.start()
-        ctx.provide("db", db)
+        ctx.provide(Services.DB, db)
         ctx.provide("migrations", MigrationRegistry(db))
         ctx.effect(lambda: db.close())
         await ctx.migrations.apply(ctx, MIGRATIONS, "sqlite", namespace="agent")

@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from agent.api import Events, plugin
+from agent.api import Events, Services, plugin
 from agent.sys.audit import _now_iso, durable
 
 
@@ -39,8 +39,8 @@ class Guard:
 
     name = "agent.guard"
     layer = "system"
-    provides = ["guard"]
-    inject = ["events", "db"]
+    provides = [Services.GUARD]
+    inject = [Services.EVENTS, Services.DB]
 
     async def apply(self, ctx) -> None:
         async def _pre_llm(payload: dict, next) -> dict:
@@ -68,7 +68,7 @@ class Guard:
 
         ctx.on(Events.LLM_PRE_CALL, _pre_llm, prepend=True)
         ctx.on(Events.TASKS_PRE_EXECUTE, _pre_task, prepend=True)
-        ctx.provide("guard", self)
+        ctx.provide(Services.GUARD, self)
 
     def policy(self, ctx) -> dict:
         """当前矩阵副本（诊断用）。"""

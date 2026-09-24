@@ -14,7 +14,7 @@ import logging
 from datetime import datetime
 from typing import Any, Callable, Mapping
 
-from agent.api import AgentError, CapabilityNotImplemented, Events, plugin
+from agent.api import AgentError, CapabilityNotImplemented, Events, Services, plugin
 
 logger = logging.getLogger("agent.tasks")
 
@@ -165,12 +165,12 @@ class TasksPlugin:
 
     name = "agent.tasks"
     layer = "system"
-    provides = ["tasks"]
-    inject = ["events"]
+    provides = [Services.TASKS]
+    inject = [Services.EVENTS]
 
     async def apply(self, ctx) -> None:
         registry = TaskRegistry()
-        ctx.provide("tasks", registry)
+        ctx.provide(Services.TASKS, registry)
 
         async def _ping(action: str = "ping") -> dict:
             return {"ok": True, "action": action, "now": _now_iso(), "service": "agent.tasks"}

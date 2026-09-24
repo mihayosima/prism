@@ -10,6 +10,8 @@ import json
 from datetime import datetime
 from typing import Any
 
+from agent.api import Services
+
 
 def _now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -17,7 +19,7 @@ def _now_iso() -> str:
 
 async def durable(ctx: Any, event: str, payload: dict) -> None:
     """写一条 durable 事件。无 db（纯内存装配）→ 不落盘也不假装（诚实）。"""
-    db = ctx.get("db")
+    db = ctx.get(Services.DB)
     if db is None:
         return
     try:

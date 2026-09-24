@@ -26,7 +26,7 @@
 
 from __future__ import annotations
 
-from agent.api import plugin
+from agent.api import Services, plugin
 
 from .components import (Actor, DefaultActor, DefaultFinalizer, DefaultObserver,
                          DefaultReasoner, Finalizer, Observer, Reasoner, ReasonOutput,
@@ -49,8 +49,8 @@ class React:
     name = "plugins.react"
     version = "0.1.0"
     layer = "system"
-    provides = ["react"]
-    inject = ["llm", "tasks", "events", "db"]
+    provides = [Services.REACT]
+    inject = [Services.LLM, Services.TASKS, Services.EVENTS, Services.DB]
     tables = ()
     description = "ReAct 多步工具循环（Think→Act+Observe→收敛；max_steps/时延/预算三把闸）"
 
@@ -70,7 +70,7 @@ class React:
             max_chars=rcfg.tool_result_max_chars)
         observer = ctx.get("react.observer") or DefaultObserver()
         finalizer = ctx.get("react.finalizer") or DefaultFinalizer()
-        ctx.provide("react", ReactLoop(reasoner, actor, observer, finalizer, rcfg))
+        ctx.provide(Services.REACT, ReactLoop(reasoner, actor, observer, finalizer, rcfg))
 
     async def status(self, ctx) -> dict:
         """插件页状态摘要（未跑过则如实报 ``runs: 0``，不给笼统假状态）。"""

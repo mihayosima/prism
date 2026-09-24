@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+from agent.api import Services
 from agent.profiles import build_agent
 
 
@@ -29,7 +30,7 @@ def test_loop_full_offline_closure_and_teardown_no_residue(tmp_path):
         assert events.listeners("agent/llm/pre-call") == []
         assert events.listeners("agent/tasks/pre-execute") == []
         assert tasks.names() == []
-        assert not c.root.has("db")
+        assert not c.root.has(Services.DB)
 
     _run(s())
 

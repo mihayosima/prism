@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from agent.api import EventBus, plugin
+from agent.api import EventBus, Services, plugin
 
 
 @plugin
@@ -11,10 +11,10 @@ class EventsPlugin:
 
     name = "agent.events"
     layer = "system"
-    provides = ["events"]
+    provides = [Services.EVENTS]
 
     async def apply(self, ctx) -> None:
-        ctx.provide("events", EventBus())
+        ctx.provide(Services.EVENTS, EventBus())
 
 
 __all__ = ["EventsPlugin"]

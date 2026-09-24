@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+from agent.api import Services
 from agent.profiles import build_agent
 
 
@@ -38,7 +39,7 @@ def test_next_turn_sees_prior_turns_in_llm_messages(tmp_path):
 
     async def s():
         await c.assemble()
-        svc = c.root.get("llm")
+        svc = c.root.get(Services.LLM)
         captured: list[list[dict]] = []
         orig = svc.complete
 

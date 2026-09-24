@@ -11,6 +11,7 @@ import asyncio
 import json
 from pathlib import Path
 
+from agent.api import Services
 from agent.profiles import build_agent
 from agent.sys.plugin_manager import PluginManager
 
@@ -56,7 +57,7 @@ def test_single_step_converges(tmp_path):
 
     async def s():
         await c.assemble()
-        assert c.root.has("react")
+        assert c.root.has(Services.REACT)
         r = await c.root.react.run(c.root, "请直接回答这个问题")
         assert r.ok and r.steps == 1 and not r.exhausted
         assert "直接回答" in r.text
@@ -219,7 +220,7 @@ def test_chat_falls_back_when_react_disabled(tmp_path):
 
     async def s():
         await c.assemble()
-        assert not c.root.has("react")
+        assert not c.root.has(Services.REACT)
         reply = await c.root.chat.send(c.root, "两步链路")
         assert reply.ok
         assert reply.plan["intent"] != "react"                    # 单步规划路径
@@ -322,9 +323,9 @@ def test_manageable_directory_plugin_and_no_residue(tmp_path):
 
     async def s():
         await c.assemble()
-        assert c.root.has("react")
+        assert c.root.has(Services.REACT)
         await c.teardown()
-        assert not c.root.has("react")             # 服务回收
+        assert not c.root.has(Services.REACT)             # 服务回收
         await c.teardown()                         # 幂等
 
     _run(s())
