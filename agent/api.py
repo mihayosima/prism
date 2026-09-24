@@ -6,7 +6,7 @@ agent 本体只准 ``from agent.api import …``；禁止 ``from agent.core impo
 
 from agent import __agent_milestone__, __version__
 from agent.core.container import Container, Plugin, plugin
-from agent.core.context import Context, State
+from agent.core.context import CURRENT_PLUGIN, Context, State, current_plugin
 from agent.core.contract import LlmProvider
 from agent.core.errors import (
     AgentError,
@@ -35,6 +35,8 @@ __all__ = [
     # context
     "Context",
     "State",
+    "current_plugin",
+    "CURRENT_PLUGIN",
     # services
     "Services",
     "SERVICE_KEYS",

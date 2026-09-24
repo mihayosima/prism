@@ -14,7 +14,14 @@ import logging
 from datetime import datetime
 from typing import Any, Callable, Mapping
 
-from agent.api import AgentError, CapabilityNotImplemented, Events, Services, plugin
+from agent.api import (
+    AgentError,
+    CapabilityNotImplemented,
+    Events,
+    Services,
+    current_plugin,
+    plugin,
+)
 
 logger = logging.getLogger("agent.tasks")
 
@@ -97,7 +104,7 @@ class TaskRegistry:
             raise AgentError(f"任务重复注册（名称唯一，D-3）: {name}")
         if risk not in RISKS:
             raise AgentError(f"risk 须 ∈ {RISKS}，得到 {risk!r}")
-        owner = owner if owner is not None else ctx.get("_current_plugin")
+        owner = owner if owner is not None else current_plugin()
         self._tasks[name] = Task(name, schema, handler, owner=owner,
                                  description=description, risk=risk)
 
@@ -117,7 +124,7 @@ class TaskRegistry:
         cmd = self._tasks.get(name)
         if cmd is None:
             raise AgentError(f"任务不存在: {name!r}")
-        caller = caller or ctx.get("_current_plugin") or "unknown"
+        caller = caller or current_plugin() or "unknown"
         decision = await ctx.events.waterfall(
             Events.TASKS_PRE_EXECUTE, {"task": name, "kwargs": kwargs, "caller": caller}
         )

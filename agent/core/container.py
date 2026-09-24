@@ -14,7 +14,7 @@ from __future__ import annotations
 import inspect
 from typing import Any, Callable, Mapping, Sequence
 
-from .context import Context
+from .context import CURRENT_PLUGIN, Context
 from .errors import AgentError, CyclicDependencyError, MissingDependencyError
 from .events_catalog import REQUIRED_SUBSCRIBER_EVENTS
 from .event_wiring import _verify_event_wiring
@@ -275,7 +275,7 @@ class Container:
         try:
             for p in order:
                 cap = self._root.capture()
-                self._root._current_plugin = p.id
+                token = CURRENT_PLUGIN.set(p.id)
                 try:
                     await p.apply(self._root)
                 except BaseException:
@@ -286,7 +286,7 @@ class Container:
                         pass
                     raise
                 finally:
-                    self._root._current_plugin = None
+                    CURRENT_PLUGIN.reset(token)
                 self._caps[p.id] = cap
             self._order = order
             self._assembled = True
@@ -315,11 +315,11 @@ class Container:
         """拓扑序 start 全部插件。"""
         self._require_assembled()
         for p in self._order:
-            self._root._current_plugin = p.id
+            token = CURRENT_PLUGIN.set(p.id)
             try:
                 await p.start(self._root)
             finally:
-                self._root._current_plugin = None
+                CURRENT_PLUGIN.reset(token)
 
     async def teardown(self) -> None:
         """对称卸载：逆拓扑序回收每插件（effect 逆序 + 服务回收），随后 root 收尾。"""

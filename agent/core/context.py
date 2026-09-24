@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import inspect
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -25,6 +26,18 @@ from .errors import (
 from .services_catalog import Services
 
 _MISSING: Any = object()
+
+# 当前插件 id：容器在装配/启动窗口内注入，监听 ctx 当前作用域。
+# 用 ContextVar 而非 ctx 上的普通属性——并发安全（多轮可并行互不串扰），
+# 且不再需要容器写私有属性（K5）。
+CURRENT_PLUGIN: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "agent_current_plugin", default=None
+)
+
+
+def current_plugin() -> str | None:
+    """当前插件 id（容器装配/启动窗口内有效）。"""
+    return CURRENT_PLUGIN.get()
 
 
 class State:
@@ -90,7 +103,6 @@ class Context:
         self._effects: list[_Effect] = []
         self._state = State()
         self._closed = False
-        self._current_plugin: str | None = None   # 容器装配/启动窗口注入的当前插件 id
 
     # ---------- 元信息 ----------
 
@@ -277,4 +289,4 @@ class Context:
         return f"Context({self._name!r}, services={self.keys()})"
 
 
-__all__ = ["Context", "State"]
+__all__ = ["Context", "State", "current_plugin", "CURRENT_PLUGIN"]
