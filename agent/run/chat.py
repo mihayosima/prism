@@ -458,7 +458,8 @@ async def _serve(args: argparse.Namespace) -> int:
 
     @app.get("/")
     async def _home():
-        return HTMLResponse(_PAGE)
+        # no-store：前端改版后，防止浏览器用启发式缓存继续喂旧版 JS（曾导致"看起来没有流式"）
+        return HTMLResponse(_PAGE, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/chat")
     async def _chat(body: dict):
