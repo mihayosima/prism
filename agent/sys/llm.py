@@ -256,7 +256,9 @@ class DeepSeekLlm:
             return _parse_json(content)
 
         # —— 流式（B5.2 打字机）——
+        payload["stream"] = True                           # 关键：告知 DeepSeek 返回 SSE 而非单条 JSON
         content_acc = ""
+        reasoning_acc = ""                                # D4 思考链（reasoning_content 每片累积）
         tool_acc: dict[int, dict] = {}                     # index -> 归并槽（D3 完整重组）
         async with httpx.AsyncClient(timeout=90.0) as client:
             async with client.stream("POST", self.BASE_URL, json=payload, headers=headers) as resp:
@@ -283,6 +285,12 @@ class DeepSeekLlm:
                     if piece and schema is None:
                         content_acc += piece
                         await ctx.events.emit(Events.LLM_TOKEN, {"text": piece})
+                    # D4 思考链（reasoning_content）照单全流：模型把推理过程放在该字段，
+                    # 不并入最终 text（text 仅来自 content），避免思考混入答案。
+                    rpiece = delta.get("reasoning_content") or ""
+                    if rpiece and schema is None:
+                        reasoning_acc += rpiece
+                        await ctx.events.emit(Events.LLM_THINKING, {"text": rpiece})
                     # 工具调用 delta 归并（按 index）
                     for tc in (delta.get("tool_calls") or []):
                         idx = tc.get("index", 0)

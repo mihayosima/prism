@@ -257,11 +257,13 @@ const chips=['ping 健康检查','有哪些工具','你能做什么'];
 let _ctrl=null,_streaming=false;
 function addStreamMsg(){
   const d=document.createElement('div');d.className='msg agent';
-  d.innerHTML='<div class="who">Agent</div><div class="bubble sb">…</div><div class="steps ss"></div>';
+  d.innerHTML='<div class="who">Agent</div>'
+    +'<details class="think" open><summary>💭 思考过程</summary><div class="tk" style="white-space:pre-wrap;font-size:12px;color:#8a8a8a;"></div></details>'
+    +'<div class="bubble sb">…</div><div class="steps ss"></div>';
   $('#messages').appendChild(d);
   const m=$('.messages');m.scrollTop=m.scrollHeight;
-  const bub=d.querySelector('.sb'),stp=d.querySelector('.ss');
-  let gotToken=false;
+  const bub=d.querySelector('.sb'),stp=d.querySelector('.ss'),think=d.querySelector('.think'),tk=d.querySelector('.tk');
+  let gotToken=false,gotThink=false;
   return {
     addStep(p){
       const el=document.createElement('div');el.className='step';
@@ -275,7 +277,14 @@ function addStreamMsg(){
       gotToken=true;
       bub.innerHTML+=esc(text||'');
       m.scrollTop=m.scrollHeight;},
+    appendThinking(text){                  // B5.2 思考流（D4）：实时追加推理过程
+      gotThink=true;
+      tk.innerHTML+=esc(text||'');
+      m.scrollTop=m.scrollHeight;},
     finish(text,ev){
+      // 思考区：若从未收到思考帧则移除（避免空折叠块），否则收敛后折叠
+      if(!gotThink&&think&&think.parentNode){think.parentNode.removeChild(think);}
+      else if(think){think.open=false;}
       // 若已逐片打出，则仅用最终文本跑一次 md 覆盖渲染，去重（文字不出现两遍）
       bub.innerHTML=md(text||'（无回复）');
       if(ev){stp.innerHTML+=stepRow('narrate','evidence.json',(ev.tokens_out>0)?'ok':'err',
@@ -307,6 +316,7 @@ async function send(){
         let f;try{f=JSON.parse(line.slice(5).trim());}catch(e){continue;}
         const ev=f.event,p=f.payload||{};
         if(ev==='progress'){box.addStep(p);}
+        else if(ev==='thinking'){box.appendThinking(p.data?p.data.text:'');}
         else if(ev==='token'){box.appendToken(p.data?p.data.text:'');}
         else if(ev==='final'){box.finish(p.text,p.evidence);}
         else if(ev==='cancelled'){box.cancel();}
