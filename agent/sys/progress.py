@@ -29,18 +29,26 @@ PROGRESS_EVENTS: tuple[str, ...] = (
     Events.REACT_STEP_START,
     Events.REACT_STEP_END,
     Events.TASKS_POST_EXECUTE,
+    Events.LLM_TOKEN,                              # B5.2 打字机帧
 )
+
+# 内核事件名 → 传输层帧类型（其余默认 "progress"）。
+# B5.2：LLM_TOKEN 映射为 "token" 帧，前端据此追加文本而非渲染步骤卡片。
+FRAME_TYPES: dict[str, str] = {
+    Events.LLM_TOKEN: "token",
+}
 
 
 def _pusher(queue: asyncio.Queue, name: str):
     """构造同步推送器（emit 对同步监听器内联执行，无额外任务开销）。"""
+    ftype = FRAME_TYPES.get(name, "progress")
 
     def _push(*args: Any) -> None:
         first = args[0] if args else {}
         payload = first if isinstance(first, dict) else {"value": first}
         try:
-            # 帧类型统一为 "progress"；内核事件名放 payload.source（传输层无需知道事件名）
-            queue.put_nowait({"event": "progress",
+            # 帧类型来自 FRAME_TYPES（默认 "progress"）；内核事件名放 payload.source
+            queue.put_nowait({"event": ftype,
                               "payload": {"source": name, "data": payload}})
         except Exception:      # noqa: BLE001 —— 队列异常绝不阻断业务主链路
             pass

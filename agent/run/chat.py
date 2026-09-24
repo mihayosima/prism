@@ -261,6 +261,7 @@ function addStreamMsg(){
   $('#messages').appendChild(d);
   const m=$('.messages');m.scrollTop=m.scrollHeight;
   const bub=d.querySelector('.sb'),stp=d.querySelector('.ss');
+  let gotToken=false;
   return {
     addStep(p){
       const el=document.createElement('div');el.className='step';
@@ -270,10 +271,18 @@ function addStreamMsg(){
       el.innerHTML='<div class="top"><span class="dot run"></span><span class="name">'+esc(nm)+'</span></div>'
         +'<details><summary>载荷</summary><pre>'+esc(json2((p&&p.data)||{}))+'</pre></details>';
       stp.appendChild(el);m.scrollTop=m.scrollHeight;},
+    appendToken(text){                     // B5.2 打字机：转义追加，不跑 markdown
+      gotToken=true;
+      bub.innerHTML+=esc(text||'');
+      m.scrollTop=m.scrollHeight;},
     finish(text,ev){
+      // 若已逐片打出，则仅用最终文本跑一次 md 覆盖渲染，去重（文字不出现两遍）
       bub.innerHTML=md(text||'（无回复）');
       if(ev){stp.innerHTML+=stepRow('narrate','evidence.json',(ev.tokens_out>0)?'ok':'err',
         json2({tokens_in:ev.tokens_in,tokens_out:ev.tokens_out}));}
+      m.scrollTop=m.scrollHeight;},
+    cancel(){                             // 保留已打出部分，仅追加标注
+      bub.innerHTML+='<span class="cancelled">（已取消）</span>';
       m.scrollTop=m.scrollHeight;}
   };}
 async function send(){
@@ -298,8 +307,9 @@ async function send(){
         let f;try{f=JSON.parse(line.slice(5).trim());}catch(e){continue;}
         const ev=f.event,p=f.payload||{};
         if(ev==='progress'){box.addStep(p);}
+        else if(ev==='token'){box.appendToken(p.data?p.data.text:'');}
         else if(ev==='final'){box.finish(p.text,p.evidence);}
-        else if(ev==='cancelled'){box.finish('（已取消）',null);}
+        else if(ev==='cancelled'){box.cancel();}
         else if(ev==='error'){box.finish('请求失败：'+(p.error||''),null);}
       }
     }
