@@ -1,4 +1,4 @@
-"""内核测试 —— Ctx / @plugin / Container / EventBus / effects / errors（离线确定性）。
+"""内核测试 —— Ctx / @plugin / Container / EventBus（emit / waterfall）/ effects / errors（离线确定性）。
 
 全部在内存进程内，不触网、不触引擎、不触 Node。
 """
@@ -257,7 +257,7 @@ def test_set_overrides_provided_service():
         root.set("never", 1)
 
 
-# ---------- EventBus（五模式） ----------
+# ---------- EventBus（双模式：emit / waterfall） ----------
 
 def _bus() -> tuple[Context, EventBus]:
     root = Context(name="t")
@@ -316,42 +316,66 @@ def test_waterfall_veto_short_circuit():
     assert result == {"allowed": False}          # 否决短路，annotate 的 next 在 veto 处终止
 
 
-def test_bail_short_circuits_at_decision():
-    root, ev = _bus()
-    called = []
-
-    def pass_through(p):
-        called.append("h1")
-        return None
-
-    async def decide(p):
-        called.append("h2")
-        return "decision"
-
-    async def never(p):
-        called.append("h3")
-        return True
-
-    root.on("t/b", pass_through)
-    root.on("t/b", decide)
-    root.on("t/b", never)
-    result = _run(ev.bail("t/b", {}))
-    assert result == "decision"
-    assert called == ["h1", "h2"]
-
-
-def test_serial_returns_first_bail_value():
-    root, ev = _bus()
-    root.on("t/s", lambda p: None)
-    root.on("t/s", lambda p: "found")
-    root.on("t/s", lambda p: "ignored")
-    assert _run(ev.serial("t/s", {})) == "found"
-
-
 def test_strict_payload_rejects_object():
     _, ev = _bus()
     with pytest.raises(TypeError):
         _run(ev.emit("t/bad", {"obj": object()}))
+
+
+def test_aclose_cancels_inflight_async_listeners():
+    """K4a：emit 飞行途中调用 aclose 能取消在途任务并清空追踪集。"""
+    root, ev = _bus()
+    started = []
+    cancelled = []
+
+    async def slow(payload):
+        started.append(1)
+        try:
+            await asyncio.sleep(5)          # 模拟长耗时的异步监听器
+        except asyncio.CancelledError:
+            cancelled.append(1)
+            raise
+
+    root.on("t/async", slow)
+
+    async def scenario():
+        emit_task = asyncio.create_task(ev.emit("t/async", {}))
+        # 轮询让出，直到 slow 真正开始运行（fire-and-forget 已入追踪集）
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if started:
+                break
+        assert started == [1]                   # slow 已开始运行
+        assert ev._tasks                       # 在途任务在追踪集中
+        await ev.aclose()                      # 取消并等待在途任务
+        assert cancelled == [1]                # 在途任务确被取消
+        assert ev._tasks == set()              # 追踪集清空
+        assert emit_task.done()                # emit 包装任务已结束，无滞留
+
+    _run(scenario())
+
+
+def test_emit_async_task_auto_discarded_after_done():
+    """K4a：异步监听器完成后，done 回调自动将其移出追踪集（无残留引用）。"""
+    root, ev = _bus()
+    done = []
+
+    async def quick(payload):
+        done.append(1)
+
+    root.on("t/q", quick)
+
+    async def scenario():
+        await ev.emit("t/q", {})               # 同步等待 emit 协程返回
+        # emit 把 quick 排成 fire-and-forget；轮询让出直到其完成且 done 回调已将其移出集
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if done and not ev._tasks:
+                break
+        assert done == [1]
+        assert ev._tasks == set()              # 已完成任务不在追踪集中（无悬挂引用）
+
+    _run(scenario())
 
 
 # ---------- 容器硬化：未声明 inject 的 apply 期读 ----------

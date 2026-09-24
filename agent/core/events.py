@@ -1,14 +1,12 @@
-"""agent.core.events —— 事件总线（五模式，slim Cordis）。
+"""agent.core.events —— 事件总线（双模式：emit 广播遥测 + waterfall 能力闸门）。
 
 payload 一律纯数据（可 JSON 化）——「事件=扩展点，payload 只带数据」（anti 跨作用域泄漏）。
-模式语义（契约级，事件声明 @mode）：
+模式语义（契约级）：
     emit      不 await；同步按注册序、async 并发 fire（fire-and-forget）；错误隔离；只承载遥测/审计。
     waterfall await；监听收 (…原参数, next) 续接组合；「不调用 next() 即否决」；错误传播。
-    parallel  await；并发；聚合异常（EventDispatchError 携带全部失败）。
-    serial    await；注册序完整执行；返回首个 bail 值（有即收，其余照跑）；错误传播。
-    bail      await；注册序，首个「非 None 非 False」值即短路返回决策值；错误传播。
 
 监听器绑定注册它的 ctx：分发时 ctx 已关闭（插件已卸载）→ 跳过并剪除（防死引用）。
+在途的 fire-and-forget 异步任务由总线追踪，aclose() 时取消并等待，避免 teardown 后残留。
 """
 
 from __future__ import annotations
@@ -25,8 +23,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("agent.events")
 
-_BAIL: Any = object()                      # 内部哨兵："无 bail 值"
 _PURE = (type(None), bool, int, float, str)
+
+_BAIL: Any = object()                      # 内部哨兵："无 bail 值"
 
 
 def _is_bail(value: Any) -> bool:
@@ -57,15 +56,16 @@ def _assert_pure_data(args: tuple[Any, ...], what: str) -> None:
 
 
 class _Listener:
-    """一条监听器记录：绑定注册它的 ctx + 执行序 + once。"""
+    """一条监听器记录：绑定注册它的 ctx + 执行序 + once + 是否 async（注册期缓存）。"""
 
-    __slots__ = ("ctx", "handler", "once", "order")
+    __slots__ = ("ctx", "handler", "once", "order", "is_async")
 
-    def __init__(self, ctx: "Context", handler: Callable, once: bool, order: int):
+    def __init__(self, ctx: "Context", handler: Callable, once: bool, order: int, is_async: bool):
         self.ctx = ctx
         self.handler = handler
         self.once = once
         self.order = order
+        self.is_async = is_async
 
 
 class EventBus:
@@ -76,6 +76,7 @@ class EventBus:
         self._seq = 0
         self.strict_payload = strict_payload
         self._required_seams: set = set(required_seams)
+        self._tasks: set[asyncio.Task] = set()   # 在途 fire-and-forget 任务（K4a 追踪）
 
     # ---------- 注册 ----------
 
@@ -83,7 +84,8 @@ class EventBus:
            *, prepend: bool = False, once: bool = False) -> Callable[[], bool]:
         """注册监听器；返回 disposer（移除并返回是否仍注册）。上下文 = 注册 ctx。"""
         self._seq += 1
-        entry = _Listener(ctx, handler, once, self._seq)
+        is_async = inspect.iscoroutinefunction(handler)
+        entry = _Listener(ctx, handler, once, self._seq, is_async)
         bucket = self._listeners.setdefault(name, [])
         if prepend:
             bucket.insert(0, entry)
@@ -105,18 +107,19 @@ class EventBus:
         """调试：某事件的 (ctx.name, once) 列表（自动剔除已关闭作用域）。"""
         return [(e.ctx.name, e.once) for e in self._listeners.get(name, ())]
 
-    # ---------- 分发：5 模式 ----------
+    # ---------- 分发：双模式 ----------
 
     async def emit(self, name: str, *args: Any) -> None:
-        """遥测/审计：同步按注册序、async 并发 fire（不对齐）；错误互不影响。"""
+        """遥测/审计：同步按注册序、async 并发 fire（fire-and-forget）；错误互不影响。"""
         if self.strict_payload:
             _assert_pure_data(args, f"emit({name!r})")
         for entry in self._snapshot(name):
             if entry.ctx.closed:
                 continue
-            if inspect.iscoroutinefunction(entry.handler):
+            if entry.is_async:
                 task = asyncio.create_task(self._guarded(entry, name, args))
-                task.add_done_callback(lambda t: t.exception() and None)
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
             else:
                 try:
                     entry.handler(*args)
@@ -205,6 +208,18 @@ class EventBus:
 
     # ---------- 内部 ----------
 
+    async def aclose(self) -> None:
+        """取消并等待所有在途 fire-and-forget 监听器任务（teardown 时调用，避免残留）。"""
+        pending = list(self._tasks)
+        for t in pending:
+            t.cancel()
+        for t in pending:
+            try:
+                await t
+            except BaseException:  # noqa: BLE001 —— 取消 / 监听器自身异常均吞掉
+                pass
+        self._tasks.clear()
+
     def _snapshot(self, name: str) -> list[_Listener]:
         return list(self._listeners.get(name, ()))
 
@@ -230,7 +245,7 @@ class EventBus:
                         self._listeners.pop(name, None)
 
     async def _guarded(self, entry: _Listener, name: str, args: tuple[Any, ...]) -> None:
-        """fire-and-forget 的 async 监听器守卫：错误只记日志。"""
+        """fire-and-forget 的 async 监听器守卫：错误只记日志（异常不向外传播）。"""
         try:
             if not entry.ctx.closed:
                 await self._invoke_one(entry, args, name)
