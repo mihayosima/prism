@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 import uuid
 
 from agent.profiles import build_agent
+from agent.sys.progress import tap_progress
 
 
 def _parse(argv: list[str] | None) -> argparse.Namespace:
@@ -251,17 +253,59 @@ function addMsg(who, text, evid){
   $('#messages').appendChild(d);
   const m=$('.messages');m.scrollTop=m.scrollHeight;}
 const chips=['ping 健康检查','有哪些工具','你能做什么'];
+let _ctrl=null,_streaming=false;
+function addStreamMsg(){
+  const d=document.createElement('div');d.className='msg agent';
+  d.innerHTML='<div class="who">Agent</div><div class="bubble sb">…</div><div class="steps ss"></div>';
+  $('#messages').appendChild(d);
+  const m=$('.messages');m.scrollTop=m.scrollHeight;
+  const bub=d.querySelector('.sb'),stp=d.querySelector('.ss');
+  return {
+    addStep(p){
+      const el=document.createElement('div');el.className='step';
+      const nm=(p&&p.source)?String(p.source).split('/').pop():'progress';
+      el.innerHTML='<div class="top"><span class="dot run"></span><span class="name">'+esc(nm)+'</span></div>'
+        +'<details><summary>载荷</summary><pre>'+esc(json2((p&&p.data)||{}))+'</pre></details>';
+      stp.appendChild(el);m.scrollTop=m.scrollHeight;},
+    finish(text,ev){
+      bub.innerHTML=md(text||'（无回复）');
+      if(ev){stp.innerHTML+=stepRow('narrate','evidence.json',(ev.tokens_out>0)?'ok':'err',
+        json2({tokens_in:ev.tokens_in,tokens_out:ev.tokens_out}));}
+      m.scrollTop=m.scrollHeight;}
+  };}
 async function send(){
+  if(_streaming&&_ctrl){_ctrl.abort();return;}
   const txt=$('#txt').value.trim();if(!txt)return;
-  addMsg('user',txt);$('#txt').value='';$('#send').disabled=true;$('#send').textContent='…';
+  addMsg('user',txt);$('#txt').value='';
+  _streaming=true;_ctrl=new AbortController();
+  $('#send').disabled=false;$('#send').textContent='停止';
+  const box=addStreamMsg();
   try{
-    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:txt})});
-    const j=await r.json();
-    if(j.error){addMsg('agent','请求失败：'+esc(j.error),null);return;}
-    addMsg('agent',j.text||'（无回复）',j.evidence||null);
-  }catch(e){addMsg('agent','请求失败：'+e.message,null);}
-  finally{$('#send').disabled=false;$('#send').textContent='发送';$('#txt').focus();}}
+    const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:txt}),signal:_ctrl.signal});
+    if(!r.ok||!r.body)throw new Error('HTTP '+r.status);
+    const reader=r.body.getReader(),dec=new TextDecoder();let buf='';
+    for(;;){
+      const {done,value}=await reader.read();if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      let i;
+      while((i=buf.indexOf('\n\n'))>=0){
+        const line=buf.slice(0,i);buf=buf.slice(i+2);
+        if(!line.startsWith('data:'))continue;
+        let f;try{f=JSON.parse(line.slice(5).trim());}catch(e){continue;}
+        const ev=f.event,p=f.payload||{};
+        if(ev==='progress'){box.addStep(p);}
+        else if(ev==='final'){box.finish(p.text,p.evidence);}
+        else if(ev==='cancelled'){box.finish('（已取消）',null);}
+        else if(ev==='error'){box.finish('请求失败：'+(p.error||''),null);}
+      }
+    }
+  }catch(e){
+    if(e&&e.name==='AbortError'){box.finish('（已取消）',null);}
+    else{box.finish('请求失败：'+((e&&e.message)||e),null);}
+  }finally{
+    _streaming=false;_ctrl=null;
+    $('#send').disabled=false;$('#send').textContent='发送';$('#txt').focus();}}
 function fmt(x){return x===null||x===undefined?'-':(typeof x==='object'?json2(x):x);}
 function tableFrom(rows,cols){return '<table><tr>'+cols.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr>'
   +rows.map(r=>'<tr>'+cols.map(c=>'<td>'+esc(fmt(r[c]))+'</td>').join('')+'</tr>').join('')+'</table>';}
@@ -364,7 +408,7 @@ document.addEventListener('DOMContentLoaded',()=>{
 async def _serve(args: argparse.Namespace) -> int:
     import uvicorn
     from fastapi import FastAPI
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
     c, pm = await _boot(args)
 
@@ -390,6 +434,13 @@ async def _serve(args: argparse.Namespace) -> int:
 
     c = _Box(c)
     session_id = uuid.uuid4().hex[:8]
+    # B6/B5 共用：run_id -> 在跑的任务。取消端点据此 cancel；断连时清理，防孤儿任务。
+    active_runs: dict[str, asyncio.Task] = {}
+
+    def _sse(event: str, payload: dict) -> str:
+        """一帧 SSE（data: {...}\\n\\n）。帧类型见设计方案 §4.5。"""
+        return "data: " + json.dumps({"event": event, "payload": payload or {}},
+                                     ensure_ascii=False) + "\n\n"
 
     async def _apply_rebuild() -> None:
         """按当前 config + 当前插件期望态重建容器（管理操作即时生效）。"""
@@ -420,6 +471,68 @@ async def _serve(args: argparse.Namespace) -> int:
                                               "tokens_out": reply.tokens_out}})
         except Exception as exc:  # noqa: BLE001 —— 回显给前端，不裸崩
             return JSONResponse({"error": str(exc)}, status_code=500)
+
+    @app.post("/api/chat/stream")
+    async def _chat_stream(body: dict):
+        """B5 流式：SSE 逐帧推送（start → progress… → final / error / cancelled）。
+
+        与 B6 共用同一 run 生命周期：本端点持有任务并登记 run_id，取消端点据此 cancel。
+        ``/api/chat`` 保留不动（--once 与离线测试依赖它）。
+        """
+        message = str(body.get("message") or "")
+        run_id = uuid.uuid4().hex[:8]
+        q: asyncio.Queue = asyncio.Queue()
+
+        async def _worker() -> None:
+            try:
+                reply = await c.root.chat.send(c.root, message, session_id=session_id)
+                await q.put({"event": "final", "payload": {
+                    "text": reply.text, "ok": reply.ok, "error": reply.error,
+                    "evidence": {"plan": reply.plan, "evidence": reply.evidence,
+                                 "tokens_in": reply.tokens_in, "tokens_out": reply.tokens_out}}})
+            except asyncio.CancelledError:
+                await q.put({"event": "cancelled", "payload": {"run_id": run_id}})
+                raise                                  # 保持取消语义，不吞
+            except Exception as exc:                   # noqa: BLE001
+                await q.put({"event": "error", "payload": {"error": str(exc)}})
+
+        async def _gen():
+            task: asyncio.Task | None = None
+            try:
+                yield _sse("start", {"run_id": run_id})
+                # 先订阅（不漏帧），再起任务
+                async with tap_progress(c.root, queue=q):
+                    task = asyncio.create_task(_worker())
+                    active_runs[run_id] = task
+                    try:
+                        while True:
+                            frame = await q.get()
+                            yield _sse(frame["event"], frame["payload"])
+                            if frame["event"] in ("final", "error", "cancelled"):
+                                return
+                    finally:
+                        active_runs.pop(run_id, None)
+                        if task is not None and not task.done():
+                            task.cancel()              # 断连/提前退出 → 取消，防孤儿
+            except asyncio.CancelledError:
+                return                                 # 客户端断连：不逃逸，任务已在 finally 取消
+            except Exception as exc:                   # noqa: BLE001
+                yield _sse("error", {"error": str(exc)})
+
+        return StreamingResponse(_gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
+
+    @app.post("/api/chat/cancel")
+    async def _chat_cancel(body: dict):
+        """B6 取消：按 run_id 取消在跑的那轮（`asyncio.Task.cancel()`，任意 await 点即时生效）。"""
+        rid = str(body.get("run_id") or "")
+        task = active_runs.get(rid)
+        if task is None:
+            return JSONResponse({"ok": False, "error": "run_id 不存在或该轮已结束"},
+                                status_code=404)
+        task.cancel()
+        return JSONResponse({"ok": True, "run_id": rid})
 
     @app.get("/api/status")
     async def _status() -> dict:

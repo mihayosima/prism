@@ -16,7 +16,15 @@ from agent.api import plugin
 
 
 class AgentDriver(Protocol):
+    """驱动协议（loop-as-plugin：换驱动 = 换插件，消费方只依赖接口）。
+
+    ``cancel`` / ``when_idle`` 为 B6 恢复的能力（详见《B5B6-流式与取消-设计方案.md》）：
+    取消在**任意 await 点**即时生效；``when_idle`` 等驱动进入空闲，供优雅停止与 A4 提问时机用。
+    """
+
     async def run(self, ctx, *, task: str, params: dict) -> "RunResult": ...
+    async def cancel(self) -> None: ...
+    async def when_idle(self) -> None: ...
 
 
 @dataclass(slots=True)
@@ -31,6 +39,9 @@ class RunResult:
 class ProduceDriver:
     """裁决驱动：执行一次任务（简化 target 模型——任务=注册表里可调用的目标）。"""
 
+    def __init__(self):
+        self._running: dict[str, asyncio.Task] = {}      # task 名 -> 在跑的 asyncio 任务（供 cancel）
+
     async def run(self, ctx, *, task: str, params: dict | None = None) -> RunResult:
         params = params or {}
         running = ctx.state.setdefault("loop_running", set())
@@ -38,6 +49,9 @@ class ProduceDriver:
             return RunResult(ok=False, skipped=True, error=f"overlap skip: {task} 上一轮未结束")
         running.add(task)
         started = time.monotonic()
+        cur = asyncio.current_task()
+        if cur is not None:
+            self._running[task] = cur
         try:
             entry = ctx.tasks.resolve(ctx, task)
             if entry is None:
@@ -51,6 +65,17 @@ class ProduceDriver:
             return RunResult(ok=False, error=str(exc))
         finally:
             running.discard(task)
+            self._running.pop(task, None)
+
+    async def cancel(self) -> None:
+        """取消全部在跑的任务——`Task.cancel()` 在任意 await 点即时生效。"""
+        for t in list(self._running.values()):
+            t.cancel()
+
+    async def when_idle(self) -> None:
+        """等待驱动进入空闲（无在跑任务）。供优雅停止与 A4 提问时机使用。"""
+        while self._running:
+            await asyncio.sleep(0.01)
 
 
 @plugin

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -94,9 +95,19 @@ class ChatDriver:
         # 契约不变：chat 只经 ctx.has("react") 感知其存在，不 import 其实现。
         if ctx.has("react"):
             return await self._send_via_react(ctx, message, session_id, prior)
-        plan = await self._plan(ctx, message, prior)
-        evidence = await self._execute(ctx, plan)
-        text, ti, to, error = await self._narrate(ctx, plan, evidence, message, prior)
+        try:
+            plan = await self._plan(ctx, message, prior)
+            evidence = await self._execute(ctx, plan)
+            text, ti, to, error = await self._narrate(ctx, plan, evidence, message, prior)
+        except asyncio.CancelledError:
+            # 单步路径同样：取消如实落审计后原样抛出
+            try:
+                await durable(ctx, Events.CHAT_DONE,
+                              {"intent": "chat", "ok": False, "error": "已取消",
+                               "cancelled": True, "session_id": session_id, "at": _now_iso()})
+            except Exception:      # noqa: BLE001 —— 审计写失败不阻断取消
+                pass
+            raise
         await self._append(ctx, session_id, "assistant", text)
         ok = bool(evidence.get("ok")) and error is None
         # reply.error：解说失败 || 执行被拒（guard/预算）都要如实上浮，不吞
@@ -127,7 +138,20 @@ class ChatDriver:
         与单步路径保持同一外部纪律：写短期记忆（user/assistant）、写 durable
         ``agent/chat/done``、喂 ``ctx.memory``（若启用）、返回 ``ChatReply``。
         """
-        res = await ctx.react.run(ctx, message, session_id=session_id, prior=prior)
+        try:
+            res = await ctx.react.run(ctx, message, session_id=session_id, prior=prior)
+        except asyncio.CancelledError:
+            # 取消既非成功也非失败：如实落审计后**原样抛出**（不吞，保持取消语义）
+            try:
+                await durable(ctx, Events.REACT_EXHAUSTED,
+                              {"reason": "已取消", "cancelled": True,
+                               "session_id": session_id, "at": _now_iso()})
+                await durable(ctx, Events.CHAT_DONE,
+                              {"intent": "react", "ok": False, "error": "已取消",
+                               "cancelled": True, "session_id": session_id, "at": _now_iso()})
+            except Exception:      # noqa: BLE001 —— 审计写失败不阻断取消
+                pass
+            raise
         text = res.text or "（无回复）"
         await self._append(ctx, session_id, "assistant", text)
         if ctx.has("memory"):
