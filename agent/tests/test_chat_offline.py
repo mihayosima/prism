@@ -1,0 +1,80 @@
+"""对话驱动测试 —— 离线确定性（fixture）：规划→执行→解说闭环 · guard 拒绝 · 无 key 诚实。"""
+
+from __future__ import annotations
+
+import asyncio
+
+from agent.profiles import TIGHT_PATCH, build_agent
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _cfg(tmp_path):
+    return {"db_path": str(tmp_path / "agent.db")}
+
+
+def test_chat_ping_round_trip(tmp_path):
+    c = build_agent(config=_cfg(tmp_path))
+
+    async def s():
+        await c.assemble()
+        reply = await c.root.chat.send(c.root, "ping 健康检查")
+        assert reply.ok
+        assert reply.plan["intent"] == "ping"
+        assert reply.text.strip()
+        assert reply.evidence["ok"] is True
+        assert reply.evidence["intent"] == "ping"
+        assert reply.tokens_out > 0
+        # durable：chat/in + chat/done 落 audit 脊柱
+        n = await c.root.db.query(
+            c.root, "SELECT COUNT(*) AS n FROM agent_events WHERE event LIKE 'agent/chat/%'")
+        assert n[0]["n"] >= 2
+        await c.teardown()
+
+    _run(s())
+
+
+def test_chat_plain_chat_intent(tmp_path):
+    c = build_agent(config=_cfg(tmp_path))
+
+    async def s():
+        await c.assemble()
+        reply = await c.root.chat.send(c.root, "你好呀")
+        assert reply.plan["intent"] == "chat"
+        assert reply.evidence["ok"] is True
+        await c.teardown()
+
+    _run(s())
+
+
+def test_chat_ping_denied_by_tight_guard(tmp_path):
+    """矩阵收窄（deny agent.ping）→ chat 内的 ping 执行被 guard 拒绝 → 如实上报，不假成功。"""
+    c = build_agent(config=_cfg(tmp_path), patch=TIGHT_PATCH)
+
+    async def s():
+        await c.assemble()
+        reply = await c.root.chat.send(c.root, "ping 健康检查")
+        assert not reply.ok
+        assert reply.evidence["ok"] is False
+        assert "未授权" in (reply.error or "") or "guard" in (reply.error or "")
+        await c.teardown()
+
+    _run(s())
+
+
+def test_chat_honest_when_no_key(monkeypatch, tmp_path):
+    """deepseek 无 key → 规划/解说被占位 Provider 诚实拒绝 → 降级告知，不碰网络。"""
+    monkeypatch.setattr("agent.sys.llm._resolve_key", lambda ctx: None)
+    c = build_agent(config={**_cfg(tmp_path),
+                            "agent": {"llm": {"provider": "deepseek", "model": "deepseek_v4_flash"}}})
+
+    async def s():
+        await c.assemble()
+        reply = await c.root.chat.send(c.root, "你好")
+        assert not reply.ok
+        assert "key" in (reply.error or "").lower()
+        await c.teardown()
+
+    _run(s())

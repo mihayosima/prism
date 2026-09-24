@@ -1,0 +1,9 @@
+# runtime artifacts
+__pycache__/
+*.py[cod]
+data/
+*.db
+*.tmp
+
+# secrets——绝不入库
+local_secrets.json
