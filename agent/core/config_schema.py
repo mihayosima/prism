@@ -32,6 +32,7 @@ _SCHEMA: dict[str, Any] = {
     },
     # 插件自管顶层节
     "windows_mcp": "_any",
+    "playwright_mcp": "_any",
 }
 
 

@@ -6,6 +6,7 @@ data/
 *.tmp
 .pytest_cache/
 agent_runtime.egg-info/
+.playwright-mcp/
 
 # secrets——绝不入库
 local_secrets.json

@@ -26,6 +26,7 @@ class Services:
     REACT = "react"
     MEMORY = "memory"
     WINDOWS_MCP = "windows_mcp"
+    PLAYWRIGHT_MCP = "playwright_mcp"
 
 
 # 全部“内核服务键”值集合（供 AST 契约测试比对）
@@ -42,6 +43,7 @@ ALL = frozenset(
         Services.REACT,
         Services.MEMORY,
         Services.WINDOWS_MCP,
+        Services.PLAYWRIGHT_MCP,
     }
 )
 
