@@ -2,18 +2,18 @@
 
 | 文档属性 | 内容 |
 |---|---|
-| 文档状态 | **v1.1（A1 与 A3 已实施，其余未动）** —— 代码见 `agent/plugins/react/`；本卷保留为通用能力的**待办总账** |
+| 文档状态 | **v1.2（A1/A3 已实施；B5 流式 / B6 取消 / D11 依赖声明 已落地；第二步仅余 D12 CI；第三步 A2/A4/B7/B8/C9/C10 全未动；D13/D14/D15 部分）** —— 代码见 `agent/plugins/react/`；本卷保留为通用能力的**待办总账** |
 | 范围 | **通用 agent 本体**；**不含记忆**（见《记忆插件-能力缺口分析.md》）与**引擎接入**（已归档 `doc/`） |
-| 依据 | 对当前代码的逐项核实（证据见 §8），基线由 **68 项**更新为 **82 项离线测试全绿** |
+| 依据 | 对当前代码的逐项核实（证据见 §8），离线测试由 **82 项**更新为 **111 项全绿**（v1.2 核实） |
 | 关联文档 | 《agent内部架构-开发文档.md》（架构）·《ReAct插件-设计方案.md》（A1/A3 的落地设计）·《审批插件-设计方案.md》（A4/C9 的落地设计）·《记忆插件-能力缺口分析.md》· `doc/README.md`（历史归档） |
-| 编制日期 | 2026-09-24（v1.1 同日：ReAct 多步循环落地） |
+| 编制日期 | 2026-09-24（v1.1：ReAct 多步循环落地）；2026-09-25（v1.2：B5 流式 / B6 取消 / D11 依赖声明 落地，文档同步实际代码进度） |
 
 ---
 
 ## 0. 结论先行
 
 1. **核心判断（v1.1 更新）：多步循环已补齐。** 原判断「它不是 agent，是单步工具调用器」的**定义性缺口已修复**——`plugins.react` 提供了 `think → act → observe → replan` 回环，`chat` 在装配该插件时委托给它、缺省回退单步（见 §9）。
-2. **仍成立的部分**：① 循环虽已补，但**流式 / 取消 / 编排 / 审批**未做；② 三条主线顺序不变：**循环（已做）→ 体验（看得见、停得下）→ 安全与生态**。
+2. **仍成立的部分**：① 循环已补；体验层 **B5 流式 / B6 取消**已做，但 **B7 调度 / B8 会话**未做；智能体层 **A2 编排 / A4 审批**未做；② 三条主线顺序不变：**循环（已做）→ 体验（已基本能做，缺会话/调度）→ 安全与生态（未做）**。
 3. **现状不是"架构不行"，而是"几处能力没接"**：内核解耦干净、插件化彻底、审计链完整、离线确定性可测、代码内零 TODO/FIXME。缺的是**运行控制**与**工程化收口**。
 
 > 一句话：**先补"循环"，再补"看得见的体验"，最后才是"安全与生态"。**
@@ -29,13 +29,13 @@
 | 工具编排（并行/串行） | ⚠️ 部分：同轮可多工具但**顺序执行**；`EventBus.parallel/serial` 仍无消费方 | `agent/plugins/react/components.py` · `DefaultActor` |
 | 上下文治理（结果截断/压缩） | ⚠️ 部分：**结果截断 + 历史裁剪已做**；摘要压缩 / token 感知裁剪未做 | `agent/plugins/react/prompt.py` `truncate` · `loop.py` `_trim` |
 | 人在环中确认（ask） | ❌ 无（只有 allow/deny）；`permission_mode`/`Tool.risk` 已预留 | `agent/sys/guard.py` `_decide` · `agent/sys/tasks.py` `RISKS` |
-| 流式输出 | ❌ 无 | `/api/chat` 一次性 `JSONResponse` |
-| 取消 / 中断 | ❌ 无（仅进程级 Ctrl+C） | `AgentDriver` 协议只有 `run` |
+| 流式输出 | ✅ 有（B5 打字机 + D4 思考流，SSE 逐段吐字，已验证） | `events_catalog.LLM_TOKEN`/`LLM_THINKING` + `progress.py` 帧 + `chat.py` 打字机；实测 SSE `thinking×16 + token×33` |
+| 取消 / 中断 | ✅ 有（B6） | `/api/chat/cancel` 端点 + `AgentDriver.cancel()`/`when_idle()` 协议 + `test_progress` B6 用例 |
 | 定时 / 周期任务 | ❌ 无 | `agent/sys/` 无 scheduler 模块 |
 | 会话持久化 / 多会话 | ❌ 无 | `session_id` 由入口进程 `uuid4()` 生成 |
 | 事务 | ❌ 无 | `agent/sys/storage.py` 仅 `execute` / `query` |
 | LLM 重试 / 退避 | ❌ 无 | `DeepSeekLlm.complete`：超时写死 90s，无重试 |
-| 依赖声明 | ❌ 无 | `pyproject.toml` 无 `[project.dependencies]`、无 `[build-system]` |
+| 依赖声明 | ✅ 有 | `pyproject.toml` 现有 `dependencies=[fastapi,uvicorn,httpx]` + `[build-system]` |
 | 插件生命周期 `start()` | ❌ 无人实现 | 仅 scaffold 模板里有；无任何插件落地 |
 | 插件 `status()` 自述 | ⚠️ `windows_mcp` / `plugins.react` 有 | `container.plugin_statuses()` 支持，多数插件未实现 |
 | lint / 类型检查 / CI | ❌ 无 | `pyproject.toml` 只有 pytest 配置 |
@@ -78,8 +78,8 @@
 
 | # | 事项 | 现状 | 目标 |
 |---|---|---|---|
-| B5 | **流式输出** | `/api/chat` 一次性 JSON，长任务全程转圈 | SSE 逐段吐字（解说与中间步骤） |
-| B6 | **取消 / 中断** | 只能 Ctrl+C 杀进程 | cancel 端点 + 恢复 `AgentDriver` 的 `cancel` / `when_idle` 协议 |
+| B5 | **流式输出** | ✅ **已实施** | SSE 逐段吐字（token 帧解说 + thinking 帧思考链）；实测可用 |
+| B6 | **取消 / 中断** | ✅ **已实施** | `/api/chat/cancel` + `AgentDriver.cancel()`/`when_idle()`，任意 await 点即时生效 |
 | B7 | **定时 / 周期任务** | **无 scheduler** | 新增 scheduler 插件（interval / daily），owner 归属 + 停用自动清任务 |
 | B8 | **会话管理** | `session_id` 进程内生成，重启即新会话 | 多会话、持久化、恢复、标题；`/api/session` 扩展 |
 
@@ -106,11 +106,11 @@
 
 | # | 事项 | 现状 | 目标 |
 |---|---|---|---|
-| D11 | **依赖声明** | `pyproject.toml` 无 `dependencies`、无 `[build-system]`，而代码已用 `httpx` / `fastapi` / `uvicorn` | 声明依赖与构建后端 ⇒ 干净环境可装可跑（**成本最低，建议最先做**） |
+| D11 | **依赖声明** | ✅ **已实施** | `pyproject.toml` 现有 `dependencies` + `[build-system]`，干净环境可 `pip install` |
 | D12 | **lint / 类型 / CI** | 仅有 pytest 配置 | ruff + 类型检查 + CI 流水线 |
 | D13 | **可观测** | 仅事件面；无 trace / 指标 / 成本看板 | 结构化日志、关键指标、成本统计；插件 `status()` 补齐 |
 | D14 | **插件 SDK 与文档** | `scaffold` 模板薄；无插件配置 schema；`start()` 无人用 | 插件开发指南、配置 schema、生命周期钩子真正落地 |
-| D15 | **测试补强** | 82 项离线测试（无网络/无外部进程） | provider 契约测试、MCP 集成测试、**回归集 / eval**（改提示词能看出变好还是变坏） |
+| D15 | **测试补强** | 111 项离线测试全绿（无网络/无外部进程；新增 B5/B6/内核用例）；**回归集 / eval 未做** | provider 契约测试、MCP 集成测试、**回归集 / eval**（改提示词能看出变好还是变坏） |
 
 ---
 
@@ -119,9 +119,9 @@
 | 步骤 | 内容 | 目标 / 验收 | 状态 |
 |---|---|---|---|
 | **第一步 · 让它真"通用"** | A1 多步循环 + A3 上下文治理 + A1 的三把闸（步数/时延/token） | 能完成"多步工具链"任务（如：先查再改再验），且步数/预算触顶时**优雅停止并如实说明** | ✅ **已达成**（`plugins.react`；13 项新用例覆盖多步链、失败自纠、双触顶、结果截断、chat 委托与回退） |
-| **第二步 · 可交付** | B5 流式 + B6 取消 + D11 依赖声明 + D12 CI | 干净环境可装可跑；长任务可见过程、可中断；每次提交自动跑测试 | ⏳ 未开始（B5/B6 与 A4 共用"中途回话通道"） |
+| **第二步 · 可交付** | B5 流式 + B6 取消 + D11 依赖声明 + D12 CI | 干净环境可装可跑；长任务可见过程、可中断；每次提交自动跑测试 | ✅ **B5/B6/D11 已达成**；⏳ **仅余 D12 CI/lint 未做** |
 | **第三步 · 规模化** | B7 调度器、B8 会话管理、A2 工具编排、A4 人工确认、C9 安全分级、C10 重试 | 具备常规 agent 运行时形态（周期任务、会话、编排、风控） | ⏳ 未开始（A4/C9 已有接口预留与设计） |
-| 收尾 | D13 可观测、D14 SDK/文档、D15 测试补强 | 可持续演进 | ⏳ 部分：`plugins.react` 已实现 `status()` 钩子（D13 一小步） |
+| 收尾 | D13 可观测、D14 SDK/文档、D15 测试补强 | 可持续演进 | ⏳ 部分：`plugins.react` 已实现 `status()`；`playwright_mcp` 按 SDK 封装成功（D14 验证）；测试 82→111（D15 部分） |
 
 > 原则：每一步都能独立验收、独立回滚；不引入新依赖前先补 D11。
 
@@ -148,12 +148,12 @@
 | EventBus 五模式仅用两种 | `agent/sys/llm.py`（`waterfall` / `emit`）· `agent/sys/tasks.py`（`waterfall` / `emit`）· `agent/sys/chat.py`（`emit`）· `agent/plugins/react/loop.py`（`emit`） |
 | guard 只有 allow / deny | `agent/sys/guard.py` · `_decide` |
 | 权限模式接口已预留 | `agent/sys/tasks.py` · `RISKS` / `register(risk=…)`；`agent/plugins/react/loop.py` · `visible_tools`（恒全量） |
-| AgentDriver 协议只有 `run` | `agent/sys/loop.py` · `class AgentDriver(Protocol)` |
+| AgentDriver 协议含 `run` + `cancel`/`when_idle`（B6） | `agent/sys/loop.py` · `class AgentDriver(Protocol)` + 具体实现 `cancel()`/`when_idle()` |
 | 无 scheduler | `agent/sys/` 目录无 scheduler 模块 |
 | 无事务 | `agent/sys/storage.py` · 仅 `execute` / `query` / `close` |
-| 无取消 | `agent/run/chat.py` · 仅进程级 `KeyboardInterrupt` |
+| 取消 | `agent/run/chat.py` · `/api/chat/cancel` + `AgentDriver.cancel()`/`when_idle()`（B6，v1.2） |
 | session_id 进程内生成 | `agent/run/chat.py` · `session_id = uuid.uuid4().hex[:8]` |
-| 依赖未声明 | `pyproject.toml`（无 `dependencies` / `build-system`）vs `agent/sys/llm.py`（httpx）· `agent/run/chat.py`（fastapi / uvicorn） |
+| 依赖已声明 | `pyproject.toml` `dependencies=[fastapi,uvicorn,httpx]` + `[build-system]`（D11，v1.2） |
 | LLM 无重试 / 超时写死 | `agent/sys/llm.py` · `DeepSeekLlm.complete`（`timeout=90.0`，无 retry） |
 | `ctx.state` 不持久 | `agent/sys/budget.py` · `ctx.state["budget_spent"]` |
 | `start()` 钩子无人实现 | 全仓仅 `agent/sys/plugin_manager.py` 的 scaffold 模板中出现 |
@@ -166,4 +166,5 @@
 | 日期 | 变更 |
 |---|---|
 | 2026-09-24 | **A1 落地**：新增目录插件 `plugins.react`（`agent/plugins/react/`，四文件：`prompt/components/loop/__init__`），默认启用；`chat` 经 `ctx.has("react")` 软委托、停用即回退单步。**A3 部分落地**（结果截断 + 历史裁剪）。**A4/C9 接口预留**（`permission_mode` / `visible_tools` / `Tool.risk`，行为未变）。`LlmProvider` 加法式支持 `tools`/`tool_calls`；插件加载器支持"插件包"。测试 68 → **82 项全绿**。设计与实现详见《ReAct插件-设计方案.md》。 |
-| — | 未做项（保持范围）：A2 并行编排、A4 审批本体、B5 流式、B6 取消、B7 调度器、B8 会话管理、C9 分级判定、C10 重试、D11–D12 工程化。 |
+| 2026-09-25 | **v1.2 同步**：实测代码后更新状态——**B5 流式、B6 取消、D11 依赖声明** 由 ❌ 改为 ✅（此前文档滞后于代码）。离线测试 82 → **111**。新增非主线交付：插件管理页显示全部插件（含 system 层）、`playwright_mcp` 目录插件（封装 microsoft/playwright-mcp，25 个 `browser_*` 工具）、内核优化 K0–K5（解耦硬化）。 |
+| — | **仍为未做项**：A2 并行编排、A4 审批本体、B7 调度器、B8 会话管理、C9 分级判定、C10 重试、D12 CI/lint；D13/D14/D15 仅部分。 |
