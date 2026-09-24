@@ -7,6 +7,8 @@ payload 一律纯数据（可 JSON 化）——「事件=扩展点，payload 只
 
 监听器绑定注册它的 ctx：分发时 ctx 已关闭（插件已卸载）→ 跳过并剪除（防死引用）。
 在途的 fire-and-forget 异步任务由总线追踪，aclose() 时取消并等待，避免 teardown 后残留。
+
+（注：parallel / serial / bail 三模式已移除——无生产消费方，属 YAGNI，详见内核优化方案 K-5。）
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import inspect
 import logging
 from typing import TYPE_CHECKING, Any, Callable
 
-from .errors import EventDispatchError, EventWiringError
+from .errors import EventWiringError
 
 if TYPE_CHECKING:
     from .context import Context
@@ -24,13 +26,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger("agent.events")
 
 _PURE = (type(None), bool, int, float, str)
-
-_BAIL: Any = object()                      # 内部哨兵："无 bail 值"
-
-
-def _is_bail(value: Any) -> bool:
-    """bail 语义（对齐 Cordis）：非 None 且非 False 视为短路/决策值。"""
-    return value is not None and value is not False
 
 
 def _assert_pure_data(args: tuple[Any, ...], what: str) -> None:
@@ -161,50 +156,6 @@ class EventBus:
             return await next_from(0)
         finally:
             self._prune(name)
-
-    async def parallel(self, name: str, *args: Any) -> None:
-        """并发 await 全部；任一失败 → 聚合 EventDispatchError。"""
-        if self.strict_payload:
-            _assert_pure_data(args, f"parallel({name!r})")
-        entries = [e for e in self._snapshot(name) if not e.ctx.closed]
-        if not entries:
-            return
-        results = await asyncio.gather(
-            *(self._invoke_one(e, args, name) for e in entries), return_exceptions=True
-        )
-        self._prune(name)
-        errors = [r for r in results if isinstance(r, BaseException)]
-        if errors:
-            raise EventDispatchError(f"parallel({name!r}): 聚合 {len(errors)} 个失败")
-
-    async def serial(self, name: str, *args: Any) -> Any:
-        """注册序完整执行；返回首个 bail 值（若有）；错误中止传播。"""
-        if self.strict_payload:
-            _assert_pure_data(args, f"serial({name!r})")
-        found: Any = _BAIL
-        for entry in self._snapshot(name):
-            if entry.ctx.closed:
-                continue
-            result = await self._invoke_one(entry, args, name)
-            if found is _BAIL and _is_bail(result):
-                found = result
-        self._prune(name)
-        return None if found is _BAIL else found
-
-    async def bail(self, name: str, *args: Any) -> Any:
-        """注册序，首个「非 None 非 False」值即短路返回；无值返回 None；错误传播。"""
-        if self.strict_payload:
-            _assert_pure_data(args, f"bail({name!r})")
-        found: Any = None
-        for entry in self._snapshot(name):
-            if entry.ctx.closed:
-                continue
-            result = await self._invoke_one(entry, args, name)
-            if _is_bail(result):
-                found = result
-                break
-        self._prune(name)
-        return found
 
     # ---------- 内部 ----------
 
