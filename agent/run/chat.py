@@ -631,7 +631,9 @@ async def _serve(args: argparse.Namespace) -> int:
             rows.append({**d, "id": d["name"], "desired": e, "actual": a, "delta": delta,
                          "status": status_map.get(d["name"])})
         for m in manifest:
-            if m.get("layer") == "system" or m["id"] in discovered_ids:
+            # 含 system 层插件一同展示（只读：前端对 delta=="system/builtin" 隐藏操作按钮）。
+            # 仅按 discovered 去重，避免目录插件与其 manifest 项重复出现。
+            if m["id"] in discovered_ids:
                 continue
             rows.append({**m, "name": m["id"], "desired": True, "actual": True,
                          "delta": "system/builtin",
