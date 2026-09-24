@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -20,7 +21,8 @@ class LlmProvider(Protocol):
     interface_version = (1, 0)
 
     async def complete(self, ctx: Any, messages: list[dict],
-                       schema: dict | None = None) -> dict: ...
+                       schema: dict | None = None,
+                       tools: list[dict] | None = None) -> dict: ...
 
 
 @dataclass(slots=True)
@@ -47,7 +49,8 @@ class PlaceholderLlm:
         self._provider = provider
 
     async def complete(self, ctx: Any, messages: list[dict],
-                       schema: dict | None = None) -> dict:
+                       schema: dict | None = None,
+                       tools: list[dict] | None = None) -> dict:
         raise CapabilityNotImplemented(
             "agent.llm.complete",
             f"provider={self._provider!r} 未接入（fixture 离线走通；真实实现需凭据/适配）",
@@ -66,15 +69,18 @@ class LlmService:
         return getattr(self._provider, "label", type(self._provider).__name__)
 
     async def complete(self, ctx, messages: list[dict], *,
-                       schema: dict | None = None, caller: str = "unknown") -> LlmResult:
+                       schema: dict | None = None, tools: list[dict] | None = None,
+                       caller: str = "unknown") -> LlmResult:
         decision = await ctx.events.waterfall(
-            "agent/llm/pre-call", {"messages": messages, "schema": schema, "caller": caller}
+            "agent/llm/pre-call",
+            {"messages": messages, "schema": schema, "caller": caller,
+             "tools": [str(t.get("name", "")) for t in (tools or [])]},
         )
         if isinstance(decision, dict) and decision.get("denied"):
             raise CapabilityNotImplemented(
                 "agent.llm.complete", decision.get("reason", "被 guard/budget 否决")
             )
-        data = await self._provider.complete(ctx, messages, schema=schema)
+        data = await self._provider.complete(ctx, messages, schema=schema, tools=tools)
         tokens_in, tokens_out = _tokens(messages), _tokens(data)
         await ctx.events.emit("agent/llm/post-call", {
             "provider": self._model, "tokens_in": tokens_in, "tokens_out": tokens_out,
@@ -99,10 +105,107 @@ def _parse_json(text: str) -> dict:
     return data
 
 
+def _wire_messages(messages: list[dict]) -> list[dict]:
+    """内部消息形状 → OpenAI 兼容 wire 形状（无工具时等价恒等）。
+
+    内部：``{"role": "assistant", "content": str, "tool_calls": [{id,name,arguments}]}``
+    与 ``{"role": "user", "content": {"tool_results": [...]}}``（观察回灌）。
+    wire：assistant.tool_calls[].function.arguments 为 JSON 字符串；观察展开为多条 role=tool。
+    """
+    out: list[dict] = []
+    for m in messages or []:
+        role = m.get("role")
+        content = m.get("content")
+        if role == "assistant" and m.get("tool_calls"):
+            calls = []
+            for i, c in enumerate(m.get("tool_calls") or []):
+                calls.append({
+                    "id": str(c.get("id") or f"call_{i}"),
+                    "type": "function",
+                    "function": {"name": str(c.get("name") or ""),
+                                 "arguments": json.dumps(c.get("arguments") or {},
+                                                         ensure_ascii=False)},
+                })
+            out.append({"role": "assistant",
+                        "content": content if isinstance(content, str) and content else None,
+                        "tool_calls": calls})
+            continue
+        if isinstance(content, dict) and content.get("tool_results") is not None:
+            for r in content["tool_results"]:
+                out.append({"role": "tool",
+                            "tool_call_id": str(r.get("tool_call_id") or ""),
+                            "content": str(r.get("content") or "")})
+            continue
+        if isinstance(content, str):
+            out.append({"role": role, "content": content})
+        else:
+            out.append({"role": role, "content": json.dumps(content, ensure_ascii=False)})
+    return out
+
+
+_JSON_TYPES = {"str": "string", "int": "integer", "float": "number",
+               "bool": "boolean", "array": "array", "object": "object"}
+
+# OpenAI / DeepSeek 工具名硬约束：仅允许 ^[a-zA-Z0-9_-]+$。
+# 内部工具名带命名空间（如 mcp.windows.xxx、agent.ping），发往模型前必须净化，
+# 模型回传的净化名再映射回内部原名以驱动 ctx.tasks.invoke。
+_TOOL_NAME_UNSAFE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _safe_tool_name(name: str) -> str:
+    """内部工具名 → 合规 wire 名（非法字符替换成 '_'）。"""
+    safe = _TOOL_NAME_UNSAFE.sub("_", name or "")
+    return safe or "tool"
+
+
+def _wire_tools(tools: list[dict]) -> tuple[list[dict], dict[str, str]]:
+    """工具目录（``TaskRegistry.catalog()`` 形状）→ OpenAI 兼容 tools 数组。
+
+    返回 ``(wired_tools, {safe_name: original_name})``：映射表供回程把模型
+    回传的净化名还原成内部原名，避免命名空间信息在 wire 上丢失。
+    重名冲突（不同原名净化后相同）自动追加 ``_2`` / ``_3`` 后缀消歧。
+    """
+    out: list[dict] = []
+    name_map: dict[str, str] = {}
+    seen: dict[str, str] = {}
+    for t in tools or []:
+        orig = str(t.get("name") or "")
+        base = _safe_tool_name(orig)
+        safe = base
+        i = 2
+        while safe in seen and seen[safe] != orig:
+            safe = f"{base}_{i}"
+            i += 1
+        seen[safe] = orig
+        name_map[safe] = orig
+        props = {k: {"type": _JSON_TYPES.get(str(v.get("type", "object")), "object")}
+                 for k, v in (t.get("params") or {}).items()}
+        out.append({"type": "function", "function": {
+            "name": safe,
+            "description": str(t.get("description") or "")[:200],
+            "parameters": {"type": "object", "properties": props,
+                           "required": [str(k) for k in (t.get("required") or [])]}}})
+    return out, name_map
+
+
+def _wire_call(raw: dict, name_map: dict[str, str] | None = None) -> dict:
+    fn = raw.get("function") or {}
+    raw_name = str(fn.get("name") or "")
+    # 模型回传的是净化名，还原成内部原名（找不到则原样回退，兼容 fixture 路径）
+    name = (name_map or {}).get(raw_name, raw_name)
+    try:
+        args = json.loads(fn.get("arguments") or "{}")
+    except (TypeError, ValueError):
+        args = {}
+    return {"id": str(raw.get("id") or ""), "name": name,
+            "arguments": args if isinstance(args, dict) else {}}
+
+
 class DeepSeekLlm:
     """DeepSeek 官方 API（OpenAI 兼容 chat/completions）。零业务词；凭据不落代码。
 
     key 解析：config.agent.llm.api_key → env DEEPSEEK_API_KEY → 工程根 local_secrets.json。
+    ``tools`` 走 native function-calling（wire 转换见 ``_wire_messages`` / ``_wire_tools``）。
     """
 
     interface_version = (1, 0)
@@ -114,14 +217,19 @@ class DeepSeekLlm:
         self._key = api_key
 
     async def complete(self, ctx: Any, messages: list[dict],
-                       schema: dict | None = None) -> dict:
+                       schema: dict | None = None,
+                       tools: list[dict] | None = None) -> dict:
         import httpx
 
-        payload = {
+        payload: dict = {
             "model": self._model,
-            "messages": messages,
+            "messages": _wire_messages(messages),
             "temperature": 0.2,
         }
+        if tools:
+            wired_tools, name_map = _wire_tools(tools)
+            payload["tools"] = wired_tools
+            payload["tool_choice"] = "auto"
         if schema:
             payload["response_format"] = {"type": "json_object"}
         headers = {"Authorization": f"Bearer {self._key}",
@@ -130,7 +238,12 @@ class DeepSeekLlm:
             resp = await client.post(self.BASE_URL, json=payload, headers=headers)
         if resp.status_code != 200:
             raise AgentError(f"deepseek api 异常 {resp.status_code}: {resp.text[:200]}")
-        content = resp.json()["choices"][0]["message"]["content"]
+        message = resp.json()["choices"][0]["message"]
+        content = message.get("content") or ""
+        raw_calls = message.get("tool_calls") or []
+        if raw_calls:                                  # 工具调用优先（可能 content 为空）
+            return {"text": content,
+                    "tool_calls": [_wire_call(c, name_map) for c in raw_calls]}
         # 有 schema（要结构化）→ 解析 JSON；无 schema（要散文）→ 原样文本
         if schema is None:
             return {"text": content}

@@ -4,6 +4,8 @@ __pycache__/
 data/
 *.db
 *.tmp
+.pytest_cache/
+agent_runtime.egg-info/
 
 # secrets——绝不入库
 local_secrets.json

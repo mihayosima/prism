@@ -3,10 +3,12 @@
 slim Cordis 运行时 + 系统层插件 + 可管理目录插件（everything-is-a-plugin）。独立可离线自举，零外部引擎依赖。
 
 - 内核：`agent/`（`agent.api` 唯一出口）
-- 设计文档（工程根）：《agent内部架构-开发文档.md》《agent记忆架构-方案.md》《记忆插件-能力缺口分析.md》《agent通用能力-完善路线.md》
+- 设计文档（工程根）：《agent内部架构-开发文档.md》《agent记忆架构-方案.md》《记忆插件-能力缺口分析.md》《agent通用能力-完善路线.md》《ReAct插件-设计方案.md》《审批插件-设计方案.md》
 - 历史归档（**不作为工作文件参考**）：`doc/` —— 专用领域设计 / 接口接入设计 / 旧计划与路线图，说明见 `doc/README.md`
 
-**已完成**：内核（`agent.api`）· 系统插件（events / loop / llm / tasks / storage / budget / guard）· 双驱动（`loop` 任务驱动 + `chat` 会话驱动）· 真实 DeepSeek provider · 目录插件管理（引擎式 desired/actual/delta，插件页可启用 / 停用 / 卸载）· 记忆插件 `plugins.memory`（LLM 提取[过 guard/budget] + 打分衰减 + recall/context 注入；**目录插件形态，默认启用**）· MCP 工具桥 `plugins.windows_mcp`。**68 项离线测试全绿。**
+**已完成**：内核（`agent.api`）· 系统插件（events / loop / llm / tasks / storage / budget / guard）· 双驱动（`loop` 任务驱动 + `chat` 会话驱动）· 真实 DeepSeek provider · 目录插件管理（引擎式 desired/actual/delta，插件页可启用 / 停用 / 卸载）· 记忆插件 `plugins.memory`（LLM 提取[过 guard/budget] + 打分衰减 + recall/context 注入；**目录插件形态，默认启用**）· **ReAct 多步循环插件 `plugins.react`**（Think→Act+Observe→收敛 + `max_steps`/时延/预算三把闸 + 工具结果截断；**目录插件形态，默认启用**）· MCP 工具桥 `plugins.windows_mcp`。**82 项离线测试全绿。**
+
+**ReAct 多步循环（`plugins.react`）**：`chat` 检测到 `ctx.has("react")` 即**委托**给 ReAct 循环（未装配自动回退单步「规划→执行→解说」，chat 契约未改）。收敛判据 = 模型**不再返回工具调用**；工具一律经 `ctx.tasks.invoke`（guard/schema/审计照生效），模型一律经 `ctx.llm`（guard/budget 照生效）——**无特权通道**。工具异常/参数错/被拒都转成观察回灌让模型自纠（同一工具连拒超 `max_rejects` 才终止）；触顶时如实标注（durable `agent/react/exhausted`）并再答一次。四组件（reasoner/actor/observer/finalizer）是**可换接缝**：`ctx.provide("react.actor", ...)` 即可替换。停用插件 → 回到单步路径。
 
 **工具调用（tool calling）**：任务注册表提供 `catalog()` 动态工具目录；chat 新增 `tool_call` 意图——规划器从工具目录里选工具、执行仍过 guard 白名单。前端有"🛠️ 工具"视图。
 

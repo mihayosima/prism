@@ -80,3 +80,45 @@ def test_build_agent_assembles_only_enabled_dir_plugin(tmp_path):
     finally:
         _drop_module("hello_probe")
         pm.remove("plugins.hello_probe")
+
+
+def test_package_plugin_with_relative_import_loads(tmp_path):
+    """插件包（以 ``__init__.py`` 为入口）支持包内相对导入 —— 多文件插件的加载前提。"""
+    pm = _pm(tmp_path)
+    pkg = tmp_path / "plugins" / "pkgprobe"
+    pkg.mkdir(parents=True)
+    (pkg / "helper.py").write_text("VALUE = 'ok'\n", encoding="utf-8")
+    (pkg / "__init__.py").write_text(
+        '"""插件包探针（多文件 + 相对导入）。"""\n'
+        "from agent.api import plugin\n"
+        "from .helper import VALUE\n"
+        "\n"
+        "\n"
+        "@plugin\n"
+        "class PkgProbe:\n"
+        "    name = 'plugins.pkgprobe'\n"
+        "    provides = ['pkgprobe']\n"
+        "    value = VALUE\n"
+        "\n"
+        "    async def apply(self, ctx):\n"
+        "        ctx.provide('pkgprobe', self)\n",
+        encoding="utf-8")
+    pm.set_enabled("plugins.pkgprobe", True)
+    _drop_module("pkgprobe")
+    _drop_module("pkgprobe.helper")
+    try:
+        assert any(c["name"] == "plugins.pkgprobe" for c in pm.discovered())
+        loaded = pm.load()
+        p = next(x for x in loaded if x.id == "plugins.pkgprobe")
+        assert p._obj().value == "ok"          # 相对导入成功（子模块已执行）
+
+        async def s():
+            c = build_agent(config={"db_path": str(tmp_path / "p.db")}, plugin_mgr=pm)
+            await c.assemble()
+            assert c.root.has("pkgprobe")
+            await c.teardown()
+
+        _run(s())
+    finally:
+        _drop_module("pkgprobe")
+        _drop_module("pkgprobe.helper")

@@ -4,6 +4,8 @@
   send(message) → ①规划（LLM→JSON intent）→ ②执行（走 tasks/只读面，guard 矩阵照样裁决）
   → ③解说（LLM 按机器证据复述成友好 markdown）。
 
+- 多步：若装配了 ``plugins.react``（``ctx.has("react")``）→ **委托**给 ReAct 循环
+  （Think→Act+Observe→收敛），chat 自身契约不变；未装配即回退下方单步路径。
 - 执行一律经 `tasks.invoke`（guard 照生效、owner/caller 审计）。
 - durable 事件：`agent/chat/in`、`agent/chat/done`（审计脊柱）。
 - LLM 任何一步被拒（预算/guard/解析失败）→ 诚实降级：不给假成功，解说用证据兜底。
@@ -88,6 +90,10 @@ class ChatDriver:
         await self._append(ctx, session_id, "user", message)
         history = await self._history(ctx, session_id, limit=HISTORY_LIMIT)
         prior = history[:-1]              # 除本条外的最近历史 → 作为会话上下文喂给模型
+        # 多步 ReAct（plugins.react，目录插件）：装配了则**委托**；缺省回退下方单步路径。
+        # 契约不变：chat 只经 ctx.has("react") 感知其存在，不 import 其实现。
+        if ctx.has("react"):
+            return await self._send_via_react(ctx, message, session_id, prior)
         plan = await self._plan(ctx, message, prior)
         evidence = await self._execute(ctx, plan)
         text, ti, to, error = await self._narrate(ctx, plan, evidence, message, prior)
@@ -111,6 +117,35 @@ class ChatDriver:
         return ChatReply(text=text, plan=plan, evidence=evidence,
                          tokens_in=ti, tokens_out=to, ok=ok, error=reply_error,
                          session_id=session_id)
+
+    # ---------- 多步循环（plugins.react 委托路径） ----------
+
+    async def _send_via_react(self, ctx, message: str, session_id: str,
+                              prior: list[dict]) -> ChatReply:
+        """把本轮交给 ReAct 循环（多步 Think→Act+Observe），再按同一纪律收尾。
+
+        与单步路径保持同一外部纪律：写短期记忆（user/assistant）、写 durable
+        ``agent/chat/done``、喂 ``ctx.memory``（若启用）、返回 ``ChatReply``。
+        """
+        res = await ctx.react.run(ctx, message, session_id=session_id, prior=prior)
+        text = res.text or "（无回复）"
+        await self._append(ctx, session_id, "assistant", text)
+        if ctx.has("memory"):
+            try:
+                await ctx.memory.remember(ctx, {
+                    "user": message, "reply": text,
+                    "plan": {"intent": "react"}, "evidence": res.as_evidence(),
+                })
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger("agent.chat").warning("memory remember failed: %s", exc)
+        await durable(ctx, "agent/chat/done", {
+            "intent": "react", "ok": res.ok,
+            "error": None if res.ok else res.reason,
+            "session_id": session_id, "at": _now_iso(),
+        })
+        return ChatReply(text=text, plan={"intent": "react"}, evidence=res.as_evidence(),
+                         tokens_in=res.tokens_in, tokens_out=res.tokens_out, ok=res.ok,
+                         error=None if res.ok else res.reason, session_id=session_id)
 
     # ---------- 短期记忆：会话转写（session-scoped 历史） ----------
 

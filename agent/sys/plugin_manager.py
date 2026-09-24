@@ -1,6 +1,7 @@
 """agent.sys.plugin_manager —— 插件管理（发现/启停/新增/卸载），语义对齐引擎 PluginManager。
 
-- 约定目录：``agent/plugins/<业务名>/__init__.py``（或 plugin.py）内含 ``@plugin`` 类。
+- 约定目录：``agent/plugins/<业务名>/__init__.py``（或 ``plugin.py``）内含 ``@plugin`` 类。
+  以 ``__init__.py`` 为入口的插件是**插件包**：可含子模块并用包内相对导入（``from .loop import …``）。
 - 期望态：``data/agent_plugin_state.json``（enabled / removed）。
 - 诚实边界：装配在启动时一次性完成 → 启停为「重启/重建后生效」（不热插拔）；卸载 = 停用 + 删目录 + removed 标记。
 
@@ -22,6 +23,8 @@ from agent.api import Plugin
 logger = logging.getLogger("agent.plugin_manager")
 
 _MARKERS = ("__init__.py", "plugin.py")
+
+_NS_PKG = "agent_plugins"        # 目录插件的命名空间父包（使插件可作为「包」被加载）
 
 _PLUGIN_TEMPLATE = '''"""插件包：{name}（一个业务 = 一个插件）。
 
@@ -208,13 +211,41 @@ def _find_locator(pkg_dir: Path) -> Path | None:
     return None
 
 
+def _ensure_namespace_pkg() -> None:
+    """登记命名空间父包 ``agent_plugins``（只建一次）。
+
+    有了它，插件包内的相对导入（``from .loop import X``）才能解析 —— 否则
+    ``agent_plugins.react`` 没有父包，`__path__` 子模块查找会失败。
+    """
+    if _NS_PKG in sys.modules:
+        return
+    import types
+
+    ns = types.ModuleType(_NS_PKG)
+    ns.__path__ = []              # 命名空间包：子模块由 sys.modules 直接登记
+    sys.modules[_NS_PKG] = ns
+
+
 def _load_module(locator: Path) -> Any:
-    module_name = f"agent_plugins.{locator.parent.name}"
-    spec = importlib.util.spec_from_file_location(module_name, locator)
+    """加载插件模块。
+
+    - ``__init__.py``（插件**包**）：以包方式加载（带 ``__path__``）→ 包内相对导入可用，
+      按设计可分多文件（prompt / components / loop / __init__）。
+    - ``plugin.py``（单文件插件）：普通模块加载。
+    """
+    _ensure_namespace_pkg()
+    module_name = f"{_NS_PKG}.{locator.parent.name}"
+    if locator.name == "__init__.py":
+        spec = importlib.util.spec_from_file_location(
+            module_name, locator, submodule_search_locations=[str(locator.parent)])
+    else:
+        spec = importlib.util.spec_from_file_location(module_name, locator)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load plugin module {locator}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
+    if locator.name == "__init__.py":
+        setattr(sys.modules[_NS_PKG], locator.parent.name, module)
     spec.loader.exec_module(module)
     return module
 

@@ -5,7 +5,7 @@
 | 文档状态 | **v2.0（通用型 agent）开发文档** —— 同步至当前实现 |
 | 归属 | 通用 agent 运行时（`agent/`，独立可自举，不依赖任何外部引擎/Node） |
 | 哲学来源 | DeepSeek-Harness 的「everything-is-a-plugin ⇒ Cordis」——**slim 重实现**，只借骨架不搬产品（§1） |
-| 关联文档 | 《agent记忆架构-方案.md》（记忆子系统设计与落点）·《记忆插件-能力缺口分析.md》（记忆现状待办）·《agent通用能力-完善路线.md》（通用能力待办与优先级）· `README.md`（运行入口与现状摘要）· `doc/`（历史归档：领域与接口设计，**不作工作参考**） |
+| 关联文档 | 《agent记忆架构-方案.md》（记忆子系统设计与落点）·《记忆插件-能力缺口分析.md》（记忆现状待办）·《agent通用能力-完善路线.md》（通用能力待办与优先级）·《ReAct插件-设计方案.md》（多步循环设计，§2 A1 的落地）· `README.md`（运行入口与现状摘要）· `doc/`（历史归档：领域与接口设计，**不作工作参考**） |
 | 编制日期 | 2026-09-22（v1.0）／**2026-09-24（v2.0：由领域施工文档改写为通用型 agent 开发文档）** |
 
 > **v2.0 变更说明**：v1.0 是面向特定领域的施工文档（含技能库 / 评分管线 / 领域数据表 / 引擎桥）。v2.0 移除全部领域与引擎专用内容，改为**如实描述当前通用 agent 实现**：内核 + 系统插件 + 两个 driver（loop / chat）+ 可管理的目录插件 + MCP 工具桥 + 记忆子系统。领域内容（如选品策略）落在各自的领域文档中，不进入本卷。
@@ -15,7 +15,7 @@
 ## 0. 结论先行
 
 1. **Agent = 自带宿主的 slim Cordis 运行时**：自己一份 `agent.api`（Context / @plugin / Container / EventBus / effects / errors），零 `import engine.*`、零 Node、零三方重依赖；**可离线自举**（无网络、无真实模型即可跑通对话闭环）。
-2. **一切皆插件，内核无特权**：主循环 `loop`、模型接缝 `llm`、任务注册表 `tasks`、事件 `events`、存储 `storage`、预算 `budget`、权限 `guard`、会话驱动 `chat` **全部是插件**；业务能力（记忆、工具桥）同样以插件挂入。
+2. **一切皆插件，内核无特权**：主循环 `loop`、模型接缝 `llm`、任务注册表 `tasks`、事件 `events`、存储 `storage`、预算 `budget`、权限 `guard`、会话驱动 `chat` **全部是插件**；业务能力（记忆、工具桥）与**多步循环（`react`）**同样以插件挂入。
 3. **「来源」与「层级」是两个正交的轴**：**来源**（内置 builtin / 目录 `agent/plugins/`）决定**生命周期**（能否启用 / 停用 / 卸载）；**layer**（`system` / `business`）只是**语义标签**。可管理性由来源判定（`delta ≠ system/builtin`），与 layer 无关。
 4. **事件是扩展点，按三域切分**：durable 落库 / live 在途 / capability 挂在接缝上；五种 dispatch 模式做控制面（§8）。
 5. **审计即轴心（model-visible means logged）**：凡进模型、进裁决的输入，都能从 `agent_events` / `agent_budget_log` 重建；tokens 逐条核算。
@@ -70,12 +70,13 @@ agent/                            ← agent 运行时（slim Cordis 重实现，
 │  └─ plugin_manager.py                  目录插件：发现 / 启停 / 新增 / 卸载（§7）
 ├─ plugins/              目录插件（来源 = 目录 ⇒ 可启停卸；layer 只是语义标签）
 │  ├─ memory/       plugins.memory       记忆子系统（layer=system，默认启用）
+│  ├─ react/        plugins.react        ReAct 多步工具循环（layer=system，默认启用；prompt/components/loop 三子模块）
 │  └─ windows_mcp/  plugins.windows_mcp  windows-mcp 工具桥（layer=business，默认启用）
-├─ fixtures/llm.py       离线确定性 LLM 夹具（零触网）
+├─ fixtures/llm.py       离线确定性 LLM 夹具（零触网；chat/memory/react 五标记路由）
 ├─ run/chat.py           入口：网页 harness / 无头 `--once`（§9.2）
 ├─ profiles.py           装配：BASE 配置 + SYS/BUSINESS 插件 + 目录插件 opt-in
 ├─ tables.py             agent_* 表 DDL（迁移清单）
-└─ tests/                离线确定性测试（68 项）
+└─ tests/                离线确定性测试（82 项）
 ```
 
 - **import 边界（硬规则）**：agent 本体只 `from agent.api import …`；不得 `import engine.*`、不得 import 大模型 SDK（仅 `agent.llm` 的 DeepSeek provider 允许 1 处 HTTP 出入，凭据不落明文）。
@@ -160,6 +161,7 @@ class XxxSubsystem:
 | **budget** | `budget` | system | 内置系统 | 成本护栏：capability 事件挂 llm 接缝（§4.3） |
 | **guard** | `guard` | system | 内置系统 | 权限网关：capability 裁决 + 矩阵 + durable 审计（§4.4） |
 | **plugins.memory** | `memory` | system | 目录插件 | 记忆子系统（LLM 提取 + 打分衰减 + recall/context 注入） |
+| **plugins.react** | `react` | system | 目录插件 | ReAct 多步工具循环（Think→Act+Observe→收敛 + 三把闸 + 四组件接缝）（§5.3） |
 | **plugins.windows_mcp** | `windows_mcp` | business | 目录插件 | windows-mcp-server 工具桥（MCP stdio → agent 工具目录） |
 
 > **装配分组 ≠ layer**：`loop` 的 layer 是 `system` 却在「内置业务」分组；`chat` 是 `business` 也在该分组。分组只表达「随 `build_agent` 恒定装配」，与语义层无关（§0.3）。
@@ -168,31 +170,36 @@ class XxxSubsystem:
 
 ```
 ServiceDefinition:  LlmProvider（agent.core.contract，零第三方依赖）
-  async complete(ctx, messages: list[dict], schema: dict|None = None) -> dict
+  async complete(ctx, messages: list[dict], schema: dict|None = None,
+                 tools: list[dict]|None = None) -> dict      # tools = 加法式扩展（native 工具调用）
   interface_version = (1, 0)
 
 装配层:  LlmService（ctx.llm）
-  complete(ctx, messages, *, schema=None, caller="unknown") -> LlmResult
+  complete(ctx, messages, *, schema=None, tools=None, caller="unknown") -> LlmResult
     ├─ waterfall "agent/llm/pre-call"（guard 先裁、budget 后裁；被拒 → CapabilityNotImplemented）
-    ├─ provider.complete(ctx, messages, schema=…)      ← Provider 层不含 caller
+    ├─ provider.complete(ctx, messages, schema=…, tools=…)   ← Provider 层不含 caller
     └─ emit "agent/llm/post-call"（tokens 记账）
 
 Provider:  FixtureLlm      离线确定性 canned 响应（测试/自举，零触网）
-           DeepSeekLlm     真实（OpenAI 兼容 chat/completions；schema 非空 → json_object）
+           DeepSeekLlm     真实（OpenAI 兼容；schema 非空 → json_object；tools 非空 → native tools）
            PlaceholderLlm  未接入/未配 key → CapabilityNotImplemented（不虚标）
 ```
 
 - key 解析顺序：`config.agent.llm.api_key` → `env DEEPSEEK_API_KEY` → 工程根 `local_secrets.json`。
 - 凭据不落代码；**tokens 逐条入 budget**（§4.3）。
-- 消费方：`chat`（plan/narrate）、`plugins.memory`（提取）、领域管线（若有）。
+- **`tools` 是加法扩展**：不传即旧行为（chat/memory 不受影响）。传 `tools` 时返回可含
+  `tool_calls: [{id, name, arguments}]`；不支持 native 工具调用的 provider 应诚实报缺（不得用文本约定假装）。
+  `agent/sys/llm.py` 的 `_wire_messages / _wire_tools / _wire_call` 负责内部消息形状 ↔ OpenAI wire 的转换。
+- 消费方：`chat`（plan/narrate）、`plugins.memory`（提取）、**`plugins.react`（每轮 Think）**。
 
 ### 4.2 `agent.tasks` —— 任务/工具注册表
 
-- `tasks.register(ctx, name, *, schema, handler, owner, description)`：名称唯一（D-3），**注册即逆**（`ctx.effect` 自动卸载）。
+- `tasks.register(ctx, name, *, schema, handler, owner, description, risk)`：名称唯一（D-3），**注册即逆**（`ctx.effect` 自动卸载）。
+- `risk`：工具风险元数据 `read / write / danger`（默认 `write`，保守）。**本次只落字段与目录输出，无判定行为**——供 approval / 权限模式消费（§5.3、AC-9）。
 - schema 轻量校验：`{参数名: {type, required, default}}`；未知参数拒绝、类型不符拒绝。
 - `tasks.invoke(ctx, name, *, caller, **kwargs)`：先过 `agent/tasks/pre-execute`（waterfall，guard 挂这）→ 校验 → 执行 → `agent/tasks/post-execute`（emit）。
 - `tasks.resolve(ctx, name) -> (lambda **kw)`：面向 driver / 桥的可调用入口（无则 `None`）。
-- `tasks.catalog()`：工具目录（供 tool-call 编排：把注册任务暴露成可调用的工具描述）。
+- `tasks.catalog(include=None)`：工具目录（供 tool-call 编排：把注册任务暴露成可调用的工具描述，含 `risk`；`include` 是权限模式的裁剪点）。
 - 内置 `agent.ping`（存活/时间戳，owner=None）。
 
 ### 4.3 `agent.budget` —— 成本护栏（挂在接缝，非管线内嵌）
@@ -247,6 +254,34 @@ chat.send(ctx, message, session_id="default") -> ChatReply{text, plan, evidence,
 - **诚实降级**：LLM 任一被拒（预算/guard/解析失败）→ 给证据兜底文本 + 如实上浮 `error`，不给假成功。
 - durable 事件：`agent/chat/in`、`agent/chat/done`、`agent/chat/reset`。
 - 环境事实块（`_env_facts`）把真实用户名/主目录/桌面喂给规划器，并禁用 `%VAR%`/`~` 占位符（路径类工具取真实值）。
+- **多步委托（软依赖）**：`send()` 里若 `ctx.has("react")` → 交给 `plugins.react` 走多步循环，再按同一外部纪律收尾（写短期记忆、`agent/chat/done`、喂 memory、返回 `ChatReply`）。**chat 只经 `ctx.has` 感知它，不 import 其实现**；插件停用即自动回退上面的单步路径（契约一行不改）。
+
+### 5.3 `plugins.react` —— ReAct 多步工具循环（目录插件）
+
+```
+ctx.react.run(ctx, prompt, *, session_id="default", prior=None) -> ReactResult
+  {ok, text, steps, tokens_in, tokens_out, exhausted, reason, tools, observations}
+```
+
+循环形状（取自 `loong-agent` 0.0.2）：
+
+```
+每轮：Think   ctx.llm.complete(messages, tools=可见工具目录)      ← guard/budget/审计照生效
+      └─ 模型**不再返回 tool_calls** ⇒ 收敛（本轮 text 即最终答复）
+      └─ 有 tool_calls ⇒ Act   ctx.tasks.invoke(逐个)              ← guard 裁决 + schema 校验 + owner 审计
+                        Observe 把结果（截断后）回灌为一条 user 消息 → 下一轮
+```
+
+- **三把闸**：`max_steps`（默认 8）· `deadline_s`（默认 120）· **token 预算**（不另写——每步都走 `ctx.llm`，`agent/llm/pre-call` 上 guard/budget 已生效）。
+- **失败即观察**：工具异常 / 参数错 / 被拒一律转成 `ToolResult(is_error=True)` 回灌，让模型自纠（**永不抛出**）；被拒另带 `denied=True`，同一工具连拒超 `max_rejects`（默认 3）才终止，防死循环。
+- **触顶诚实收尾**：durable `agent/react/exhausted` + 标注原因；可选再问一次模型（`finalize_on_exceed`，不给工具），失败退回证据兜底文本。**不崩、不静默、不假成功。**
+- **上下文治理**：工具结果按 `tool_result_max_chars`（默认 2000）截断并标注；喂给模型的窗口按 `history_keep` 裁剪（保 system + 首个用户请求 + 最近 N 条）。
+- **四组件接缝**（可换）：`Reasoner / Actor / Observer / Finalizer` 均为 Protocol；`ctx.provide("react.actor", ...)` 等任一注入即替换缺省实现（与 `ctx.llm` 的 provider 选择同构）。**approval 将来只需替换 `Actor`**。
+- **事件**：durable `agent/react/start|step|final|exhausted`（可重建一次 run 的轨迹）；live `agent/react/step/start|end`（前端进度）。
+- **零特权**：模型一律 `ctx.llm`，工具一律 `ctx.tasks.invoke`；`tables=()` ⇒ 卸载零残留。
+- **权限模式接口预留**（本次只落位置，行为不变）：`ctx.state["permission_mode"]` 状态位、`visible_tools(ctx)` 裁剪点（**恒返回全量**）、`Tool.risk` 元数据。
+- 配置 `config["agent"]["react"]`：`{max_steps, deadline_s, tool_result_max_chars, history_keep, max_rejects, finalize_on_exceed}`。
+- 详见《ReAct插件-设计方案.md》（含四组件定义、启停组合矩阵、与 approval 的依赖方向）。
 
 ---
 
@@ -289,7 +324,8 @@ chat.send(ctx, message, session_id="default") -> ChatReply{text, plan, evidence,
   `delta = "system/builtin"` ⇒ 内置插件，不给操作；目录插件（discovered）的 delta 是
   `enabled · assembled / enabled · 待重启装配 / disabled · 未装配 / 待停用` ⇒ **一律给「启用 / 停用 / 移除」按钮**。
 - 因此 **`layer` 不参与可管理性判定**：目录插件无论 `layer=system` 还是 `business`，都可启停卸。这正是 §0.3「两个正交的轴」的落地方式。
-- 现状：`plugins.memory`（记忆）与 `plugins.windows_mcp`（工具桥）均为目录插件，默认启用（见 `data/agent_plugin_state.json`）。
+- 现状：`plugins.memory`（记忆）、`plugins.react`（ReAct 多步循环）与 `plugins.windows_mcp`（工具桥）均为目录插件，默认启用（见 `data/agent_plugin_state.json`）。
+- **插件包**：以 `__init__.py` 为入口的插件是**包**，可含子模块并用包内相对导入（`from .loop import …`）——加载器按包加载（`submodule_search_locations` + 命名空间父包 `agent_plugins`）。`plugins.react` 即四文件形态（`prompt/components/loop/__init__`）。
 
 ---
 
@@ -297,8 +333,8 @@ chat.send(ctx, message, session_id="default") -> ChatReply{text, plan, evidence,
 
 | 域 | 定义 | 落点 | 事件（命名空间 `agent/*`） |
 |---|---|---|---|
-| **durable** | 须跨重启存活的事实 | 落 `agent_events` | `agent/chat/in` · `agent/chat/done` · `agent/chat/reset` · `agent/permission/decision` · `agent/memory/remembered` · `agent/memory/recall` |
-| **live** | 在途可观测 | 内存 emit（不落库） | `agent/llm/post-call` · `agent/tasks/post-execute` |
+| **durable** | 须跨重启存活的事实 | 落 `agent_events` | `agent/chat/in` · `agent/chat/done` · `agent/chat/reset` · `agent/permission/decision` · `agent/memory/remembered` · `agent/memory/recall` · `agent/react/start` · `agent/react/step` · `agent/react/final` · `agent/react/exhausted` |
+| **live** | 在途可观测 | 内存 emit（不落库） | `agent/llm/post-call` · `agent/tasks/post-execute` · `agent/react/step/start` · `agent/react/step/end` |
 | **capability** | 把策略/约束挂在 seam 上 | seam dispatch（waterfall） | `agent/llm/pre-call`（guard·budget）· `agent/tasks/pre-execute`（guard） |
 
 - 每个事件声明 `@mode`（emit/waterfall/parallel/serial/bail）；本卷运行时实际挂载 `waterfall`（pre-call / pre-execute）与 `emit`（post-*）。
@@ -314,8 +350,11 @@ chat.send(ctx, message, session_id="default") -> ChatReply{text, plan, evidence,
 - `FixtureLlm` 按 system prompt 里的**标记路由**到 canned 响应，保证「同一输入 → 同一输出」：
   - `<!--chat:plan-->` → 规划 canned（按关键词路由）；
   - `<!--chat:answer-->` → 解说 canned；
-  - `<!--memory:extract-->` → 记忆抽取 canned（`{"facts": [...], ...}`）。
+  - `<!--memory:extract-->` → 记忆抽取 canned（`{"facts": [...], ...}`）；
+  - `<!--react:turn-->` → ReAct 脚本化：按「请求关键词 + 已完成轮数」给出确定性 `tool_calls` 或最终答复；
+  - `<!--react:final-->` → ReAct 触顶收尾 canned。
 - 全测试**不触网、不触任何外部进程**。
+- 注意：路由**只拼接 `str` 内容**——ReAct 的观察回灌消息 `content` 是 dict，不参与关键词/标记匹配。
 
 ### 9.2 入口
 
@@ -340,13 +379,16 @@ agent/
 │                               #              / audit / mcp_client / plugin_manager）
 ├─ plugins/                     # 目录插件（来源 = 目录 ⇒ 可启停卸）
 │  ├─ memory/                   #   plugins.memory —— 记忆子系统（layer=system，默认启用）
+│  ├─ react/                    #   plugins.react —— ReAct 多步循环（layer=system，默认启用）
+│  │                            #     └ prompt.py / components.py / loop.py / __init__.py（插件包）
 │  └─ windows_mcp/              #   plugins.windows_mcp —— windows-mcp 工具桥（layer=business，默认启用）
 ├─ fixtures/llm.py              # FixtureLlm（离线确定性 canned 路由）
 ├─ run/chat.py                  # 入口：网页 harness + 无头 --once
 ├─ profiles.py                  # BASE_AGENT_CONFIG / SYS_PLUGINS / BUSINESS_PLUGINS / build_agent
 ├─ tables.py                    # agent_* 表 DDL（MIGRATIONS）
-└─ tests/                       # 离线确定性测试（test_kernel / test_sys / test_memory / test_plugin_manager /
-                                #              test_chat_* / test_guard / test_mcp_client / test_tool_call / test_profiles …）
+└─ tests/                       # 离线确定性测试（test_kernel / test_sys / test_memory / test_react /
+                                #              test_plugin_manager / test_chat_* / test_guard / test_mcp_client /
+                                #              test_tool_call / test_profiles …）
 ```
 
 ---
@@ -377,7 +419,8 @@ agent/
 | A4 | `agent.sys.plugin_manager` 目录插件管理（发现/启停/新增/卸载） | ✅ |
 | A5 | 工具调用（tool_call）+ MCP 工具桥（`plugins.windows_mcp`） | ✅ |
 | A6 | 记忆子系统（`plugins.memory` 目录插件：提取 + 打分衰减 + recall/context 注入） | ✅ 主链路；图谱能力见待办 |
-| — | 离线确定性测试 | **68 项全绿** |
+| A7 | **ReAct 多步循环**（`plugins.react`：Think→Act+Observe→收敛 + 三把闸 + 四组件接缝；`chat` 软委托） | ✅ |
+| — | 离线确定性测试 | **82 项全绿** |
 
 > 原则：全程不依赖任何外部进程；每段可独立回滚；任一步 `tests/` 全绿。
 
@@ -388,13 +431,15 @@ agent/
 | # | 契约 | 定义 | 状态 |
 |---|---|---|---|
 | AC-1 | import 边界 | agent 本体只 `from agent.api import`；不得 `import engine.*` / 大模型 SDK（llm provider 单点 HTTP 除外） | ✅ |
-| AC-2 | 键命名 | 系统键 `loop/llm/tasks/events/db/migrations/budget/guard`；业务键 `chat` / `memory` / `windows_mcp` | ✅ |
+| AC-2 | 键命名 | 系统键 `loop/llm/tasks/events/db/migrations/budget/guard/react`；业务键 `chat` / `memory` / `windows_mcp` | ✅ |
 | AC-3 | 表命名 | 一律 `agent_*`、独立 `agent.db` | ✅ |
 | AC-4 | 事件模式 | 事件声明 `@mode`；三域命名 `agent/*`；payload 纯数据 | ✅ |
 | AC-5 | honest 边界 | 无 key / 缺数据 / 缺失能力 → `CapabilityNotImplemented`，不虚标、不静默 | ✅ |
 | AC-6 | 驱动可换 | 消费方只依赖 `AgentDriver` 接口，不依赖具体 driver 实现 | ✅ |
 | AC-7 | 可自举 | `python -m agent.run.chat --fixture` 离线跑通对话闭环 | ✅ |
 | AC-8 | 来源/层级正交 | 目录插件的可管理性由**来源**判定，与 `layer` 无关（`layer` 仅为语义标签） | ✅ |
+| AC-9 | 接缝加法式演进 | 扩展接缝（如 `LlmProvider.tools`）只做**加法**：缺省参数 ⇒ 既有调用方行为不变；不支持者诚实报 `CapabilityNotImplemented`，不用文本约定假装 | ✅ |
+| AC-10 | 无特权通道 | 多步循环（`plugins.react`）不新建模型/工具通道：模型一律 `ctx.llm`、工具一律 `ctx.tasks.invoke` ⇒ guard/budget/schema/审计自动继承 | ✅ |
 
 ---
 
@@ -410,6 +455,10 @@ agent/
 | OPEN-6 | 会话持久化粒度 | `session_id` 由入口进程生成；跨进程/跨重启的会话管理未做 |
 | OPEN-7 | 外部系统桥（引擎等） | MCP 已通；其它系统接入按 §11 模式（目录插件 + tasks）逐个添加 |
 | OPEN-8 | 多 provider / 模型路由 | 现为单 provider 装配；路由与降级未做 |
+| OPEN-9 | 审批与权限模式（`plan` / `auto` / `bypass`） | **接口已预留未实现**（`permission_mode` 状态位 / `visible_tools` 裁剪点 / `Tool.risk`）；设计见《审批插件-设计方案.md》 |
+| OPEN-10 | 中途回话通道（SSE / WebSocket / 取消） | **未实现**；是 approval 问人、流式输出、取消共用的基础设施 |
+| OPEN-11 | `guard` 表达力（通配符 / 参数级规则 / 读·写分级） | 现为精确名匹配、只看任务名；读写分级已由 `Tool.risk` 补上元数据，判定未接 |
+| OPEN-12 | 并行工具编排 | `EventBus.parallel` 已实现但**无消费方**；`plugins.react` 的 `DefaultActor` 目前顺序执行 |
 
 ---
 

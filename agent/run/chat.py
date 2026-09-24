@@ -75,7 +75,7 @@ async def _once(args: argparse.Namespace) -> int:
 
 _PAGE = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Agent · Harness</title>
+<title>prism</title>
 <style>
 :root{
   --brand:#4176e6; --brand2:#5686fe; --brand-soft:#edf3ff; --brand-ink:#2b53b8;
@@ -160,7 +160,7 @@ tr:last-child td{border-bottom:0}
 pre.json{background:#0d0f13;color:#c9d6ec;padding:10px 12px;border-radius:8px;overflow:auto;font-family:var(--mono);font-size:11.5px}
 </style></head><body>
 <div class="top">
-  <div class="brand"><div class="mark">◈</div>Agent · Harness</div>
+  <div class="brand"><div class="mark">◈</div>prism</div>
   <span class="mono" id="session"></span>
   <div class="spacer"></div>
   <span class="pill" id="model">…</span>
@@ -490,12 +490,14 @@ async def _serve(args: argparse.Namespace) -> int:
             delta = ("enabled · assembled" if (e and a) else
                      ("enabled · 待重启装配" if (e and not a) else
                       ("disabled · 未装配" if (not e and not a) else "待停用")))
-            rows.append({**d, "desired": e, "actual": a, "delta": delta,
+            # 行结构统一：目录插件与内置 manifest 两种来源都同时给 id + name（前端按键取 id）
+            rows.append({**d, "id": d["name"], "desired": e, "actual": a, "delta": delta,
                          "status": status_map.get(d["name"])})
         for m in manifest:
             if m.get("layer") == "system" or m["id"] in discovered_ids:
                 continue
-            rows.append({**m, "desired": True, "actual": True, "delta": "system/builtin",
+            rows.append({**m, "name": m["id"], "desired": True, "actual": True,
+                         "delta": "system/builtin",
                          "status": status_map.get(m["id"])})
         return {"plugins": rows, "state_exists": pm._state_file.exists()}
 

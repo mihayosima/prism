@@ -1,6 +1,7 @@
 """agent.sys.tasks —— 任务注册表（run(ctx,**params) 统一入口 + owner）。
 
-- ``register(ctx, name, *, schema, handler, owner)`` 注册即逆（teardown 对称移除）。
+- ``register(ctx, name, *, schema, handler, owner, risk)`` 注册即逆（teardown 对称移除）；
+  ``risk`` 是工具风险元数据（read/write/danger，默认 write），随 ``catalog()`` 输出。
 - ``invoke`` 先过 ``agent/tasks/pre-execute``（capability，guard 挂这）→ schema 校验 → 执行
   → ``agent/tasks/post-execute``（emit）→ 返回。
 - ``resolve(name)`` 返回 ``lambda **kw`` 可调用入口（面向 loop/桥，与引擎 TargetRegistry 同约定）。
@@ -16,6 +17,12 @@ from typing import Any, Callable, Mapping
 from agent.api import AgentError, CapabilityNotImplemented, plugin
 
 logger = logging.getLogger("agent.tasks")
+
+# 工具风险分级（**元数据**，供 approval/权限模式消费；本次只落字段，无判定行为）
+#   read   只读（查询/读取，可自动放行）
+#   write  有副作用（默认；保守取值 —— 未声明即按"会改东西"对待）
+#   danger 高危（执行命令/改系统，应默认需人确认）
+RISKS = ("read", "write", "danger")
 
 
 def _now_iso() -> str:
@@ -57,15 +64,17 @@ def validate_kwargs(schema: Mapping[str, dict] | None, kwargs: dict[str, Any]) -
 
 
 class Task:
-    __slots__ = ("name", "schema", "handler", "owner", "description")
+    __slots__ = ("name", "schema", "handler", "owner", "description", "risk")
 
     def __init__(self, name: str, schema: Mapping[str, dict] | None, handler: Callable,
-                 *, owner: str | None = None, description: str = ""):
+                 *, owner: str | None = None, description: str = "",
+                 risk: str = "write"):
         self.name = name
         self.schema = schema
         self.handler = handler
         self.owner = owner
         self.description = description
+        self.risk = risk
 
     async def invoke(self, kwargs: dict[str, Any]) -> Any:
         clean = validate_kwargs(self.schema, kwargs)
@@ -83,11 +92,14 @@ class TaskRegistry:
 
     def register(self, ctx, name: str, *, schema: Mapping[str, dict] | None,
                  handler: Callable, owner: str | None = None,
-                 description: str = "") -> Callable[[], bool]:
+                 description: str = "", risk: str = "write") -> Callable[[], bool]:
         if name in self._tasks:
             raise AgentError(f"任务重复注册（名称唯一，D-3）: {name}")
+        if risk not in RISKS:
+            raise AgentError(f"risk 须 ∈ {RISKS}，得到 {risk!r}")
         owner = owner if owner is not None else ctx.get("_current_plugin")
-        self._tasks[name] = Task(name, schema, handler, owner=owner, description=description)
+        self._tasks[name] = Task(name, schema, handler, owner=owner,
+                                 description=description, risk=risk)
 
         def dispose() -> bool:
             if name in self._tasks:
@@ -142,6 +154,7 @@ class TaskRegistry:
                            for k, v in (t.schema or {}).items()},
                 "required": [k for k, v in (t.schema or {}).items() if v.get("required")],
                 "owner": t.owner,
+                "risk": t.risk,
             })
         return out
 
@@ -167,4 +180,4 @@ class TasksPlugin:
                           handler=_ping, owner=None)
 
 
-__all__ = ["TaskRegistry", "TasksPlugin", "validate_kwargs"]
+__all__ = ["TaskRegistry", "TasksPlugin", "validate_kwargs", "RISKS"]
