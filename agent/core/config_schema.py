@@ -22,7 +22,7 @@ from .errors import ConfigError
 _SCHEMA: dict[str, Any] = {
     "db_path": str,
     "agent": {
-        "llm": {"provider": str, "model": str},
+        "llm": {"provider": str, "model": str, "stream": bool},
         "budget": {"max_tokens_per_run": int, "reset_on_new_session": bool},
         "permissions": {"default": str, "task_allow": list, "task_deny": list, "llm": str},
         "loop": {"deadline_s": (int, float)},

@@ -30,7 +30,7 @@ from agent.sys.tasks import TasksPlugin
 BASE_AGENT_CONFIG: dict = {
     "db_path": "data/agent.db",
     "agent": {
-        "llm": {"provider": "fixture", "model": "fixture"},
+        "llm": {"provider": "fixture", "model": "fixture", "stream": True},
         "budget": {"max_tokens_per_run": 200000, "reset_on_new_session": True},
         "permissions": {"default": "open", "task_allow": ["*"], "task_deny": [], "llm": "open"},
         "loop": {"deadline_s": 60},

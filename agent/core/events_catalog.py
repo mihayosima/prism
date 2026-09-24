@@ -16,6 +16,7 @@ class Events:
     # LLM 生命周期
     LLM_PRE_CALL = "agent/llm/pre-call"
     LLM_POST_CALL = "agent/llm/post-call"
+    LLM_TOKEN = "agent/llm/token"          # B5.2 打字机：每片文本 {"text": 片段}
 
     # 任务（工具）生命周期
     TASKS_PRE_EXECUTE = "agent/tasks/pre-execute"
@@ -57,6 +58,7 @@ def all_events() -> set[str]:
 EVENT_MODE: dict[str, str] = {
     Events.LLM_PRE_CALL: "waterfall",
     Events.LLM_POST_CALL: "emit",
+    Events.LLM_TOKEN: "emit",              # B5.2 流式打字机（遥测性质，不进 required seam）
     Events.TASKS_PRE_EXECUTE: "waterfall",
     Events.TASKS_POST_EXECUTE: "emit",
     Events.CHAT_IN: "emit",
