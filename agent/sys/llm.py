@@ -221,11 +221,15 @@ class DeepSeekLlm:
                        tools: list[dict] | None = None) -> dict:
         import httpx
 
+        cfg = (((ctx.config or {}).get("agent") or {}).get("llm") or {})
+        stream_on = bool(cfg.get("stream", True))      # D5 默认 true
+
         payload: dict = {
             "model": self._model,
             "messages": _wire_messages(messages),
             "temperature": 0.2,
         }
+        name_map: dict[str, str] = {}
         if tools:
             wired_tools, name_map = _wire_tools(tools)
             payload["tools"] = wired_tools
@@ -234,20 +238,75 @@ class DeepSeekLlm:
             payload["response_format"] = {"type": "json_object"}
         headers = {"Authorization": f"Bearer {self._key}",
                    "Content-Type": "application/json"}
+
+        if not stream_on:
+            # —— 非流式（行为同今天）——
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                resp = await client.post(self.BASE_URL, json=payload, headers=headers)
+            if resp.status_code != 200:
+                raise AgentError(f"deepseek api 异常 {resp.status_code}: {resp.text[:200]}")
+            message = resp.json()["choices"][0]["message"]
+            content = message.get("content") or ""
+            raw_calls = message.get("tool_calls") or []
+            if raw_calls:                                  # 工具调用优先（可能 content 为空）
+                return {"text": content,
+                        "tool_calls": [_wire_call(c, name_map) for c in raw_calls]}
+            if schema is None:
+                return {"text": content}
+            return _parse_json(content)
+
+        # —— 流式（B5.2 打字机）——
+        content_acc = ""
+        tool_acc: dict[int, dict] = {}                     # index -> 归并槽（D3 完整重组）
         async with httpx.AsyncClient(timeout=90.0) as client:
-            resp = await client.post(self.BASE_URL, json=payload, headers=headers)
-        if resp.status_code != 200:
-            raise AgentError(f"deepseek api 异常 {resp.status_code}: {resp.text[:200]}")
-        message = resp.json()["choices"][0]["message"]
-        content = message.get("content") or ""
-        raw_calls = message.get("tool_calls") or []
-        if raw_calls:                                  # 工具调用优先（可能 content 为空）
-            return {"text": content,
+            async with client.stream("POST", self.BASE_URL, json=payload, headers=headers) as resp:
+                if resp.status_code != 200:
+                    await resp.aread()                      # 流式下不能 resp.json()
+                    raise AgentError(f"deepseek api 异常 {resp.status_code}: {resp.text[:200]}")
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    if not data:
+                        continue
+                    try:
+                        obj = json.loads(data)
+                    except (TypeError, ValueError):
+                        continue                            # 跳过非 JSON 行（注释/心跳）
+                    choice = (obj.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    # 文本片段：schema 为 None（用户可见散文）才发帧；
+                    # D4 照单全流——带 tool_calls 轮的 content（思考文本）也照发
+                    piece = delta.get("content") or ""
+                    if piece and schema is None:
+                        content_acc += piece
+                        await ctx.events.emit(Events.LLM_TOKEN, {"text": piece})
+                    # 工具调用 delta 归并（按 index）
+                    for tc in (delta.get("tool_calls") or []):
+                        idx = tc.get("index", 0)
+                        slot = tool_acc.setdefault(idx, {
+                            "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""}})
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        if tc.get("type"):
+                            slot["type"] = tc["type"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            slot["function"]["arguments"] += fn["arguments"]
+                    if choice.get("finish_reason"):
+                        break
+        raw_calls = [slot for _idx, slot in sorted(tool_acc.items())]
+        if raw_calls:                                      # 工具调用优先（可能 content 为空）
+            return {"text": content_acc,
                     "tool_calls": [_wire_call(c, name_map) for c in raw_calls]}
-        # 有 schema（要结构化）→ 解析 JSON；无 schema（要散文）→ 原样文本
         if schema is None:
-            return {"text": content}
-        return _parse_json(content)
+            return {"text": content_acc}
+        return _parse_json(content_acc)
 
 
 def _resolve_key(ctx) -> str | None:

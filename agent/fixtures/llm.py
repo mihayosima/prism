@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent.api import Events
+
 
 def _plan(user_text: str) -> dict:
     """chat 规划 canned：按关键词路由（离线确定性）。"""
@@ -114,18 +116,29 @@ class FixtureLlm:
                        tools: list[dict] | None = None) -> dict:
         kind, route = _route(messages or [])
         if kind == "react":
-            return _react_reply(messages or [])
-        if kind == "react_final":
-            return {"text": "已达执行上限，基于已有信息作答（fixture）。"}
-        if kind == "plan":
-            return _plan(route)
-        if kind == "answer":
-            return {"text": "好的，已按意图执行（fixture 解说）。"}
-        if kind == "extract":
+            result = _react_reply(messages or [])
+        elif kind == "react_final":
+            result = {"text": "已达执行上限，基于已有信息作答（fixture）。"}
+        elif kind == "plan":
+            result = _plan(route)
+        elif kind == "answer":
+            result = {"text": "好的，已按意图执行（fixture 解说）。"}
+        elif kind == "extract":
             t = (route or "")[:40].strip()
-            return {"facts": [f"fixture-mem：{t}"] if t else [],
-                    "intentions": [], "entities": [], "relations": []}
-        return {"text": "（fixture 默认响应）"}
+            result = {"facts": [f"fixture-mem：{t}"] if t else [],
+                      "intentions": [], "entities": [], "relations": []}
+        else:
+            result = {"text": "（fixture 默认响应）"}
+
+        # B5.2 离线切帧：stream 开启且非结构化调用 → 把散文切成 4 片依次 emit
+        stream_on = bool((((ctx.config or {}).get("agent") or {}).get("llm") or {}).get("stream", True))
+        text = result.get("text")
+        if stream_on and schema is None and isinstance(text, str) and text:
+            step = max(1, len(text) // 4)
+            pieces = [text[i:i + step] for i in range(0, len(text), step)]
+            for p in pieces:
+                await ctx.events.emit(Events.LLM_TOKEN, {"text": p})
+        return result
 
 
 __all__ = ["FixtureLlm"]
