@@ -14,10 +14,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import sys
 import uuid
-from pathlib import Path
 
 from agent.api import Services
 from agent.profiles import build_agent
@@ -163,8 +161,7 @@ tr:last-child td{border-bottom:0}
 .filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 .filters .chip.active{background:var(--brand);color:#fff;border-color:var(--brand)}
 pre.json{background:#0d0f13;color:#c9d6ec;padding:10px 12px;border-radius:8px;overflow:auto;font-family:var(--mono);font-size:11.5px}
-</style>
-<!--THEME_ASSETS--></head><body<!--THEME_BODY-->>
+</style></head><body>
 <div class="top">
   <div class="brand"><div class="mark">◈</div>prism</div>
   <span class="mono" id="session"></span>
@@ -427,40 +424,16 @@ document.addEventListener('DOMContentLoaded',()=>{
     $('#pname').value='';$('#pprovides').value='';};
   load('perms');load('plugins');load('memory');load('tools');
 });
-</script>
-<!--THEME_SCRIPT--></body></html>
+</script></body></html>
 """
 
 
 async def _serve(args: argparse.Namespace) -> int:
     import uvicorn
     from fastapi import FastAPI
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
     c, pm = await _boot(args)
-
-    # —— 主题槽（core 零 prism 逻辑）：若「已启用」的某插件 provides=ui_theme，
-    #    注入其皮肤资源（CSS/JS/图标）并给 <body> 打 data-theme；否则维持默认外观。 ——
-    _theme_pkg, _theme_id = "", ""
-    _enabled = set(pm.enabled())
-    for _d in pm.discovered():
-        if "ui_theme" in (_d.get("provides") or []) and _d["name"] in _enabled:
-            _theme_pkg = _d.get("package") or _d["name"].rsplit(".", 1)[-1]
-            _theme_id = _d["name"]
-            break
-    _theme_head = _theme_body = _theme_script = ""
-    if _theme_pkg:
-        _theme_head = (
-            f'<link rel="stylesheet" href="/theme/{_theme_pkg}/theme.css">\n'
-            f'<link rel="icon" href="/theme/{_theme_pkg}/prism.svg" type="image/svg+xml">'
-        )
-        _theme_body = f' data-theme="{_theme_pkg}"'
-        _theme_script = f'<script src="/theme/{_theme_pkg}/theme.js" defer></script>'
-    _PAGE_BUILT = (_PAGE
-                   .replace("<!--THEME_ASSETS-->", _theme_head)
-                   .replace("<!--THEME_BODY-->", _theme_body)
-                   .replace("<!--THEME_SCRIPT-->", _theme_script))
-    _THEME_ALLOWED = {"theme.css", "theme.js", "prism.svg"}
 
     class _Box:
         """可换容器的句柄：handlers 引用 c.root 不受「重建容器」影响。"""
@@ -509,7 +482,7 @@ async def _serve(args: argparse.Namespace) -> int:
     @app.get("/")
     async def _home():
         # no-store：前端改版后，防止浏览器用启发式缓存继续喂旧版 JS（曾导致"看起来没有流式"）
-        return HTMLResponse(_PAGE_BUILT, headers={"Cache-Control": "no-store"})
+        return HTMLResponse(_PAGE, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/chat")
     async def _chat(body: dict):
@@ -697,19 +670,6 @@ async def _serve(args: argparse.Namespace) -> int:
             return JSONResponse({"ok": True, "info": info, "plugins": res["plugins"]})
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
-
-    @app.get("/theme/{pkg:path}/{file:path}")
-    async def _theme_asset(pkg: str, file: str):
-        """主题槽资源：仅服务于当前启用的 ui_theme 插件的白名单文件（防源码泄漏 / 目录穿越）。"""
-        if not _theme_pkg or pkg != _theme_pkg or file not in _THEME_ALLOWED:
-            return JSONResponse({"error": "not found"}, status_code=404)
-        base = (Path(__file__).resolve().parent.parent / "plugins" / pkg).resolve()
-        target = (base / file).resolve()
-        if target != base and not str(target).startswith(str(base) + os.sep):
-            return JSONResponse({"error": "forbidden"}, status_code=403)
-        if not target.is_file():
-            return JSONResponse({"error": "not found"}, status_code=404)
-        return FileResponse(target)
 
     url = f"http://{args.host}:{args.port}"
     print(f"Agent Harness 就绪: {url}   （Ctrl+C 退出）", file=sys.stderr)

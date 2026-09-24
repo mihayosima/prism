@@ -27,7 +27,6 @@ class Services:
     MEMORY = "memory"
     WINDOWS_MCP = "windows_mcp"
     PLAYWRIGHT_MCP = "playwright_mcp"
-    UI_THEME = "ui_theme"
 
 
 # 全部“内核服务键”值集合（供 AST 契约测试比对）
@@ -45,7 +44,6 @@ ALL = frozenset(
         Services.MEMORY,
         Services.WINDOWS_MCP,
         Services.PLAYWRIGHT_MCP,
-        Services.UI_THEME,
     }
 )
 
