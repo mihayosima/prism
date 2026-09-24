@@ -37,7 +37,7 @@ def test_class_plugin_provides_and_attr_access():
             ctx.provide("aaa", {"t": 1})
 
     async def scenario():
-        c = Container()
+        c = Container(verify_wiring=False)
         c.add(A)
         await c.assemble()
         assert c.root.aaa["t"] == 1
@@ -54,7 +54,7 @@ def test_function_plugin_form():
         ctx.provide("f", "hello")
 
     async def scenario():
-        c = Container()
+        c = Container(verify_wiring=False)
         c.add(fn)
         await c.assemble()
         assert c.root.f == "hello"
@@ -91,7 +91,7 @@ def test_inject_topology_orders_provider_first():
             ctx.provide("data", 1)
 
     async def scenario():
-        c = Container()
+        c = Container(verify_wiring=False)
         c.add(Consumer)   # 后进也有依赖边，拓扑仍 provider 先行
         c.add(Provider)
         await c.assemble()
@@ -120,7 +120,7 @@ def test_d3_duplicate_service_key_rejected():
             ctx.provide("x", 2)
 
     async def scenario():
-        c = Container()
+        c = Container(verify_wiring=False)
         c.add(A)
         c.add(B)
         with pytest.raises(AgentError):
@@ -139,7 +139,7 @@ def test_missing_dependency_reports_list():
             pass
 
     async def scenario():
-        c = Container()
+        c = Container(verify_wiring=False)
         c.add(P)
         with pytest.raises(MissingDependencyError) as ei:
             await c.assemble()
@@ -168,7 +168,7 @@ def test_cycle_dependency_reports_cycle():
             ctx.provide("b", 2)
 
     async def scenario():
-        c = Container()
+        c = Container(verify_wiring=False)
         c.add(A)
         c.add(B)
         with pytest.raises(CyclicDependencyError) as ei:
@@ -187,7 +187,7 @@ def test_apply_must_be_async():
             return None
 
     async def scenario():
-        c = Container()
+        c = Container(verify_wiring=False)
         c.add(Bad)
         with pytest.raises(AgentError):
             await c.assemble()
@@ -218,7 +218,7 @@ def test_symmetric_teardown_effect_reverse_order():
             ctx.effect(lambda: order.append("q_teardown"))
 
     async def scenario():
-        c = Container()
+        c = Container(verify_wiring=False)
         c.add(P)
         c.add(Q)
         await c.assemble()
@@ -375,7 +375,7 @@ def test_uninjected_read_in_apply_is_none():
             ctx.provide("zz", 42)
 
     async def scenario():
-        c = Container()
+        c = Container(verify_wiring=False)
         c.add(Reader)
         c.add(Provider)
         await c.assemble()

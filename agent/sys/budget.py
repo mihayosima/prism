@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from agent.api import plugin
+from agent.api import Events, plugin
 from agent.sys.audit import _now_iso
 from agent.sys.llm import _tokens
 
@@ -49,12 +49,12 @@ class Budget:
                 (model, ti, to, None, _now_iso()),
             )
 
-        ctx.on("agent/llm/pre-call", _pre)
-        ctx.on("agent/llm/post-call", _post)
+        ctx.on(Events.LLM_PRE_CALL, _pre)
+        ctx.on(Events.LLM_POST_CALL, _post)
         if cfg.get("reset_on_new_session", True):
             def _reset_session(_payload: dict) -> None:      # 同步：emit 内联执行，立即生效
                 ctx.state["budget_spent"] = 0
-            ctx.on("agent/chat/reset", _reset_session)
+            ctx.on(Events.CHAT_RESET, _reset_session)
         ctx.provide("budget", self)
 
 

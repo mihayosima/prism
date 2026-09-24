@@ -11,8 +11,10 @@ from agent.core.contract import LlmProvider
 from agent.core.errors import (
     AgentError,
     CapabilityNotImplemented,
+    ConfigError,
     CyclicDependencyError,
     EventDispatchError,
+    EventWiringError,
     MissingDependencyError,
     ScopeClosedError,
     ServiceConflictError,
@@ -20,6 +22,7 @@ from agent.core.errors import (
     TeardownError,
 )
 from agent.core.events import EventBus
+from agent.core.events_catalog import Events, all_events, EVENT_MODE, REQUIRED_SUBSCRIBER_EVENTS
 
 __all__ = [
     "__version__",
@@ -33,13 +36,20 @@ __all__ = [
     "State",
     # events
     "EventBus",
+    "Events",
+    "all_events",
+    "EVENT_MODE",
+    "REQUIRED_SUBSCRIBER_EVENTS",
     "EventDispatchError",
+    "EventWiringError",
     # 能力接缝契约（业务经此导入，不 import 实现）
     "LlmProvider",
     # errors
     "AgentError",
     "CapabilityNotImplemented",
+    "ConfigError",
     "CyclicDependencyError",
+    "EventWiringError",
     "MissingDependencyError",
     "ScopeClosedError",
     "ServiceConflictError",

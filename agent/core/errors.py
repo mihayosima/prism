@@ -78,11 +78,21 @@ class CapabilityNotImplemented(AgentError):
         super().__init__(f"能力未就绪: {capability}{suffix}")
 
 
+class ConfigError(AgentError):
+    """配置 schema 校验失败（键拼错 / 类型不符）。"""
+
+
+class EventWiringError(AgentError):
+    """capability 接缝接线校验失败（装配期/运行期监听缺失）。"""
+
+
 __all__ = [
     "AgentError",
     "CapabilityNotImplemented",
+    "ConfigError",
     "CyclicDependencyError",
     "EventDispatchError",
+    "EventWiringError",
     "MissingDependencyError",
     "ScopeClosedError",
     "ServiceConflictError",

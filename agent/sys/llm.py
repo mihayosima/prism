@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from agent.api import AgentError, CapabilityNotImplemented, plugin
+from agent.api import AgentError, CapabilityNotImplemented, Events, plugin
 
 
 class LlmProvider(Protocol):
@@ -72,7 +72,7 @@ class LlmService:
                        schema: dict | None = None, tools: list[dict] | None = None,
                        caller: str = "unknown") -> LlmResult:
         decision = await ctx.events.waterfall(
-            "agent/llm/pre-call",
+            Events.LLM_PRE_CALL,
             {"messages": messages, "schema": schema, "caller": caller,
              "tools": [str(t.get("name", "")) for t in (tools or [])]},
         )
@@ -82,7 +82,7 @@ class LlmService:
             )
         data = await self._provider.complete(ctx, messages, schema=schema, tools=tools)
         tokens_in, tokens_out = _tokens(messages), _tokens(data)
-        await ctx.events.emit("agent/llm/post-call", {
+        await ctx.events.emit(Events.LLM_POST_CALL, {
             "provider": self._model, "tokens_in": tokens_in, "tokens_out": tokens_out,
             "caller": caller,
         })

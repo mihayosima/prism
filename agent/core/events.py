@@ -18,7 +18,7 @@ import inspect
 import logging
 from typing import TYPE_CHECKING, Any, Callable
 
-from .errors import EventDispatchError
+from .errors import EventDispatchError, EventWiringError
 
 if TYPE_CHECKING:
     from .context import Context
@@ -71,10 +71,11 @@ class _Listener:
 class EventBus:
     """ctx.events —— 事件总线。注册走 ctx.on（挂 ctx 作用域）；分发走 ctx.events.<mode>。"""
 
-    def __init__(self, strict_payload: bool = True):
+    def __init__(self, strict_payload: bool = True, required_seams: set = set()):
         self._listeners: dict[str, list[_Listener]] = {}
         self._seq = 0
         self.strict_payload = strict_payload
+        self._required_seams: set = set(required_seams)
 
     # ---------- 注册 ----------
 
@@ -132,6 +133,12 @@ class EventBus:
         if self.strict_payload:
             _assert_pure_data(args, f"waterfall({name!r})")
         chain = self._snapshot(name)
+        if name in self._required_seams and not chain:
+            raise EventWiringError(
+                f"capability 接缝 {name!r} 要求 ≥1 个实时监听（required_seams），"
+                f"但分发瞬间 0 监听——闸门静默打开"
+                f"（装配期校验漏检，或运行期监听被剪除）"
+            )
         origin = args if len(args) != 1 else args[0]
 
         async def next_from(index: int) -> Any:

@@ -16,6 +16,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .context import Context
 from .errors import AgentError, CyclicDependencyError, MissingDependencyError
+from .events_catalog import REQUIRED_SUBSCRIBER_EVENTS
+from .event_wiring import _verify_event_wiring
 
 
 def _coerce_list(value: Any) -> tuple[str, ...]:
@@ -145,7 +147,8 @@ async def _awaitable(result: Any, what: str) -> Any:
 class Container:
     """插件装配容器：内置服务预置 + 拓扑排序 + apply/start + 对称 teardown。"""
 
-    def __init__(self, builtin: Mapping[str, Any] | None = None, name: str = "agent"):
+    def __init__(self, builtin: Mapping[str, Any] | None = None, name: str = "agent",
+                 verify_wiring: bool = True):
         self._root = Context(name=name)
         for key, value in (builtin or {}).items():
             self._root.provide(key, value)
@@ -153,6 +156,8 @@ class Container:
         self._order: list[Plugin] = []
         self._caps: dict[str, tuple[frozenset[str], int]] = {}
         self._assembled = False
+        # P3：capability 接缝接线校验开关（默认开；裸/裁剪容器显式 False 豁免）。
+        self._verify_wiring = verify_wiring
 
     @property
     def root(self) -> Context:
@@ -161,6 +166,14 @@ class Container:
     @property
     def assembled(self) -> bool:
         return self._assembled
+
+    def _wiring_required(self) -> set[str]:
+        """单源：装配期校验 + 运行期 waterfall 守卫共用的 required seam 集合。
+        verify_wiring=False → 返回空集，两处同时关闭，杜绝漂移。
+        """
+        if not self._verify_wiring:
+            return set()
+        return set(REQUIRED_SUBSCRIBER_EVENTS)
 
     def plugin_manifest(self) -> list[dict]:
         """已装配插件清单（通用 introspection；供元数据/诊断展示）。"""
@@ -276,6 +289,13 @@ class Container:
                 self._caps[p.id] = cap
             self._order = order
             self._assembled = True
+            # P3：capability 接缝接线校验（装配期 fail-fast）+
+            #     同源注入 bus.required_seams（运行期 waterfall 守卫）。
+            bus = self._root.get("events")
+            if bus is not None:
+                bus.required_seams = self._wiring_required()
+                if self._verify_wiring:
+                    _verify_event_wiring(self, bus)
         except BaseException:
             # 已完成插件的区间逆序回收 + root 收尾，随后原样抛出
             for cap in list(self._caps.values())[::-1]:

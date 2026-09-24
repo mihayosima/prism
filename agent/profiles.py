@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent.api import Container
+from agent.core.config_schema import validate_config, coerce_config
 from agent.sys.budget import Budget
 from agent.sys.chat import Chat
 from agent.sys.events_plugin import EventsPlugin
@@ -73,12 +74,13 @@ def build_agent(*, config: dict | None = None, patch: dict | None = None,
       `agent/plugins/` 下【启用】的目录插件（业务插件，可像引擎一样启停/新增/卸载）。
       默认不扫目录 → 测试/无头入口封闭、不误拉真实子进程。
     """
-    cfg = deep_merge(BASE_AGENT_CONFIG, config or {})
+    cfg = coerce_config(config or {}, defaults=BASE_AGENT_CONFIG)
     cfg = deep_merge(cfg, patch or {})
+    validate_config(cfg)                      # P2：配置键/类型 fail-fast
     builtin = {"config": cfg}
     if builtin_data:
         builtin.update(builtin_data)
-    container = Container(builtin=builtin)
+    container = Container(builtin=builtin, verify_wiring=True)   # P3：显式开接线校验（默认即 True，写清便于审计）
     container.add(*SYS_PLUGINS, *BUSINESS_PLUGINS, *extra_plugins)
     pm = plugin_mgr
     if pm is None and plugin_dir:

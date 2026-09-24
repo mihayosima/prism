@@ -24,7 +24,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Any
 
-from agent.api import CapabilityNotImplemented, plugin
+from agent.api import CapabilityNotImplemented, Events, plugin
 from agent.sys.audit import _now_iso, durable
 
 logger = logging.getLogger("plugins.memory")
@@ -217,7 +217,7 @@ class MemoryDriver:
         try:
             out = await self._extractor.extract(ctx, payload)
         except CapabilityNotImplemented as exc:
-            await durable(ctx, "agent/memory/remembered", {
+            await durable(ctx, Events.MEMORY_REMEMBERED, {
                 "ok": False, "reason": str(exc), "at": _now_iso()})
             return {"ok": False, "reason": str(exc)}
         added = []
@@ -228,7 +228,7 @@ class MemoryDriver:
                     score_observed=1.0, created_at=_now_iso(), last_accessed_at=_now_iso(),
                     accessed_count=1))
                 added.append({"kind": kind, "content": t})
-        await durable(ctx, "agent/memory/remembered", {
+        await durable(ctx, Events.MEMORY_REMEMBERED, {
             "ok": True, "added": len(added), "at": _now_iso()})
         return {"ok": True, "added": added}
 
@@ -261,7 +261,7 @@ class MemoryDriver:
             d = m.as_dict()
             d["score"] = score
             out.append(d)
-        await durable(ctx, "agent/memory/recall", {"query": query, "hits": len(out), "at": now})
+        await durable(ctx, Events.MEMORY_RECALL, {"query": query, "hits": len(out), "at": now})
         return out
 
     async def context(self, ctx, query: str, limit: int = 5, max_chars: int = 1200) -> str:

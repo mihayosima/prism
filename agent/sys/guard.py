@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from agent.api import plugin
+from agent.api import Events, plugin
 from agent.sys.audit import _now_iso, durable
 
 
@@ -46,7 +46,7 @@ class Guard:
         async def _pre_llm(payload: dict, next) -> dict:
             caller = payload.get("caller", "unknown")
             decision = _decide(ctx, "llm", caller=caller)
-            await durable(ctx, "agent/permission/decision", {
+            await durable(ctx, Events.PERMISSION_DECISION, {
                 "who": caller, "level": "llm", "target": "agent.llm.complete",
                 "decision": decision, "at": _now_iso(),
             })
@@ -58,7 +58,7 @@ class Guard:
             task = payload.get("task", "")
             caller = payload.get("caller", "unknown")
             decision = _decide(ctx, "task", target=task, caller=caller)
-            await durable(ctx, "agent/permission/decision", {
+            await durable(ctx, Events.PERMISSION_DECISION, {
                 "who": caller, "level": "task", "target": task,
                 "decision": decision, "at": _now_iso(),
             })
@@ -66,8 +66,8 @@ class Guard:
                 return await next()
             return {"denied": True, "reason": f"guard: 任务 {task!r} 未授权（caller={caller!r}）"}
 
-        ctx.on("agent/llm/pre-call", _pre_llm, prepend=True)
-        ctx.on("agent/tasks/pre-execute", _pre_task, prepend=True)
+        ctx.on(Events.LLM_PRE_CALL, _pre_llm, prepend=True)
+        ctx.on(Events.TASKS_PRE_EXECUTE, _pre_task, prepend=True)
         ctx.provide("guard", self)
 
     def policy(self, ctx) -> dict:

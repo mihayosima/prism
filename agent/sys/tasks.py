@@ -14,7 +14,7 @@ import logging
 from datetime import datetime
 from typing import Any, Callable, Mapping
 
-from agent.api import AgentError, CapabilityNotImplemented, plugin
+from agent.api import AgentError, CapabilityNotImplemented, Events, plugin
 
 logger = logging.getLogger("agent.tasks")
 
@@ -119,14 +119,14 @@ class TaskRegistry:
             raise AgentError(f"任务不存在: {name!r}")
         caller = caller or ctx.get("_current_plugin") or "unknown"
         decision = await ctx.events.waterfall(
-            "agent/tasks/pre-execute", {"task": name, "kwargs": kwargs, "caller": caller}
+            Events.TASKS_PRE_EXECUTE, {"task": name, "kwargs": kwargs, "caller": caller}
         )
         if isinstance(decision, dict) and decision.get("denied"):
             raise CapabilityNotImplemented(
                 f"agent.tasks.{name}", decision.get("reason", "被 guard/约束否决")
             )
         result = await cmd.invoke(kwargs)
-        await ctx.events.emit("agent/tasks/post-execute", {"task": name, "caller": caller})
+        await ctx.events.emit(Events.TASKS_POST_EXECUTE, {"task": name, "caller": caller})
         return result
 
     def resolve(self, ctx, name: str) -> Callable[..., Any] | None:

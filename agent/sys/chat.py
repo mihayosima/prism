@@ -19,7 +19,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from agent.api import AgentError, CapabilityNotImplemented, plugin
+from agent.api import AgentError, CapabilityNotImplemented, Events, plugin
 from agent.sys.audit import _now_iso, durable
 
 PLAN_SYSTEM = (
@@ -85,7 +85,7 @@ class ChatDriver:
             return ChatReply(text="请输入一条消息。", plan={"intent": "chat"},
                              evidence={}, tokens_in=0, tokens_out=0, ok=True,
                              session_id=session_id)
-        await durable(ctx, "agent/chat/in",
+        await durable(ctx, Events.CHAT_IN,
                       {"message": message, "session_id": session_id, "at": _now_iso()})
         await self._append(ctx, session_id, "user", message)
         history = await self._history(ctx, session_id, limit=HISTORY_LIMIT)
@@ -110,7 +110,7 @@ class ChatDriver:
                 })
             except Exception as exc:  # noqa: BLE001
                 logging.getLogger("agent.chat").warning("memory remember failed: %s", exc)
-        await durable(ctx, "agent/chat/done", {
+        await durable(ctx, Events.CHAT_DONE, {
             "intent": plan.get("intent"),
             "ok": ok, "error": reply_error, "session_id": session_id, "at": _now_iso(),
         })
@@ -138,7 +138,7 @@ class ChatDriver:
                 })
             except Exception as exc:  # noqa: BLE001
                 logging.getLogger("agent.chat").warning("memory remember failed: %s", exc)
-        await durable(ctx, "agent/chat/done", {
+        await durable(ctx, Events.CHAT_DONE, {
             "intent": "react", "ok": res.ok,
             "error": None if res.ok else res.reason,
             "session_id": session_id, "at": _now_iso(),
@@ -179,7 +179,7 @@ class ChatDriver:
             ctx, "SELECT COUNT(*) AS n FROM agent_messages WHERE session_id=?", (session_id,))
         await ctx.db.execute(ctx, "DELETE FROM agent_messages WHERE session_id=?", (session_id,))
         if ctx.has("events"):
-            await ctx.events.emit("agent/chat/reset", {"session_id": session_id})
+            await ctx.events.emit(Events.CHAT_RESET, {"session_id": session_id})
         return rows[0]["n"]
 
     async def _memory_block(self, ctx, query: str) -> str:

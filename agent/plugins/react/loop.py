@@ -25,7 +25,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from agent.api import CapabilityNotImplemented
+from agent.api import CapabilityNotImplemented, Events
 from agent.sys.audit import _now_iso, durable
 
 from .components import Actor, Finalizer, Observer, Reasoner
@@ -116,7 +116,7 @@ class ReactLoop:
     async def run(self, ctx, prompt: str, *, session_id: str = "default",
                   prior: list[dict] | None = None) -> ReactResult:
         cfg = self._cfg
-        await durable(ctx, "agent/react/start", {
+        await durable(ctx, Events.REACT_START, {
             "prompt": (prompt or "")[:500], "session_id": session_id,
             "max_steps": cfg.max_steps, "at": _now_iso()})
 
@@ -140,7 +140,7 @@ class ReactLoop:
                 reason = f"超时（超过 {cfg.deadline_s:.0f}s）"
                 break
             steps += 1
-            await ctx.events.emit("agent/react/step/start",
+            await ctx.events.emit(Events.REACT_STEP_START,
                                   {"step": steps, "session_id": session_id})
 
             # ---- Think ----
@@ -159,7 +159,7 @@ class ReactLoop:
                              "tool_calls": [c.as_dict() for c in out.tool_calls]})
 
             if not out.tool_calls:                       # ← 收敛：不再需要工具
-                await durable(ctx, "agent/react/final", {
+                await durable(ctx, Events.REACT_FINAL, {
                     "steps": steps, "tokens_in": tokens_in, "tokens_out": tokens_out,
                     "at": _now_iso()})
                 self._record(ctx, steps, tool_trace, exhausted=False)
@@ -179,11 +179,11 @@ class ReactLoop:
                         stop_reason = (f"工具 {r.name!r} 反复被拒"
                                        f"（超过 {cfg.max_rejects} 次），终止")
             messages.append(await self._observer.observe(ctx, results))
-            await durable(ctx, "agent/react/step", {
+            await durable(ctx, Events.REACT_STEP, {
                 "step": steps, "tools": [r.name for r in results],
                 "is_error": any(r.is_error for r in results),
                 "tokens_in": tokens_in, "tokens_out": tokens_out, "at": _now_iso()})
-            await ctx.events.emit("agent/react/step/end", {
+            await ctx.events.emit(Events.REACT_STEP_END, {
                 "step": steps, "tools": [r.name for r in results],
                 "is_error": any(r.is_error for r in results)})
             if stop_reason:
@@ -194,7 +194,7 @@ class ReactLoop:
 
         # ---- 触顶统一收尾：不崩、不静默，如实标注 ----
         reason = reason or f"已达步数上限 max_steps={cfg.max_steps}"
-        await durable(ctx, "agent/react/exhausted", {
+        await durable(ctx, Events.REACT_EXHAUSTED, {
             "steps": steps, "reason": reason, "tokens_in": tokens_in,
             "tokens_out": tokens_out, "at": _now_iso()})
         if cfg.finalize_on_exceed and not hard:
