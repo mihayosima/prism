@@ -263,7 +263,9 @@ function addStreamMsg(){
   return {
     addStep(p){
       const el=document.createElement('div');el.className='step';
-      const nm=(p&&p.source)?String(p.source).split('/').pop():'progress';
+      const src=(p&&p.source)?String(p.source):'';
+      const nm=(src?src.replace(/^agent\//,''):'progress')
+        +((p&&p.data&&p.data.step)?(' · step '+p.data.step):'');
       el.innerHTML='<div class="top"><span class="dot run"></span><span class="name">'+esc(nm)+'</span></div>'
         +'<details><summary>载荷</summary><pre>'+esc(json2((p&&p.data)||{}))+'</pre></details>';
       stp.appendChild(el);m.scrollTop=m.scrollHeight;},
