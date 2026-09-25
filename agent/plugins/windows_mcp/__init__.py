@@ -16,7 +16,7 @@ import logging
 import os
 
 from agent.api import Services, StateKeys, plugin
-from agent.sys.mcp_client import McpStdioClient
+from agent.api import McpStdioClient
 
 logger = logging.getLogger("agent.plugins.windows_mcp")
 

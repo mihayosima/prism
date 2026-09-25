@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from agent.api import AgentError, CapabilityNotImplemented, Events, Services, durable, plugin
-from agent.core.tokens import estimate_tokens
+from agent.api import estimate_tokens
 
 
 class LlmProvider(Protocol):

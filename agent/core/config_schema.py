@@ -33,6 +33,7 @@ _SCHEMA: dict[str, Any] = {
         "context": "_any",
         "system_memory": "_any",
         "work_memory": "_any",
+        "short_term": "_any",
     },
     # 插件自管顶层节
     "windows_mcp": "_any",

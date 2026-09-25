@@ -1,6 +1,6 @@
 # 工作记忆（第 3 层）— Redis 缓存设计方案
 
-> 状态：待审。系统记忆（第 1 层）已落地并通过全量回归；本方案聚焦第 3 层「工作记忆」。
+> 状态：**已实施并合并**（commit 49513f5，全量回归 0 失败）。系统记忆（第 1 层）已落地；本方案聚焦第 3 层「工作记忆」。
 > 定位：任务级进度缓存，任务结束即失效；存储后端 = Redis（用户指定）。
 
 ---
@@ -13,7 +13,7 @@
 | 存什么 | 任务完成进度（step / tool_trace / checkpoints / status），**不存对话全文** |
 | 寿命 | 任务级——`run()` 开始建、结束 DEL；兜底 TTL 防泄漏 |
 | 后端 | Redis（外部服务）；Redis 不可用时降级为进程内 dict，功能不崩 |
-| 形态 | 系统层插件 `agent.sys.work_memory`，`provides=[Services.WORK_MEMORY]` |
+| 形态 | **目录插件** `plugins.work_memory`（opt-in，与 `plugins.short_term` 同级），`provides=[Services.WORK_MEMORY]` |
 
 **不触碰**：系统记忆（文件，已落）、长期记忆（`plugins.memory`）、短期记忆（`agent_messages` 表 + 滚动摘要，属 G1 范畴）。
 
@@ -32,8 +32,8 @@
 ## 2. 设计
 
 ### 2.1 形态与装配
-- 系统层插件 `agent/sys/work_memory.py`：`provides=[Services.WORK_MEMORY]`、`inject=[]`（纯缓存服务，零业务依赖）。
-- 装配进 `profiles.SYS_PLUGINS`（与 `SystemMemory` 同级，内核级能力，硬装配）。
+- 目录插件 `agent/plugins/work_memory/`（`__init__.py` 装配 + `backend.py` 双后端）：`provides=[Services.WORK_MEMORY]`、`inject=[]`（纯缓存服务，零业务依赖）。
+- 装配：**opt-in**（经「插件」页启用），**不在** `profiles.SYS_PLUGINS` 硬装配——与短期记忆 `plugins.short_term`、系统记忆 `plugins.system_memory` 同级。
 - 新增 `core/services_catalog.py` 登记 `Services.WORK_MEMORY`。
 
 ### 2.2 服务接口（接缝可注入，Protocol 留插件内）
@@ -111,9 +111,9 @@ class WorkMemoryLike(Protocol):
 
 **W1 — 插件骨架 + Redis 客户端 + 降级**
 - `pyproject.toml` 加 `redis>=5.0` 主依赖（保证导入）；导入失败时告警并降级内存版。
-- `agent/sys/work_memory.py`：`WorkMemory` 插件（Redis 实现）+ `InMemoryWorkMemory`（降级）。
+- `agent/plugins/work_memory/`（`__init__.py` 装配 + `backend.py` 双后端）：`WorkMemory` 插件（Redis 实现）+ `InMemoryWorkMemory`（降级）。
 - `core/services_catalog.py` 登记 `Services.WORK_MEMORY`；`core/config_schema.py` 放行 `agent.work_memory`。
-- `profiles.SYS_PLUGINS` 加 `WorkMemory`。
+- 装配：目录插件 opt-in（经「插件」页启用），**不在** `profiles.SYS_PLUGINS` 硬装配。
 
 **W2 — react 接入（消费面）**
 - `run()` 开始 `begin`、每步 `update`/`checkpoint`、结束 `finish`；接缝 `ctx.get(...)` 获取，降级透明。

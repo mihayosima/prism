@@ -13,7 +13,7 @@ from pathlib import Path
 from agent.api import Services
 from agent.plugins.react.prompt import build_system
 from agent.profiles import build_agent
-from agent.sys.system_memory import load_system_memory
+from agent.plugins.system_memory import SystemMemory, load_system_memory
 
 
 def _run(coro):
@@ -72,7 +72,8 @@ def test_external_override_full_replace(tmp_path: Path):
 def test_plugin_provides_text(tmp_path: Path):
     """SystemMemory 提供 system_memory 服务，内容 = 默认目录加载结果。"""
     async def _coro():
-        c = build_agent(config={"db_path": str(tmp_path / "agent.db")})
+        c = build_agent(config={"db_path": str(tmp_path / "agent.db")},
+                        extra_plugins=(SystemMemory,))     # 目录插件：显式 opt-in
         await c.assemble()
         assert c.root.has(Services.SYSTEM_MEMORY)
         text = c.root.get(Services.SYSTEM_MEMORY)
@@ -84,7 +85,8 @@ def test_plugin_provides_text(tmp_path: Path):
 def test_chat_plan_injects_system_memory(tmp_path: Path):
     """chat 规划阶段把系统记忆前置注入 system 提示（静态底座 + 阶段指令）。"""
     async def _coro():
-        c = build_agent(config={"db_path": str(tmp_path / "agent.db")})
+        c = build_agent(config={"db_path": str(tmp_path / "agent.db")},
+                        extra_plugins=(SystemMemory,))     # 目录插件：显式 opt-in
         await c.assemble()
         ctx = c.root
         driver = ctx.get(Services.CHAT)
@@ -115,7 +117,8 @@ def test_disabled_graceful_when_dir_missing(tmp_path: Path):
     """外部目录指向不存在路径 → 提供空串，chat 仍可正常工作（不注入、不报错）。"""
     async def _coro():
         c = build_agent(config={"db_path": str(tmp_path / "agent.db")},
-                        patch={"agent": {"system_memory": {"dir": "/no_such_dir_abc"}}})
+                        patch={"agent": {"system_memory": {"dir": "/no_such_dir_abc"}}},
+                        extra_plugins=(SystemMemory,))
         await c.assemble()
         assert c.root.get(Services.SYSTEM_MEMORY) == ""
         ctx = c.root
@@ -130,4 +133,33 @@ def test_disabled_graceful_when_dir_missing(tmp_path: Path):
         await driver._plan(ctx, "你好", prior=[])
         assert "身份" not in captured["system"]       # 未注入
         assert "任务规划器" in captured["system"]      # 阶段指令仍在
+    _run(_coro())
+
+
+# ---- 目录插件语义（与短期记忆同级：opt-in，非系统层硬装配） ----
+
+def test_directory_plugin_opt_in(tmp_path: Path):
+    """插件管理器可发现；未启用不装配（消费方软降级），启用后提供记忆文本。"""
+    from agent.sys.plugin_manager import PluginManager
+
+    async def _coro():
+        pdir = str(Path(__file__).resolve().parent.parent / "plugins")
+        pm = PluginManager(plugin_dir=pdir, state_file=str(tmp_path / "state.json"))
+        cands = [c for c in pm.discovered() if c["name"] == "plugins.system_memory"]
+        assert cands, "plugins.system_memory 应可被发现（目录插件）"
+        assert cands[0]["provides"] == [Services.SYSTEM_MEMORY]
+
+        # 未启用 → 不装配（不裸崩）
+        c1 = build_agent(config={"db_path": str(tmp_path / "a.db")}, plugin_mgr=pm)
+        await c1.assemble()
+        assert not c1.root.has(Services.SYSTEM_MEMORY)
+        await c1.teardown()
+
+        # 启用 → 装配并提供记忆文本
+        pm.set_enabled("plugins.system_memory", True)
+        c2 = build_agent(config={"db_path": str(tmp_path / "b.db")}, plugin_mgr=pm)
+        await c2.assemble()
+        assert c2.root.get(Services.SYSTEM_MEMORY) == load_system_memory()
+        await c2.teardown()
+
     _run(_coro())

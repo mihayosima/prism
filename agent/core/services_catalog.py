@@ -28,6 +28,7 @@ class Services:
     CONTEXT = "context"
     SYSTEM_MEMORY = "system_memory"
     WORK_MEMORY = "work_memory"
+    SHORT_TERM = "short_term"
     WINDOWS_MCP = "windows_mcp"
     PLAYWRIGHT_MCP = "playwright_mcp"
 
@@ -48,6 +49,7 @@ ALL = frozenset(
         Services.CONTEXT,
         Services.SYSTEM_MEMORY,
         Services.WORK_MEMORY,
+        Services.SHORT_TERM,
         Services.WINDOWS_MCP,
         Services.PLAYWRIGHT_MCP,
     }

@@ -1,4 +1,4 @@
-"""agent.sys.mcp_client —— 通用 MCP stdio 客户端（子进程 JSON-RPC，仅 stdlib）。
+"""agent.core.mcp_client —— 通用 MCP stdio 客户端（子进程 JSON-RPC，仅 stdlib）。
 
 把一个 MCP 服务器（stdio 子进程）封装成可用的工具目录 + 调用能力：
     start() → initialize + notifications/initialized → list_tools() → call_tool(name, args)

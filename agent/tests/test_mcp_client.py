@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from agent.sys.mcp_client import McpStdioClient
+from agent.core.mcp_client import McpStdioClient
 
 
 def _run(coro):

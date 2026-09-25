@@ -18,7 +18,7 @@ import os
 import shutil
 
 from agent.api import Services, StateKeys, plugin
-from agent.sys.mcp_client import McpStdioClient
+from agent.api import McpStdioClient
 
 logger = logging.getLogger("agent.plugins.playwright_mcp")
 

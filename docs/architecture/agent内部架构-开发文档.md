@@ -395,7 +395,9 @@ agent/
 
 ## 11. 工具桥：MCP（外部能力的现实接入）
 
-- `agent.sys.mcp_client.McpStdioClient`：通用 MCP **stdio** 客户端，零三方依赖
+- `agent.core.mcp_client.McpStdioClient`：通用 MCP **stdio** 客户端，零三方依赖（原在
+  `agent.sys`，解耦审计后下沉内核——它只服务业务插件，放 sys 属"共享库放错层"；
+  插件经 `agent.api` 出口引用）。
   （`start()` / `list_tools()` / `call_tool(name, args)` / `close()`）。
 - `plugins.windows_mcp`：把 windows-mcp-server 的工具**自动注册进 agent 工具目录**
   - 工具 → 任务名 `mcp.windows.<tool>`，`owner="plugins.windows_mcp"`，输入 schema 由 MCP `inputSchema` 映射为 tasks 类型；

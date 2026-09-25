@@ -24,8 +24,10 @@ from agent.core.errors import (
 )
 from agent.core.events import EventBus
 from agent.core.events_catalog import Events, all_events, EVENT_MODE, REQUIRED_SUBSCRIBER_EVENTS
+from agent.core.mcp_client import McpStdioClient
 from agent.core.services_catalog import ALL as SERVICE_KEYS, Services
 from agent.core.state_keys import StateKeys
+from agent.core.tokens import clip_json, clip_text, estimate_tokens
 
 # ---- 提示词标记 SSOT（D4）-------------------------------------------------
 # 离线 FixtureLlm 据系统提示中的标记路由确定性响应；生产侧（chat/memory/react）
@@ -56,6 +58,12 @@ __all__ = [
     # 审计公共面（D4 转正；实现位于 core/audit）
     "durable",
     "now_iso",
+    # MCP stdio 客户端（实现位于 core/mcp_client；业务插件一律经本出口）
+    "McpStdioClient",
+    # token 原语（实现位于 core/tokens；插件/系统层一律经本出口，不得直连 core）
+    "estimate_tokens",
+    "clip_text",
+    "clip_json",
     # 提示词标记 SSOT（D4：离线 fixture 据此路由；`<!--` 字面量只许出现在本文件）
     "MARK_CHAT_PLAN",
     "MARK_CHAT_ANSWER",

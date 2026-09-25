@@ -1,11 +1,19 @@
-"""短期记忆（会话历史）测试 —— 转写落库 · 下一轮注入模型上下文 · 会话隔离 · 重置。"""
+"""短期记忆（会话历史）测试 —— 转写落库 · 下一轮注入模型上下文 · 会话隔离 · 重置。
+
+数据层归属（解耦审计 §① 修复）：``agent_messages`` 归短期记忆内容层
+（``plugins/short_term``），chat 侧零 SQL，一律经 ``Services.SHORT_TERM``。
+故本文件的会话历史用例**显式装配**目录插件；另补一组"插件未装配"的降级用例，
+证明 opt-in 语义下对话不裸崩。
+"""
 
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from agent.api import Services
 from agent.profiles import build_agent
+from agent.sys.plugin_manager import PluginManager
 
 
 def _run(coro):
@@ -16,8 +24,26 @@ def _cfg(tmp_path):
     return {"db_path": str(tmp_path / "agent.db")}
 
 
+def _pm(tmp_path):
+    PLUGIN_DIR = Path(__file__).resolve().parent.parent / "plugins"
+    pm = PluginManager(plugin_dir=str(PLUGIN_DIR),
+                       state_file=str(tmp_path / "state.json"))
+    pm.set_enabled("plugins.short_term", True)      # 目录插件：opt-in
+    pm.set_enabled("plugins.context", True)         # 调度层（收窗）
+    return pm
+
+
+def _build(tmp_path):
+    return build_agent(config=_cfg(tmp_path), plugin_mgr=_pm(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# 装配短期记忆：会话转写
+# ---------------------------------------------------------------------------
+
+
 def test_multiturn_history_stored(tmp_path):
-    c = build_agent(config=_cfg(tmp_path))
+    c = _build(tmp_path)
 
     async def s():
         await c.assemble()
@@ -35,7 +61,7 @@ def test_multiturn_history_stored(tmp_path):
 
 def test_next_turn_sees_prior_turns_in_llm_messages(tmp_path):
     """证明短期记忆真的注入模型：第二轮发给 LLM 的消息里含第一轮用户消息。"""
-    c = build_agent(config=_cfg(tmp_path))
+    c = _build(tmp_path)
 
     async def s():
         await c.assemble()
@@ -59,7 +85,7 @@ def test_next_turn_sees_prior_turns_in_llm_messages(tmp_path):
 
 
 def test_sessions_isolated_and_reset(tmp_path):
-    c = build_agent(config=_cfg(tmp_path))
+    c = _build(tmp_path)
 
     async def s():
         await c.assemble()
@@ -73,6 +99,59 @@ def test_sessions_isolated_and_reset(tmp_path):
         assert n >= 2
         assert await c.root.chat.history(c.root, "a") == []
         assert await c.root.chat.history(c.root, "b") != []   # 互不影响
+        await c.teardown()
+
+    _run(s())
+
+
+def test_reset_clears_summary_too(tmp_path):
+    """解耦审计发现的缺陷：``reset`` 必须级联清摘要表。
+
+    否则历史已删、摘要仍残留，下一轮会把"已被删掉的历史"的前情注入模型。
+    """
+    c = _build(tmp_path)
+
+    async def s():
+        await c.assemble()
+        short = c.root.get(Services.SHORT_TERM)
+        for i in range(3):
+            await short.append(c.root, "s", "user", f"消息{i}")
+        await short._store.upsert_summary(c.root, "s", summary="旧前情", version=1,
+                                          covers_up_to_seq=999, tokens=10)
+        assert await short.latest_summary(c.root, "s") == "旧前情"
+        await c.root.chat.reset(c.root, "s")
+        assert await short.latest_summary(c.root, "s") is None, "reset 未级联清摘要"
+        await c.teardown()
+
+    _run(s())
+
+
+def test_chat_has_no_direct_sql_on_message_table():
+    """守卫：chat（sys 层）不得直连短期记忆拥有的表（数据层归属）。"""
+    import re
+    from pathlib import Path as _P
+    src = (_P(__file__).resolve().parent.parent / "sys" / "chat.py").read_text(encoding="utf-8")
+    body = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
+    assert not re.search(r"(INSERT\s+INTO|DELETE\s+FROM|UPDATE)\s+agent_messages", body, re.I)
+    assert not re.search(r"FROM\s+agent_messages", body, re.I)
+
+
+# ---------------------------------------------------------------------------
+# 降级：短期记忆未装配（opt-in）→ 对话不裸崩，仅无会话转写
+# ---------------------------------------------------------------------------
+
+
+def test_without_short_term_plugin_chat_still_works(tmp_path):
+    """未装配短期记忆插件：send 正常返回，历史为空，reset 返回 0（不裸崩）。"""
+    c = build_agent(config=_cfg(tmp_path))       # 不传 plugin_mgr → 目录插件不装
+
+    async def s():
+        await c.assemble()
+        assert not c.root.has(Services.SHORT_TERM)
+        r = await c.root.chat.send(c.root, "你好", session_id="s3")
+        assert r.ok and r.text
+        assert await c.root.chat.history(c.root, "s3") == []
+        assert await c.root.chat.reset(c.root, "s3") == 0
         await c.teardown()
 
     _run(s())

@@ -8,8 +8,10 @@ build_agent(config, patch)：
   - offline：默认矩阵全开 → 不挡 T0/T1/T2 默认路径；
   - tight：矩阵收窄（deny agent.ping）→ 给 guard 造真实「非默认全开」拒绝场景。
 
-记忆（plugins.memory）不在系统层：它是 agent/plugins/memory 下的目录插件，
-默认启用，经「插件」页可停用 / 启用 / 卸载；停用后 ctx.has("memory") 为 False。
+记忆四层**全部**不在系统层，均为 agent/plugins/ 下的目录插件（opt-in）：
+  - plugins.system_memory（第1层·文件身份）/ plugins.memory（第2层·长期知识）
+  - plugins.work_memory（第3层·任务进度）/ plugins.short_term（第4层·对话历史）
+经「插件」页可停用 / 启用 / 卸载；停用后对应 ctx.has(...) 为 False，消费方软降级。
 """
 
 from __future__ import annotations
@@ -25,9 +27,7 @@ from agent.sys.guard import Guard
 from agent.sys.llm import LlmPlugin
 from agent.sys.loop import Loop
 from agent.sys.storage import Storage
-from agent.sys.system_memory import SystemMemory
 from agent.sys.tasks import TasksPlugin
-from agent.sys.work_memory import WorkMemory
 
 BASE_AGENT_CONFIG: dict = {
     "db_path": "data/agent.db",
@@ -43,7 +43,9 @@ TIGHT_PATCH: dict = {"agent": {"permissions": {"task_deny": ["agent.ping"]}}}
 
 LOW_BUDGET_PATCH: dict = {"agent": {"budget": {"max_tokens_per_run": 60}}}
 
-SYS_PLUGINS = (EventsPlugin, TasksPlugin, Storage, LlmPlugin, Budget, Guard, SystemMemory, WorkMemory)
+# 记忆四层**全部**是目录插件（opt-in），不在系统层硬装配：
+#   system_memory / work_memory / short_term / memory —— 经「插件」页启停，与 sys 层解耦。
+SYS_PLUGINS = (EventsPlugin, TasksPlugin, Storage, LlmPlugin, Budget, Guard)
 BUSINESS_PLUGINS = (Loop, Chat)
 
 

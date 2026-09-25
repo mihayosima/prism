@@ -49,6 +49,21 @@ _MESSAGES = [
     "CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id, seq)",
 ]
 
+# 短期记忆（第 4 层）摘要表：覆盖「所有不在当前 kept 里的历史」（covers_up_to_seq）。
+# version 递增、tokens 供预算；与 agent_messages 同库（namespace=agent）。
+_SUMMARIES = [
+    "CREATE TABLE IF NOT EXISTS agent_session_summaries ("
+    " session_id TEXT PRIMARY KEY, summary TEXT, version INTEGER DEFAULT 1,"
+    " covers_up_to_seq INTEGER, tokens INTEGER, updated_at TEXT)",
+]
+
+# 扩展 agent_messages：token_count（写入时预估，供预算）+ compressed_into（标记被哪版摘要覆盖）。
+# 以 ALTER 追加（幂等：迁移名未应用才执行），兼容已建旧库（agent_010 不含这两列）。
+_MSG_FIELDS = [
+    "ALTER TABLE agent_messages ADD COLUMN token_count INTEGER",
+    "ALTER TABLE agent_messages ADD COLUMN compressed_into INTEGER",
+]
+
 
 # ---- 已废弃迁移（仅登记名称，不再执行任何 DDL） ----
 # 早期领域版本曾建 agent_runs / agent_scores / agent_picks / agent_candidates 四表；代码已移除，
@@ -73,6 +88,8 @@ MIGRATIONS = [
     ("agent_008_entities", _per("sqlite", *_ENTITIES), "记忆实体"),
     ("agent_009_edges", _per("sqlite", *_EDGES), "记忆关系边"),
     ("agent_010_messages", _per("sqlite", *_MESSAGES), "会话转写（短期记忆：session_id + role/content 时序）"),
+    ("agent_011_session_summaries", _per("sqlite", *_SUMMARIES), "短期记忆滚动摘要（covers_up_to_seq 覆盖非 kept 历史）"),
+    ("agent_012_message_fields", _per("sqlite", *_MSG_FIELDS), "agent_messages 扩 token_count + compressed_into（兼容旧库 ALTER）"),
 ]
 
 __all__ = ["MIGRATIONS"]

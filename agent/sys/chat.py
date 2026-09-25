@@ -99,8 +99,8 @@ class ChatDriver:
         await durable(ctx, Events.CHAT_IN,
                       {"message": message, "session_id": session_id, "at": now_iso()})
         await self._append(ctx, session_id, "user", message)
-        history = await self._history(ctx, session_id, limit=HISTORY_LIMIT)
-        prior = history[:-1]              # 除本条外的最近历史 → 作为会话上下文喂给模型
+        # 短期记忆（内容层）提供历史 + 上下文治理（调度层）收窗；二者任一缺失 → 旧 HISTORY_LIMIT 硬裁
+        prior = await self._build_prior(ctx, session_id, message)
         # 多步 ReAct（plugins.react，目录插件）：装配了则**委托**；缺省回退下方单步路径。
         # 契约不变：chat 只经 ctx.has("react") 感知其存在，不 import 其实现。
         if ctx.has(Services.REACT):
@@ -135,6 +135,8 @@ class ChatDriver:
             "intent": plan.get("intent"),
             "ok": ok, "error": reply_error, "session_id": session_id, "at": now_iso(),
         })
+        if ctx.has(Services.SHORT_TERM):
+            asyncio.create_task(self._safe_compress(ctx, session_id))
         return ChatReply(text=text, plan=plan, evidence=evidence,
                          tokens_in=ti, tokens_out=to, ok=ok, error=reply_error,
                          session_id=session_id)
@@ -178,44 +180,88 @@ class ChatDriver:
             "error": None if res.ok else res.reason,
             "session_id": session_id, "at": now_iso(),
         })
+        if ctx.has(Services.SHORT_TERM):
+            asyncio.create_task(self._safe_compress(ctx, session_id))
         return ChatReply(text=text, plan={"intent": "react"}, evidence=res.as_evidence(),
                          tokens_in=res.tokens_in, tokens_out=res.tokens_out, ok=res.ok,
                          error=None if res.ok else res.reason, session_id=session_id)
 
     # ---------- 短期记忆：会话转写（session-scoped 历史） ----------
+    #
+    # 数据层归属：``agent_messages`` / ``agent_session_summaries`` 两表**归短期记忆内容层**
+    # （plugins/short_term）。chat 作为消费方**零 SQL**——append / history / reset 一律
+    # 经 ``ctx.get(Services.SHORT_TERM)``；插件未装配（目录插件 opt-in）→ 无会话转写，
+    # 对话照常进行，绝不裸崩。这样"内容层 owner"才名副其实，也不会出现两套实现漂移。
 
     async def _append(self, ctx, session_id: str, role: str, content: str) -> None:
-        if ctx.get(Services.DB) is None:
-            return
-        await ctx.db.execute(
-            ctx, "INSERT INTO agent_messages(session_id, role, content, at) VALUES (?,?,?,?)",
-            (session_id, role, content, now_iso()))
+        short = ctx.get(Services.SHORT_TERM)
+        if short is None:
+            return                                  # 未装配：无转写，不落库也不报错
+        await short.append(ctx, session_id, role, content)
 
     async def _history(self, ctx, session_id: str, limit: int = HISTORY_LIMIT) -> list[dict]:
-        if ctx.get(Services.DB) is None:
+        short = ctx.get(Services.SHORT_TERM)
+        if short is None:
             return []
-        rows = await ctx.db.query(
-            ctx, "SELECT role, content FROM agent_messages WHERE session_id=?"
-                 " ORDER BY seq DESC LIMIT ?", (session_id, limit))
-        return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+        rows = await short.recent(ctx, session_id, limit)
+        return [{"role": r["role"], "content": r["content"]} for r in rows]
 
     async def history(self, ctx, session_id: str = "default", limit: int = 100) -> list[dict]:
-        if ctx.get(Services.DB) is None:
+        short = ctx.get(Services.SHORT_TERM)
+        if short is None:
             return []
-        rows = await ctx.db.query(
-            ctx, "SELECT seq, role, content, at FROM agent_messages WHERE session_id=?"
-                 " ORDER BY seq ASC LIMIT ?", (session_id, limit))
-        return [dict(r) for r in rows]
+        return await short.history(ctx, session_id, limit)
+
+    # ---------- 短期记忆：prior 构造（内容层提供 + 调度层收窗） ----------
+
+    async def _build_prior(self, ctx, session_id: str, message: str) -> list[dict]:
+        """构造喂给模型的会话上下文。
+
+        职责边界（关键）：
+        - **短期记忆**提供内容（全量历史 + 滚动摘要前情）；
+        - **上下文治理**做调度收窗（``pick_history`` 决定窗口留多少条）；
+        - 本地截短（窗口内可逆）属内容层，由 ``short_term.truncate_view`` 对选中老内容凝练。
+
+        降级：短期记忆或治理器缺失 → 退回旧 ``HISTORY_LIMIT`` 条数硬裁（不劣化、不裸崩）。
+        """
+        if ctx.has(Services.SHORT_TERM) and ctx.has(Services.CONTEXT):
+            short = ctx.get(Services.SHORT_TERM)
+            raw = await short.get_history(ctx, session_id)      # seq ASC，含本轮 user（最新）
+            raw_excl = raw[:-1] if raw else []                 # 排除本轮 user（调用方单独追加）
+            summary = await short.latest_summary(ctx, session_id)
+            governor = ctx.get(Services.CONTEXT)
+            budget = governor.history_budget()
+            kept, _ = governor.pick_history(raw_excl, budget, keep_first=True)
+            kept_view = short.truncate_view(kept)               # 内容层窗口内截短（老内容，可逆）
+            prior: list[dict] = []
+            if summary:
+                prior.append({
+                    "role": "user",
+                    "content": "[会话前情 · 以下为历史摘要，仅供参考]\n" + summary,
+                })
+            prior.extend(kept_view)
+            return prior
+        # 降级：旧 HISTORY_LIMIT 条数硬裁（除本轮 user 外）
+        history = await self._history(ctx, session_id, limit=HISTORY_LIMIT)
+        return history[:-1]
+
+    async def _safe_compress(self, ctx, session_id: str) -> None:
+        """异步触发压缩（双保险：maybe_compress 内部已吞执行异常并按退避处理）。"""
+        try:
+            short = ctx.get(Services.SHORT_TERM)
+            if short is not None:
+                await short.maybe_compress(ctx, session_id)
+        except Exception as exc:  # noqa: BLE001 —— 压缩失败绝不拖累主回复
+            logging.getLogger("agent.chat").warning("short_term compress task failed: %s", exc)
 
     async def reset(self, ctx, session_id: str = "default") -> int:
-        if ctx.get(Services.DB) is None:
-            return 0
-        rows = await ctx.db.query(
-            ctx, "SELECT COUNT(*) AS n FROM agent_messages WHERE session_id=?", (session_id,))
-        await ctx.db.execute(ctx, "DELETE FROM agent_messages WHERE session_id=?", (session_id,))
+        short = ctx.get(Services.SHORT_TERM)
+        # 无短期记忆插件 → 无转写可清（n=0），但**事件照发**：新会话语义与记忆层是否装配
+        # 无关，预算累计等订阅方依赖 ``CHAT_RESET`` 清零。
+        n = await short.reset(ctx, session_id) if short is not None else 0
         if ctx.has(Services.EVENTS):
             await ctx.events.emit(Events.CHAT_RESET, {"session_id": session_id})
-        return rows[0]["n"]
+        return n
 
     async def _memory_block(self, ctx, query: str) -> str:
         if not ctx.has(Services.MEMORY):
@@ -341,8 +387,9 @@ class Chat:
     version = "0.1.0"
     layer = "business"
     provides = [Services.CHAT]
-    inject = [Services.LLM, Services.TASKS, Services.EVENTS, Services.DB,
-              Services.SYSTEM_MEMORY]
+    # 记忆四层均为**软依赖**（目录插件 opt-in，可能未启用）→ 不写进 inject，
+    # 否则未启用时容器装配直接 MissingDependencyError。消费处一律 ctx.get(...) or 默认。
+    inject = [Services.LLM, Services.TASKS, Services.EVENTS, Services.DB]
     description = "对话驱动：意图规划 → 执行(guard) → LLM 解说"
 
     async def apply(self, ctx) -> None:

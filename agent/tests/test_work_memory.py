@@ -11,8 +11,8 @@ from pathlib import Path
 from agent.api import Services
 from agent.profiles import build_agent
 from agent.sys.plugin_manager import PluginManager
-from agent.sys.work_memory import (InMemoryWorkMemory, RedisWorkMemory,
-                                   WorkMemory, WorkMemoryLike)
+from agent.plugins.work_memory import (InMemoryWorkMemory, RedisWorkMemory,
+                                       WorkMemory, WorkMemoryLike)
 
 try:
     import fakeredis.aioredis as _fa
@@ -30,6 +30,7 @@ def _pm(tmp_path):
     pm = PluginManager(plugin_dir=str(PLUGIN_DIR),
                        state_file=str(tmp_path / "state.json"))
     pm.set_enabled("plugins.react", True)
+    pm.set_enabled("plugins.work_memory", True)      # 目录插件：opt-in
     return pm
 
 
@@ -124,7 +125,9 @@ def test_plugin_degrades_without_redis(tmp_path):
         await c.assemble()
         wm = c.root.get(Services.WORK_MEMORY)
         assert type(wm).__name__ == "WorkMemory"
-        assert isinstance(wm._impl, InMemoryWorkMemory)
+        # 注意：目录插件由 PluginManager 按**文件路径**加载，类身份与 ``agent.plugins.*``
+        # 导入路径下的类对象不同（两个模块对象）→ 用类型名断言，不用 isinstance。
+        assert type(wm._impl).__name__ == "InMemoryWorkMemory"
         await c.teardown()
 
     _run(s())
