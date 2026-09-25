@@ -34,6 +34,7 @@ class SqliteDb:
         self._path = path
         self._conn = None
         self._lock = None
+        self._in_tx = False                     # S4：事务块内 execute 不自行提交
 
     async def start(self) -> None:
         from pathlib import Path
@@ -41,12 +42,15 @@ class SqliteDb:
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = self._sqlite3.connect(self._path)
         self._conn.row_factory = self._sqlite3.Row
+        self._conn.isolation_level = None       # 显式事务模式：BEGIN/COMMIT 由本类掌控
         self._lock = asyncio.Lock()
 
     async def execute(self, ctx, sql: str, params: tuple = ()) -> None:
+        if self._in_tx:
+            self._conn.execute(sql, params or ())   # 事务块内：由 transaction 统一提交
+            return
         async with self._lock:
-            with self._conn:                          # with 连接 = 提交/回滚
-                self._conn.execute(sql, params or ())
+            self._conn.execute(sql, params or ())
 
     async def query(self, ctx, sql: str, params: tuple = ()) -> list[dict]:
         async with self._lock:
@@ -54,6 +58,34 @@ class SqliteDb:
             rows = cur.fetchall()
             cur.close()
             return [dict(r) for r in rows]
+
+    def transaction(self, ctx):
+        """S4：显式事务（异步上下文管理器；普通方法，返回 cm 而非协程）。
+
+        ``async with db.transaction(ctx): ...``——块内多条语句同生共死：
+        任一异常 → ROLLBACK，正常退出 → COMMIT。块内持锁，迁移等原子性依赖此原语。
+        """
+        db = self
+
+        class _Tx:
+            async def __aenter__(self):
+                await db._lock.acquire()
+                db._in_tx = True
+                db._conn.execute("BEGIN")
+                return db
+
+            async def __aexit__(self, exc_type, exc, tb):
+                try:
+                    if exc_type is None:
+                        db._conn.execute("COMMIT")
+                    else:
+                        db._conn.execute("ROLLBACK")
+                finally:
+                    db._in_tx = False
+                    db._lock.release()
+                return False
+
+        return _Tx()
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -86,12 +118,15 @@ class MigrationRegistry:
         for name, stmts, _desc in migrations:
             if name in applied:
                 continue
-            for sql in stmts.get(dialect, ()):
-                await self._db.execute(ctx, sql)
-            await self._db.execute(
-                ctx, "INSERT INTO agent_migrations(name, applied_at) VALUES (?,?)",
-                (name, _now_iso()),
-            )
+            # S4：每组迁移的全部语句 + 名字登记包进单个事务——
+            # 中途失败 → 整组回滚（不留半套表、不留名字），下次启动可完整重放。
+            async with self._db.transaction(ctx):
+                for sql in stmts.get(dialect, ()):
+                    await self._db.execute(ctx, sql)
+                await self._db.execute(
+                    ctx, "INSERT INTO agent_migrations(name, applied_at) VALUES (?,?)",
+                    (name, _now_iso()),
+                )
             ran.append(name)
         return ran
 
