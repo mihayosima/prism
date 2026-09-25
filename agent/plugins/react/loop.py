@@ -26,7 +26,8 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from agent.api import CapabilityNotImplemented, Events, StateKeys, durable, now_iso
+from agent.api import (CapabilityNotImplemented, Events, Services, StateKeys,
+                     durable, now_iso)
 
 logger = logging.getLogger("agent.react")
 
@@ -123,7 +124,9 @@ class ReactLoop:
             "max_steps": cfg.max_steps, "at": now_iso()})
 
         tools = visible_tools(ctx)
-        messages: list[dict] = [{"role": "system", "content": build_system(tools)}]
+        messages: list[dict] = [{"role": "system",
+                                  "content": build_system(tools,
+                                                          ctx.get(Services.SYSTEM_MEMORY) or "")}]
         messages.extend(dict(m) for m in (prior or []))
         messages.append({"role": "user", "content": prompt})
 

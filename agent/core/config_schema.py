@@ -30,6 +30,8 @@ _SCHEMA: dict[str, Any] = {
         # 插件自管节
         "memory": "_any",
         "react": "_any",
+        "context": "_any",
+        "system_memory": "_any",
     },
     # 插件自管顶层节
     "windows_mcp": "_any",

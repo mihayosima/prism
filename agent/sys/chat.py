@@ -228,7 +228,11 @@ class ChatDriver:
     # ---------- ① 规划 ----------
 
     async def _plan(self, ctx, message: str, prior: list[dict]) -> dict:
-        system = f"{MARK_CHAT_PLAN}\n{PLAN_SYSTEM}"
+        sm = ctx.get(Services.SYSTEM_MEMORY) or ""
+        system = MARK_CHAT_PLAN
+        if sm:                                       # 系统记忆：静态底座（声明层，前置注入）
+            system += "\n" + sm
+        system += "\n" + PLAN_SYSTEM
         mem = await self._memory_block(ctx, message)
         if mem:
             system += "\n\n" + mem
@@ -302,7 +306,11 @@ class ChatDriver:
     async def _narrate(self, ctx, plan: dict, evidence: dict, message: str, prior: list[dict]):
         snippet = json.dumps({"plan": plan, "evidence": evidence},
                              ensure_ascii=False)
-        system = f"{MARK_CHAT_ANSWER}\n{ANSWER_SYSTEM}\n\n证据 JSON:\n{snippet}"
+        sm = ctx.get(Services.SYSTEM_MEMORY) or ""
+        system = MARK_CHAT_ANSWER
+        if sm:                                       # 系统记忆：静态底座（声明层，前置注入）
+            system += "\n" + sm
+        system += "\n" + ANSWER_SYSTEM + "\n\n证据 JSON:\n" + snippet
         mem = await self._memory_block(ctx, message)
         if mem:
             system += "\n\n" + mem
@@ -333,7 +341,8 @@ class Chat:
     version = "0.1.0"
     layer = "business"
     provides = [Services.CHAT]
-    inject = [Services.LLM, Services.TASKS, Services.EVENTS, Services.DB]
+    inject = [Services.LLM, Services.TASKS, Services.EVENTS, Services.DB,
+              Services.SYSTEM_MEMORY]
     description = "对话驱动：意图规划 → 执行(guard) → LLM 解说"
 
     async def apply(self, ctx) -> None:

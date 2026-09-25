@@ -43,6 +43,8 @@ class Events:
     # 记忆插件
     MEMORY_REMEMBERED = "agent/memory/remembered"
     MEMORY_RECALL = "agent/memory/recall"
+    # 上下文治理插件：agent/context/governed 事件名随 G1 接线（装配元数据 durable）
+    # 一并登记——SSOT 守卫要求常量被源码引用，未接线的名字不提前入册。
 
 
 def all_events() -> set[str]:

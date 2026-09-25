@@ -62,8 +62,10 @@ def render_tools(catalog: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_system(catalog: list[dict]) -> str:
-    return f"{REACT_SYSTEM}\n\n{render_tools(catalog)}\n\n{env_facts()}"
+def build_system(catalog: list[dict], system_memory: str = "") -> str:
+    # 系统记忆：静态底座（声明层），前置注入；动态块（工具/环境）按原模式裁剪追加
+    base = (system_memory + "\n\n" + REACT_SYSTEM) if system_memory else REACT_SYSTEM
+    return f"{base}\n\n{render_tools(catalog)}\n\n{env_facts()}"
 
 
 def as_text(value) -> str:

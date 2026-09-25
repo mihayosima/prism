@@ -25,6 +25,7 @@ from agent.sys.guard import Guard
 from agent.sys.llm import LlmPlugin
 from agent.sys.loop import Loop
 from agent.sys.storage import Storage
+from agent.sys.system_memory import SystemMemory
 from agent.sys.tasks import TasksPlugin
 
 BASE_AGENT_CONFIG: dict = {
@@ -41,7 +42,7 @@ TIGHT_PATCH: dict = {"agent": {"permissions": {"task_deny": ["agent.ping"]}}}
 
 LOW_BUDGET_PATCH: dict = {"agent": {"budget": {"max_tokens_per_run": 60}}}
 
-SYS_PLUGINS = (EventsPlugin, TasksPlugin, Storage, LlmPlugin, Budget, Guard)
+SYS_PLUGINS = (EventsPlugin, TasksPlugin, Storage, LlmPlugin, Budget, Guard, SystemMemory)
 BUSINESS_PLUGINS = (Loop, Chat)
 
 

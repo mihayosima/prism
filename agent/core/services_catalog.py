@@ -25,6 +25,8 @@ class Services:
     BUDGET = "budget"
     REACT = "react"
     MEMORY = "memory"
+    CONTEXT = "context"
+    SYSTEM_MEMORY = "system_memory"
     WINDOWS_MCP = "windows_mcp"
     PLAYWRIGHT_MCP = "playwright_mcp"
 
@@ -42,6 +44,8 @@ ALL = frozenset(
         Services.BUDGET,
         Services.REACT,
         Services.MEMORY,
+        Services.CONTEXT,
+        Services.SYSTEM_MEMORY,
         Services.WINDOWS_MCP,
         Services.PLAYWRIGHT_MCP,
     }

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from agent.api import AgentError, CapabilityNotImplemented, Events, Services, durable, plugin
+from agent.core.tokens import estimate_tokens
 
 
 class LlmProvider(Protocol):
@@ -35,18 +36,12 @@ class LlmResult:
     provider: str = "fixture"
 
 
-_CJK_LO, _CJK_HI = "\u4e00", "\u9fff"   # CJK 统一表意文字主区
-_CJK_TOKEN_PER_CHAR = 0.75              # 中文 ≈ 每字 0.75 token（估算口径，诚实标注=estimate）
-
-
 def _tokens(obj: Any) -> int:
-    """tokens 估算（诚实标注=estimate）：ASCII 按 4 字符/token，CJK 按 0.75 token/字。
+    """tokens 估算——兼容别名：实现已转正 ``core.tokens.estimate_tokens``（G0）。
 
     旧口径 ``len//4`` 对中文系统性低估 2–3 倍（S1 修正），budget 预借以本函数为准。
     """
-    s = json.dumps(obj, ensure_ascii=False)
-    cjk = sum(1 for ch in s if _CJK_LO <= ch <= _CJK_HI)
-    return max(1, int((len(s) - cjk) / 4 + cjk * _CJK_TOKEN_PER_CHAR))
+    return estimate_tokens(obj)
 
 
 class PlaceholderLlm:
