@@ -29,28 +29,45 @@ class Budget:
         ctx.state.setdefault("budget_spent", 0)
 
         async def _pre(payload: dict, next) -> dict:
-            est = _tokens(payload.get("messages", []))
+            # est 覆盖 messages + tools 目录 + schema（S1：不再漏算请求侧开销）
+            est = (_tokens(payload.get("messages", []))
+                   + _tokens(payload.get("tools") or [])
+                   + _tokens(payload.get("schema") or {}))
             spent = ctx.state.get("budget_spent", 0)
             if max_tokens and spent + est > max_tokens:
                 return {"denied": True,
                         "reason": f"预算超限 spent={spent}+est={est}>{max_tokens}"}
-            # 预借记账（确定性：与 post 竞态无关；est 与真实同口径）
+            # 预借记账（确定性：与 post 竞态无关）；pending est 留痕供对账/退款
             ctx.state["budget_spent"] = spent + est
+            ctx.state["budget_pending_est"] = est
             return await next()
 
         async def _post(payload: dict) -> None:
-            # 记账行（实际 tokens）；花费已在 pre 借用，这里只落账审计
+            # S1 对账：用实际入账替换预借（spent = spent - est + actual），
+            # 账面精确等于 Σ实际；当前"实际"仍是估算口径，S6 接入真实 usage 后才有真实差值。
             ti = int(payload.get("tokens_in", 0))
             to = int(payload.get("tokens_out", 0))
+            est = ctx.state.get("budget_pending_est", 0)
+            spent = ctx.state.get("budget_spent", 0)
+            ctx.state["budget_spent"] = max(0, spent - est + (ti + to))
+            ctx.state["budget_pending_est"] = 0
             await ctx.db.execute(
                 ctx,
                 "INSERT INTO agent_budget_log(model, tokens_in, tokens_out, est_cost, at)"
                 " VALUES (?,?,?,?,?)",
-                (model, ti, to, None, _now_iso()),
+                (model, ti, to, est or None, _now_iso()),
             )
+
+        def _call_failed(payload: dict) -> None:
+            # S1：调用失败 → 全额退还本次预借（同步监听器，emit 内联执行立即生效）。
+            est = ctx.state.get("budget_pending_est", 0)
+            if est:
+                ctx.state["budget_spent"] = max(0, ctx.state.get("budget_spent", 0) - est)
+                ctx.state["budget_pending_est"] = 0
 
         ctx.on(Events.LLM_PRE_CALL, _pre)
         ctx.on(Events.LLM_POST_CALL, _post)
+        ctx.on(Events.LLM_CALL_FAILED, _call_failed)
         if cfg.get("reset_on_new_session", True):
             def _reset_session(_payload: dict) -> None:      # 同步：emit 内联执行，立即生效
                 ctx.state["budget_spent"] = 0

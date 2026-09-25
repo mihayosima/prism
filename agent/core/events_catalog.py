@@ -16,6 +16,7 @@ class Events:
     # LLM 生命周期
     LLM_PRE_CALL = "agent/llm/pre-call"
     LLM_POST_CALL = "agent/llm/post-call"
+    LLM_CALL_FAILED = "agent/llm/call-failed"   # S1：provider 失败（durable 审计 + budget 退款）
     LLM_TOKEN = "agent/llm/token"          # B5.2 打字机：每片文本 {"text": 片段}
     LLM_THINKING = "agent/llm/thinking"    # B5.2 思考流（D4）：reasoning_content 每片 {"text": 片段}
 
@@ -59,6 +60,7 @@ def all_events() -> set[str]:
 EVENT_MODE: dict[str, str] = {
     Events.LLM_PRE_CALL: "waterfall",
     Events.LLM_POST_CALL: "emit",
+    Events.LLM_CALL_FAILED: "emit",        # S1：失败审计/退款（live 通知 budget；durable 由 llm 接缝直写）
     Events.LLM_TOKEN: "emit",              # B5.2 流式打字机（遥测性质，不进 required seam）
     Events.LLM_THINKING: "emit",           # B5.2 思考流（D4）：同属遥测性质，不进 required seam
     Events.TASKS_PRE_EXECUTE: "waterfall",

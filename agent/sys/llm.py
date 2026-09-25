@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from agent.api import AgentError, CapabilityNotImplemented, Events, Services, plugin
+from agent.sys.audit import durable
 
 
 class LlmProvider(Protocol):
@@ -34,9 +35,18 @@ class LlmResult:
     provider: str = "fixture"
 
 
+_CJK_LO, _CJK_HI = "\u4e00", "\u9fff"   # CJK 统一表意文字主区
+_CJK_TOKEN_PER_CHAR = 0.75              # 中文 ≈ 每字 0.75 token（估算口径，诚实标注=estimate）
+
+
 def _tokens(obj: Any) -> int:
-    """tokens 估算（诚实标注=estimate）：字符数≈tokens 的 4 倍（粗略，用于账目）。"""
-    return max(1, len(json.dumps(obj, ensure_ascii=False)) // 4)
+    """tokens 估算（诚实标注=estimate）：ASCII 按 4 字符/token，CJK 按 0.75 token/字。
+
+    旧口径 ``len//4`` 对中文系统性低估 2–3 倍（S1 修正），budget 预借以本函数为准。
+    """
+    s = json.dumps(obj, ensure_ascii=False)
+    cjk = sum(1 for ch in s if _CJK_LO <= ch <= _CJK_HI)
+    return max(1, int((len(s) - cjk) / 4 + cjk * _CJK_TOKEN_PER_CHAR))
 
 
 class PlaceholderLlm:
@@ -80,7 +90,15 @@ class LlmService:
             raise CapabilityNotImplemented(
                 "agent.llm.complete", decision.get("reason", "被 guard/budget 否决")
             )
-        data = await self._provider.complete(ctx, messages, schema=schema, tools=tools)
+        try:
+            data = await self._provider.complete(ctx, messages, schema=schema, tools=tools)
+        except Exception as exc:
+            # S1：失败路径——durable 审计 + live 通知（budget 同步退款），随后原样抛出。
+            # 成功路径行为零变化。
+            payload = {"caller": caller, "error": str(exc)}
+            await durable(ctx, Events.LLM_CALL_FAILED, dict(payload))
+            await ctx.events.emit(Events.LLM_CALL_FAILED, dict(payload))
+            raise
         tokens_in, tokens_out = _tokens(messages), _tokens(data)
         await ctx.events.emit(Events.LLM_POST_CALL, {
             "provider": self._model, "tokens_in": tokens_in, "tokens_out": tokens_out,
