@@ -41,6 +41,8 @@ class ProduceDriver:
 
     def __init__(self):
         self._running: dict[str, asyncio.Task] = {}      # task 名 -> 在跑的 asyncio 任务（供 cancel）
+        self._idle = asyncio.Event()                     # S7：空闲信号（替代轮询）
+        self._idle.set()
 
     async def run(self, ctx, *, task: str, params: dict | None = None) -> RunResult:
         params = params or {}
@@ -52,6 +54,7 @@ class ProduceDriver:
         cur = asyncio.current_task()
         if cur is not None:
             self._running[task] = cur
+        self._idle.clear()                               # S7：有任务在跑 → 非空闲
         try:
             entry = ctx.tasks.resolve(ctx, task)
             if entry is None:
@@ -60,12 +63,15 @@ class ProduceDriver:
             result = await asyncio.wait_for(entry(**params), timeout=deadline)
             return RunResult(ok=True, result=result, span_ms=int((time.monotonic() - started) * 1000))
         except asyncio.TimeoutError:
-            return RunResult(ok=False, error=f"deadline 超时（> {params}）")
+            return RunResult(ok=False,
+                             error=f"deadline 超时（> {deadline}s，task={task!r}）")
         except Exception as exc:  # noqa: BLE001 —— 单次任务失败不 kill 循环
             return RunResult(ok=False, error=str(exc))
         finally:
             running.discard(task)
             self._running.pop(task, None)
+            if not self._running:
+                self._idle.set()                         # S7：全部结束 → 空闲
 
     async def cancel(self) -> None:
         """取消全部在跑的任务——`Task.cancel()` 在任意 await 点即时生效。"""
@@ -74,8 +80,9 @@ class ProduceDriver:
 
     async def when_idle(self) -> None:
         """等待驱动进入空闲（无在跑任务）。供优雅停止与 A4 提问时机使用。"""
-        while self._running:
-            await asyncio.sleep(0.01)
+        if not self._running:
+            return
+        await self._idle.wait()
 
 
 @plugin

@@ -42,7 +42,10 @@ FRAME_TYPES: dict[str, str] = {
 
 
 def _pusher(queue: asyncio.Queue, name: str):
-    """构造同步推送器（emit 对同步监听器内联执行，无额外任务开销）。"""
+    """构造同步推送器（emit 对同步监听器内联执行，无额外任务开销）。
+
+    S7：队列满（有界）→ 丢最旧一帧保新帧并计数（``queue.dropped``），绝不阻断业务主链路。
+    """
     ftype = FRAME_TYPES.get(name, "progress")
 
     def _push(*args: Any) -> None:
@@ -52,7 +55,15 @@ def _pusher(queue: asyncio.Queue, name: str):
             # 帧类型来自 FRAME_TYPES（默认 "progress"）；内核事件名放 payload.source
             queue.put_nowait({"event": ftype,
                               "payload": {"source": name, "data": payload}})
-        except Exception:      # noqa: BLE001 —— 队列异常绝不阻断业务主链路
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()                 # 丢最旧
+                queue.put_nowait({"event": ftype,
+                                  "payload": {"source": name, "data": payload}})
+                queue.dropped = getattr(queue, "dropped", 0) + 1
+            except Exception:  # noqa: BLE001 —— 丢帧策略自身的异常也绝不外泄
+                pass
+        except Exception:  # noqa: BLE001 —— 队列异常绝不阻断业务主链路
             pass
 
     return _push
@@ -60,16 +71,14 @@ def _pusher(queue: asyncio.Queue, name: str):
 
 @asynccontextmanager
 async def tap_progress(ctx, *, queue: asyncio.Queue | None = None,
-                       events: tuple[str, ...] = PROGRESS_EVENTS) -> AsyncIterator[asyncio.Queue]:
+                       events: tuple[str, ...] = PROGRESS_EVENTS,
+                       maxsize: int = 1024) -> AsyncIterator[asyncio.Queue]:
     """订阅内核事件 → 推入队列；退出作用域**自动注销**监听（scope effect 对称回收）。
 
-    用法：:
-
-        async with tap_progress(ctx) as q:
-            task = asyncio.create_task(chat.send(...))   # 必须在订阅之后再起任务，防漏帧
-            frame = await q.get()
+    ``maxsize``：自建队列的有界容量（S7，默认 1024）——token 高频流 + 慢消费者
+    不再无限占内存；传入自定义 ``queue`` 时以其实际容量为准。
     """
-    q = queue if queue is not None else asyncio.Queue()
+    q = queue if queue is not None else asyncio.Queue(maxsize=maxsize)
     async with ctx.scope("progress") as sctx:
         for name in events:
             sctx.on(name, _pusher(q, name))

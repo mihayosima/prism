@@ -8,16 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
 
 from agent.api import AgentError, Services, plugin
+from agent.sys.audit import _now_iso
 from agent.tables import MIGRATIONS
 
 logger = logging.getLogger("agent.storage")
-
-
-def _now_iso() -> str:
-    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
 class SqliteDb:
@@ -43,6 +39,8 @@ class SqliteDb:
         self._conn = self._sqlite3.connect(self._path)
         self._conn.row_factory = self._sqlite3.Row
         self._conn.isolation_level = None       # 显式事务模式：BEGIN/COMMIT 由本类掌控
+        self._conn.execute("PRAGMA journal_mode=WAL")    # S7：多进程并发读写更稳
+        self._conn.execute("PRAGMA busy_timeout=5000")   # S7：锁冲突等待 5s 而非立即抛错
         self._lock = asyncio.Lock()
 
     async def execute(self, ctx, sql: str, params: tuple = ()) -> None:

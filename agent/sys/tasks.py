@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from datetime import datetime
+import time
 from typing import Any, Callable, Mapping
 
 from agent.api import (
@@ -22,6 +22,7 @@ from agent.api import (
     current_plugin,
     plugin,
 )
+from agent.sys.audit import _now_iso
 
 logger = logging.getLogger("agent.tasks")
 
@@ -30,10 +31,6 @@ logger = logging.getLogger("agent.tasks")
 #   write  有副作用（默认；保守取值 —— 未声明即按"会改东西"对待）
 #   danger 高危（执行命令/改系统，应默认需人确认）
 RISKS = ("read", "write", "danger")
-
-
-def _now_iso() -> str:
-    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
 # ---- 轻量 schema 校验（{参数名: {type, required, default}}） ----
@@ -134,8 +131,19 @@ class TaskRegistry:
             raise CapabilityNotImplemented(
                 f"agent.tasks.{name}", decision.get("reason", "被 guard/约束否决")
             )
-        result = await cmd.invoke(kwargs)
-        await ctx.events.emit(Events.TASKS_POST_EXECUTE, {"task": name, "caller": caller})
+        started = time.monotonic()
+        ok, error = True, None
+        try:
+            result = await cmd.invoke(kwargs)
+        except Exception as exc:
+            ok, error = False, str(exc)     # S7：失败也发 post 事件（审计不缺失败样本）
+            raise
+        finally:
+            span_ms = int((time.monotonic() - started) * 1000)
+            await ctx.events.emit(Events.TASKS_POST_EXECUTE, {
+                "task": name, "caller": caller,
+                "ok": ok, "span_ms": span_ms, "error": error,
+            })
         return result
 
     def resolve(self, ctx, name: str) -> Callable[..., Any] | None:

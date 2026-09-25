@@ -193,7 +193,16 @@ class PluginManager:
             return {"enabled": [], "removed": []}
         try:
             return json.loads(self._state_file.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            # S7：状态文件损坏——告警 + 备份坏文件，不再静默当作空状态
+            #（静默清空 = 一次文件损坏即禁用全部目录插件且无人知晓）。
+            backup = self._state_file.with_suffix(".corrupt")
+            logger.error("插件状态文件 %s 损坏（%s）；已备份为 %s，按空状态处理",
+                         self._state_file, exc, backup.name)
+            try:
+                self._state_file.replace(backup)
+            except OSError:  # noqa: BLE001 —— 备份失败不阻断启动
+                pass
             return {"enabled": [], "removed": []}
 
     def _write_state(self, data: dict) -> None:
