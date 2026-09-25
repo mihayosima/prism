@@ -7,10 +7,11 @@ dependencies = [
     "fastapi>=0.139",
     "uvicorn>=0.51",
     "httpx>=0.28",
+    "redis>=5.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "fakeredis>=2.0"]
 
 [build-system]
 requires = ["setuptools>=61.0"]

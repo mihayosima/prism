@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -130,6 +131,14 @@ class ReactLoop:
         messages.extend(dict(m) for m in (prior or []))
         messages.append({"role": "user", "content": prompt})
 
+        # 工作记忆（第 3 层）：任务级进度缓存。接缝获取，缺失则跳过（不破解耦）。
+        wm = ctx.get(Services.WORK_MEMORY)
+        run_id = uuid.uuid4().hex
+        task_id = f"{session_id}:{run_id}"
+        if wm is not None:
+            await wm.begin(task_id, {"session_id": session_id, "run_id": run_id,
+                                     "max_steps": cfg.max_steps})
+
         steps = 0
         tokens_in = tokens_out = 0
         rejected: dict[str, int] = defaultdict(int)
@@ -169,6 +178,8 @@ class ReactLoop:
                     "steps": steps, "tokens_in": tokens_in, "tokens_out": tokens_out,
                     "at": now_iso()})
                 self._record(ctx, steps, tool_trace, exhausted=False)
+                if wm is not None:
+                    await wm.finish(task_id)
                 return ReactResult(ok=True, text=out.text or "（未给出回答）", steps=steps,
                                    tokens_in=tokens_in, tokens_out=tokens_out,
                                    tools=tool_trace, observations=observed)
@@ -192,6 +203,13 @@ class ReactLoop:
             await ctx.events.emit(Events.REACT_STEP_END, {
                 "step": steps, "tools": [r.name for r in results],
                 "is_error": any(r.is_error for r in results)})
+            # 工作记忆：每步进度更新 + 里程碑检查点（tool_trace 仅工具名、已限 10，体积小）
+            if wm is not None:
+                last = tool_trace[-1] if tool_trace else ""
+                await wm.update(task_id, step=steps, tools=list(tool_trace), last_action=last)
+                await wm.checkpoint(task_id, f"step_{steps}",
+                                    {"tool_trace": list(tool_trace[-10:]),
+                                     "last_action": last, "note": "step completed"})
             if stop_reason:
                 reason = stop_reason
                 break
@@ -211,6 +229,8 @@ class ReactLoop:
         else:
             text = f"（已达执行上限：{reason}）"
         self._record(ctx, steps, tool_trace, exhausted=True, reason=reason)
+        if wm is not None:
+            await wm.finish(task_id)
         return ReactResult(ok=not hard, text=text, steps=steps, tokens_in=tokens_in,
                            tokens_out=tokens_out, exhausted=True, reason=reason,
                            tools=tool_trace, observations=observed)
