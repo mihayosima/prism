@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from agent.api import Services, plugin
+from agent.api import Services, StateKeys, plugin
 
 
 class AgentDriver(Protocol):
@@ -46,7 +46,7 @@ class ProduceDriver:
 
     async def run(self, ctx, *, task: str, params: dict | None = None) -> RunResult:
         params = params or {}
-        running = ctx.state.setdefault("loop_running", set())
+        running = ctx.state.setdefault(StateKeys.LOOP_RUNNING, set())
         if task in running:
             return RunResult(ok=False, skipped=True, error=f"overlap skip: {task} 上一轮未结束")
         running.add(task)

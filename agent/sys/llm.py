@@ -15,8 +15,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from agent.api import AgentError, CapabilityNotImplemented, Events, Services, plugin
-from agent.sys.audit import durable
+from agent.api import AgentError, CapabilityNotImplemented, Events, Services, durable, plugin
 
 
 class LlmProvider(Protocol):
@@ -82,6 +81,12 @@ class LlmService:
     async def complete(self, ctx, messages: list[dict], *,
                        schema: dict | None = None, tools: list[dict] | None = None,
                        caller: str = "unknown") -> LlmResult:
+        """模型调用（消费方视角，契约见 ``core/contract.LlmProvider``）。
+
+        pre-call waterfall（guard→budget 预借）→ provider.complete → post-call 入账；
+        失败发 ``agent/llm/call-failed``（budget 同步监听器内联退款）后原样抛出。
+        结果与 ``stream`` 配置无关（schema 调用走流式也返回已解析 dict）。
+        """
         decision = await ctx.events.waterfall(
             Events.LLM_PRE_CALL,
             {"messages": messages, "schema": schema, "caller": caller,

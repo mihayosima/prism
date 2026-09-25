@@ -30,7 +30,7 @@ def test_failed_call_refunds_pre_debit_and_audits(tmp_path):
             await c.root.llm.complete(
                 c.root, [{"role": "user", "content": "你好" * 50}], caller="t")
         assert c.root.state.get("budget_spent") == spent0, "失败调用应全额退还预借"
-        assert c.root.state.get("budget_pending_est", 0) == 0, "pending est 应清零"
+        assert not c.root.state.get("budget_pending_est"), "pending est 分槽应清空"
         rows = await c.root.db.query(
             c.root, "SELECT event FROM agent_events WHERE event='agent/llm/call-failed'")
         assert rows, "失败应落 durable 审计"
@@ -53,7 +53,7 @@ def test_successful_call_reconciles_to_actual(tmp_path):
         # 实际入账 = tokens_in(messages) + tokens_out(响应)；预借多出的部分已回冲
         actual = _tokens(messages) + _tokens({"text": "（fixture 默认响应）"})
         assert spent == actual, f"对账后 spent 应等于实际入账 {actual}，得到 {spent}"
-        assert c.root.state.get("budget_pending_est", 0) == 0
+        assert not c.root.state.get("budget_pending_est")
         rows = await c.root.db.query(
             c.root, "SELECT est_cost FROM agent_budget_log")
         assert rows and rows[-1]["est_cost"] is not None, "est_cost 应落值"

@@ -15,7 +15,7 @@ import json
 import logging
 import os
 
-from agent.api import Services, plugin
+from agent.api import Services, StateKeys, plugin
 from agent.sys.mcp_client import McpStdioClient
 
 logger = logging.getLogger("agent.plugins.windows_mcp")
@@ -65,10 +65,11 @@ class WindowsMcp:
         except Exception as exc:  # noqa: BLE001 —— 起不来诚实报，不拖垮装配
             logger.warning("windows_mcp 启动失败: %s", exc)
             ctx.provide(Services.WINDOWS_MCP, self)
-            ctx.state.setdefault("windows_mcp_error", str(exc))
+            ctx.state.setdefault(StateKeys.MCP_ERROR.format(bridge="windows_mcp"), str(exc))
             return
         self._client = client
-        ctx.state.setdefault("windows_mcp_tools", [t.get("name") for t in tools])
+        ctx.state.setdefault(StateKeys.MCP_TOOLS.format(bridge="windows_mcp"),
+                             [t.get("name") for t in tools])
         _TYPE = {"string": "str", "number": "float", "integer": "int",
                  "boolean": "bool", "array": "array", "object": "object"}
         for t in tools:
@@ -98,8 +99,8 @@ class WindowsMcp:
             self._client = None
 
     async def status(self, ctx) -> dict:
-        return {"tools": ctx.state.get("windows_mcp_tools", []),
-                "error": ctx.state.get("windows_mcp_error")}
+        return {"tools": ctx.state.get(StateKeys.MCP_TOOLS.format(bridge="windows_mcp"), []),
+                "error": ctx.state.get(StateKeys.MCP_ERROR.format(bridge="windows_mcp"))}
 
 
 __all__ = ["WindowsMcp"]

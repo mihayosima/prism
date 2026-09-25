@@ -26,8 +26,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from agent.api import CapabilityNotImplemented, Events
-from agent.sys.audit import _now_iso, durable
+from agent.api import CapabilityNotImplemented, Events, StateKeys, durable, now_iso
 
 logger = logging.getLogger("agent.react")
 
@@ -121,7 +120,7 @@ class ReactLoop:
         cfg = self._cfg
         await durable(ctx, Events.REACT_START, {
             "prompt": (prompt or "")[:500], "session_id": session_id,
-            "max_steps": cfg.max_steps, "at": _now_iso()})
+            "max_steps": cfg.max_steps, "at": now_iso()})
 
         tools = visible_tools(ctx)
         messages: list[dict] = [{"role": "system", "content": build_system(tools)}]
@@ -165,7 +164,7 @@ class ReactLoop:
             if not out.tool_calls:                       # ← 收敛：不再需要工具
                 await durable(ctx, Events.REACT_FINAL, {
                     "steps": steps, "tokens_in": tokens_in, "tokens_out": tokens_out,
-                    "at": _now_iso()})
+                    "at": now_iso()})
                 self._record(ctx, steps, tool_trace, exhausted=False)
                 return ReactResult(ok=True, text=out.text or "（未给出回答）", steps=steps,
                                    tokens_in=tokens_in, tokens_out=tokens_out,
@@ -186,7 +185,7 @@ class ReactLoop:
             await durable(ctx, Events.REACT_STEP, {
                 "step": steps, "tools": [r.name for r in results],
                 "is_error": any(r.is_error for r in results),
-                "tokens_in": tokens_in, "tokens_out": tokens_out, "at": _now_iso()})
+                "tokens_in": tokens_in, "tokens_out": tokens_out, "at": now_iso()})
             await ctx.events.emit(Events.REACT_STEP_END, {
                 "step": steps, "tools": [r.name for r in results],
                 "is_error": any(r.is_error for r in results)})
@@ -200,7 +199,7 @@ class ReactLoop:
         reason = reason or f"已达步数上限 max_steps={cfg.max_steps}"
         await durable(ctx, Events.REACT_EXHAUSTED, {
             "steps": steps, "reason": reason, "tokens_in": tokens_in,
-            "tokens_out": tokens_out, "at": _now_iso()})
+            "tokens_out": tokens_out, "at": now_iso()})
         if cfg.finalize_on_exceed and not hard:
             try:
                 text = await self._finalizer.finalize(ctx, messages, reason)
@@ -218,9 +217,9 @@ class ReactLoop:
     def _record(self, ctx, steps: int, tools: list[str], *, exhausted: bool,
                 reason: str | None = None) -> None:
         try:
-            ctx.state["react_last"] = {"steps": steps, "tools": list(tools[-10:]),
-                                       "exhausted": exhausted, "reason": reason,
-                                       "at": _now_iso()}
+            ctx.state[StateKeys.REACT_LAST] = {"steps": steps, "tools": list(tools[-10:]),
+                                               "exhausted": exhausted, "reason": reason,
+                                               "at": now_iso()}
         except Exception:                                # noqa: BLE001 —— 诊断不阻断主链路
             pass
 

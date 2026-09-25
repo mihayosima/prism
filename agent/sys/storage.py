@@ -9,8 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from agent.api import AgentError, Services, plugin
-from agent.sys.audit import _now_iso
+from agent.api import AgentError, Services, now_iso, plugin
 from agent.tables import MIGRATIONS
 
 logger = logging.getLogger("agent.storage")
@@ -123,7 +122,7 @@ class MigrationRegistry:
                     await self._db.execute(ctx, sql)
                 await self._db.execute(
                     ctx, "INSERT INTO agent_migrations(name, applied_at) VALUES (?,?)",
-                    (name, _now_iso()),
+                    (name, now_iso()),
                 )
             ran.append(name)
         return ran

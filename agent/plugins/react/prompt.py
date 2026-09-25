@@ -1,7 +1,8 @@
 """plugins.react · 提示词与上下文治理（系统提示 / 工具目录渲染 / 结果截断）。
 
-- 两个标记（离线 Fixture 据此路由，保证确定性）：
-  ``<!--react:turn-->`` 每轮推理 · ``<!--react:final-->`` 触顶收尾。
+- 两个标记（离线 Fixture 据此路由，保证确定性）：react:turn 每轮推理 ·
+  react:final 触顶收尾。常量值以 ``agent.api`` 的 ``MARK_REACT_TURN / MARK_REACT_FINAL``
+  为单一真相源（D4）。
 - 环境事实块：与 chat 的规划提示同源语义（机器权威 → 禁止 ``%VAR%`` 占位符）。
   在本包内自带一份实现，避免目录插件反向 import ``agent.sys.chat`` 的内部函数。
 """
@@ -11,8 +12,10 @@ from __future__ import annotations
 import json
 import os
 
-TURN_MARK = "<!--react:turn-->"
-FINAL_MARK = "<!--react:final-->"
+from agent.api import MARK_REACT_FINAL, MARK_REACT_TURN
+
+TURN_MARK = MARK_REACT_TURN
+FINAL_MARK = MARK_REACT_FINAL
 
 REACT_SYSTEM = (
     TURN_MARK + "\n"

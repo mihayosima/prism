@@ -22,10 +22,17 @@ import math
 import re
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
-from agent.api import CapabilityNotImplemented, Events, Services, plugin
-from agent.sys.audit import _now_iso, durable
+from agent.api import (
+    CapabilityNotImplemented,
+    Events,
+    MARK_MEMORY_EXTRACT,
+    Services,
+    durable,
+    now_iso,
+    plugin,
+)
 
 logger = logging.getLogger("plugins.memory")
 
@@ -41,7 +48,7 @@ EXTRACT_SCHEMA = {
 }
 
 EXTRACT_SYSTEM = (
-    "<!--memory:extract-->\n"
+    MARK_MEMORY_EXTRACT + "\n"
     "你是记忆提取器。从给定的对话/运行载荷中提取新信息，只输出 JSON：\n"
     '{"facts": ["短句持久事实"], "intentions": [{"text": "用户/任务意图"}],'
     ' "entities": [{"name": "...", "kind": "person|org|topic"}],'
@@ -114,6 +121,30 @@ def _from_row(r: dict) -> MemoryItem:
 # ---------------------------------------------------------------------------
 
 
+class MemoryStoreLike(Protocol):
+    """持久化组件契约（D2 固化；Driver 消费面：upsert/touch/valid/delete）。"""
+
+    async def upsert(self, ctx, m: "MemoryItem") -> None: ...
+
+    async def touch(self, ctx, m: "MemoryItem") -> None: ...
+
+    async def valid(self, ctx) -> list["MemoryItem"]: ...
+
+    async def delete(self, ctx, mid: str) -> None: ...
+
+
+class MemoryExtractorLike(Protocol):
+    """提取组件契约：payload → {facts, intentions, entities, relations}（结构走 schema）。"""
+
+    async def extract(self, ctx, payload: dict) -> dict: ...
+
+
+class MemorySearchLike(Protocol):
+    """召回打分契约（纯函数）：query × item × now → 分数（越大越相关）。"""
+
+    def score(self, query: str, m: "MemoryItem", now: str) -> float: ...
+
+
 class MemoryStore:
     """持久化（agent_* 表）。"""
 
@@ -140,10 +171,10 @@ class MemoryStore:
         await self._db.execute(
             ctx,
             "UPDATE agent_memories SET last_accessed_at=?, accessed_count=accessed_count+1 WHERE id=?",
-            (_now_iso(), m.id))
+            (now_iso(), m.id))
 
     async def valid(self, ctx) -> list[MemoryItem]:
-        now = _now_iso()
+        now = now_iso()
         rows = await self._db.query(
             ctx, "SELECT * FROM agent_memories WHERE invalid_at IS NULL OR invalid_at > ?", (now,))
         return [_from_row(r) for r in rows]
@@ -157,7 +188,7 @@ class MemoryStore:
 
 
 class MemoryExtractor:
-    """LLM 提取（走 ctx.llm；离线 Fixture 路由 `<!--memory:extract-->`）。"""
+    """LLM 提取（走 ctx.llm；离线 Fixture 按 MARK_MEMORY_EXTRACT 标记路由）。"""
 
     async def extract(self, ctx, payload: dict) -> dict:
         text = json.dumps(payload, ensure_ascii=False)
@@ -218,18 +249,18 @@ class MemoryDriver:
             out = await self._extractor.extract(ctx, payload)
         except CapabilityNotImplemented as exc:
             await durable(ctx, Events.MEMORY_REMEMBERED, {
-                "ok": False, "reason": str(exc), "at": _now_iso()})
+                "ok": False, "reason": str(exc), "at": now_iso()})
             return {"ok": False, "reason": str(exc)}
         added = []
         for kind, texts in (("fact", out["facts"]), ("intention", out["intentions"])):
             for t in texts:
                 await self._store.upsert(ctx, MemoryItem(
                     id=_mem_id(t), kind=kind, content=t, entity_ids=[],
-                    score_observed=1.0, created_at=_now_iso(), last_accessed_at=_now_iso(),
+                    score_observed=1.0, created_at=now_iso(), last_accessed_at=now_iso(),
                     accessed_count=1))
                 added.append({"kind": kind, "content": t})
         await durable(ctx, Events.MEMORY_REMEMBERED, {
-            "ok": True, "added": len(added), "at": _now_iso()})
+            "ok": True, "added": len(added), "at": now_iso()})
         return {"ok": True, "added": added}
 
     async def add(self, ctx, *, kind: str, content: str, entity_ids: list[str] | None = None,
@@ -238,7 +269,7 @@ class MemoryDriver:
         """手动/决策直写（不经过 LLM），合并去重。"""
         if kind not in KINDS:
             raise ValueError(f"kind 须 ∈ {KINDS}")
-        now = _now_iso()
+        now = now_iso()
         m = MemoryItem(id=_mem_id(content), kind=kind, content=content,
                    entity_ids=entity_ids or [], score_observed=score_observed,
                    created_at=now, last_accessed_at=now, accessed_count=1,
@@ -249,7 +280,7 @@ class MemoryDriver:
     # ---- 召回 ----
 
     async def recall(self, ctx, query: str, limit: int = 8) -> list[dict]:
-        now = _now_iso()
+        now = now_iso()
         mems = await self._store.valid(ctx)
         scored = sorted(
             ((self._search.score(query, m, now), m) for m in mems),
@@ -272,7 +303,7 @@ class MemoryDriver:
         lines = ["[相关记忆]"]
         used = 0
         for r in rec:
-            seg = f"- ({r['kind']}) {r['content']}  (score {r['score']:.2f} · {_days_between(r['created_at'], _now_iso()):.0f}d前)"
+            seg = f"- ({r['kind']}) {r['content']}  (score {r['score']:.2f} · {_days_between(r['created_at'], now_iso()):.0f}d前)"
             if used + len(seg) > max_chars:
                 break
             lines.append(seg)
@@ -289,7 +320,7 @@ class MemoryDriver:
 
     async def prune(self, ctx, *, older_than_days: float = 30.0, min_score: float = 0.25) -> int:
         """淡化清理：足够旧且低分（以空查询打分）的记忆删除；无效记忆先清。"""
-        now = _now_iso()
+        now = now_iso()
         removed = 0
         for m in await self._store.valid(ctx):
             age = _days_between(m.created_at, now)
@@ -327,14 +358,17 @@ class Memory:
 
     async def apply(self, ctx) -> None:
         cfg = ((ctx.config or {}).get("agent") or {}).get("memory") or {}
+        # 三组件 = 可选注入的接缝服务（与 react 四组件同构，D2 开缝）：
+        # ctx.get("memory.store" | "memory.extractor" | "memory.search") 存在即用注入实现。
         driver = MemoryDriver(
-            MemoryStore(ctx.db),
-            MemoryExtractor(),
-            MemorySearch(half_life_days=float(cfg.get("half_life_days", 14.0)),
-                         access_hl_days=float(cfg.get("access_hl_days", 7.0))),
+            ctx.get("memory.store") or MemoryStore(ctx.db),
+            ctx.get("memory.extractor") or MemoryExtractor(),
+            ctx.get("memory.search")
+            or MemorySearch(half_life_days=float(cfg.get("half_life_days", 14.0)),
+                            access_hl_days=float(cfg.get("access_hl_days", 7.0))),
         )
         ctx.provide(Services.MEMORY, driver)
 
 
 __all__ = ["Memory", "MemoryItem", "MemoryDriver", "MemoryExtractor", "MemorySearch",
-           "MemoryStore"]
+           "MemoryStore", "MemoryStoreLike", "MemoryExtractorLike", "MemorySearchLike"]

@@ -20,9 +20,9 @@ from agent.api import (
     Events,
     Services,
     current_plugin,
+    now_iso,
     plugin,
 )
-from agent.sys.audit import _now_iso
 
 logger = logging.getLogger("agent.tasks")
 
@@ -190,7 +190,7 @@ class TasksPlugin:
         ctx.provide(Services.TASKS, registry)
 
         async def _ping(action: str = "ping") -> dict:
-            return {"ok": True, "action": action, "now": _now_iso(), "service": "agent.tasks"}
+            return {"ok": True, "action": action, "now": now_iso(), "service": "agent.tasks"}
 
         registry.register(ctx, "agent.ping",
                           schema={"action": {"type": "str", "required": False, "default": "ping"}},

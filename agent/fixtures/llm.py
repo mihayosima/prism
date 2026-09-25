@@ -2,15 +2,23 @@
 
 按 system prompt 里的标记路由到 canned 结构化响应，
 保证：同一输入 → 同一输出（离线确定性）。
-标记：<!--chat:plan--> · <!--chat:answer--> · <!--memory:extract--> ·
-      <!--react:turn-->（脚本化 tool_calls）· <!--react:final-->（触顶收尾）。
+标记：chat:plan · chat:answer · memory:extract ·
+      react:turn（脚本化 tool_calls）· react:final（触顶收尾）。
+常量单一真相源在 agent.api（MARK_*，D4）。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from agent.api import Events
+from agent.api import (
+    MARK_CHAT_ANSWER,
+    MARK_CHAT_PLAN,
+    MARK_MEMORY_EXTRACT,
+    MARK_REACT_FINAL,
+    MARK_REACT_TURN,
+    Events,
+)
 
 
 def _plan(user_text: str) -> dict:
@@ -39,15 +47,15 @@ def _route(messages: list[dict]) -> tuple[str, str]:
             sys_text += content
         else:
             user_text += content
-    if "<!--react:final-->" in sys_text:
+    if MARK_REACT_FINAL in sys_text:
         return "react_final", user_text
-    if "<!--react:turn-->" in sys_text:
+    if MARK_REACT_TURN in sys_text:
         return "react", user_text
-    if "<!--chat:plan-->" in sys_text:
+    if MARK_CHAT_PLAN in sys_text:
         return "plan", user_text
-    if "<!--chat:answer-->" in sys_text:
+    if MARK_CHAT_ANSWER in sys_text:
         return "answer", user_text
-    if "<!--memory:extract-->" in sys_text:
+    if MARK_MEMORY_EXTRACT in sys_text:
         return "extract", user_text
     return "default", ""
 

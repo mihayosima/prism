@@ -9,8 +9,7 @@
 
 from __future__ import annotations
 
-from agent.api import Events, Services, plugin
-from agent.sys.audit import _now_iso, durable
+from agent.api import Events, Services, durable, now_iso, plugin
 
 
 def _matrix(ctx) -> dict:
@@ -63,7 +62,7 @@ class Guard:
             decision = _decide(ctx, "llm", caller=caller)
             await durable(ctx, Events.PERMISSION_DECISION, {
                 "who": caller, "level": "llm", "target": "agent.llm.complete",
-                "decision": decision, "at": _now_iso(),
+                "decision": decision, "at": now_iso(),
             })
             if decision == "allow":
                 return await next()
@@ -76,7 +75,7 @@ class Guard:
             decision = _decide(ctx, "task", target=task, caller=caller, risk=risk)
             await durable(ctx, Events.PERMISSION_DECISION, {
                 "who": caller, "level": "task", "target": task, "risk": risk,
-                "decision": decision, "at": _now_iso(),
+                "decision": decision, "at": now_iso(),
             })
             if decision == "allow":
                 return await next()

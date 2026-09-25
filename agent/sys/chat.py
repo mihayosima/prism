@@ -20,8 +20,18 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from agent.api import AgentError, CapabilityNotImplemented, Events, Services, plugin
-from agent.sys.audit import _now_iso, durable
+from agent.api import (
+    AgentError,
+    CapabilityNotImplemented,
+    Events,
+    MARK_CHAT_ANSWER,
+    MARK_CHAT_PLAN,
+    ReactResultLike,
+    Services,
+    durable,
+    now_iso,
+    plugin,
+)
 
 PLAN_SYSTEM = (
     "你是通用 Agent 的任务规划器。根据用户输入只输出一个 JSON（不要解释，不要 markdown 围栏）：\n"
@@ -87,7 +97,7 @@ class ChatDriver:
                              evidence={}, tokens_in=0, tokens_out=0, ok=True,
                              session_id=session_id)
         await durable(ctx, Events.CHAT_IN,
-                      {"message": message, "session_id": session_id, "at": _now_iso()})
+                      {"message": message, "session_id": session_id, "at": now_iso()})
         await self._append(ctx, session_id, "user", message)
         history = await self._history(ctx, session_id, limit=HISTORY_LIMIT)
         prior = history[:-1]              # 除本条外的最近历史 → 作为会话上下文喂给模型
@@ -104,7 +114,7 @@ class ChatDriver:
             try:
                 await durable(ctx, Events.CHAT_DONE,
                               {"intent": "chat", "ok": False, "error": "已取消",
-                               "cancelled": True, "session_id": session_id, "at": _now_iso()})
+                               "cancelled": True, "session_id": session_id, "at": now_iso()})
             except Exception:      # noqa: BLE001 —— 审计写失败不阻断取消
                 pass
             raise
@@ -123,7 +133,7 @@ class ChatDriver:
                 logging.getLogger("agent.chat").warning("memory remember failed: %s", exc)
         await durable(ctx, Events.CHAT_DONE, {
             "intent": plan.get("intent"),
-            "ok": ok, "error": reply_error, "session_id": session_id, "at": _now_iso(),
+            "ok": ok, "error": reply_error, "session_id": session_id, "at": now_iso(),
         })
         return ChatReply(text=text, plan=plan, evidence=evidence,
                          tokens_in=ti, tokens_out=to, ok=ok, error=reply_error,
@@ -139,16 +149,17 @@ class ChatDriver:
         ``agent/chat/done``、喂 ``ctx.memory``（若启用）、返回 ``ChatReply``。
         """
         try:
-            res = await ctx.react.run(ctx, message, session_id=session_id, prior=prior)
+            res: ReactResultLike = await ctx.react.run(ctx, message, session_id=session_id,
+                                                       prior=prior)
         except asyncio.CancelledError:
             # 取消既非成功也非失败：如实落审计后**原样抛出**（不吞，保持取消语义）
             try:
                 await durable(ctx, Events.REACT_EXHAUSTED,
                               {"reason": "已取消", "cancelled": True,
-                               "session_id": session_id, "at": _now_iso()})
+                               "session_id": session_id, "at": now_iso()})
                 await durable(ctx, Events.CHAT_DONE,
                               {"intent": "react", "ok": False, "error": "已取消",
-                               "cancelled": True, "session_id": session_id, "at": _now_iso()})
+                               "cancelled": True, "session_id": session_id, "at": now_iso()})
             except Exception:      # noqa: BLE001 —— 审计写失败不阻断取消
                 pass
             raise
@@ -165,7 +176,7 @@ class ChatDriver:
         await durable(ctx, Events.CHAT_DONE, {
             "intent": "react", "ok": res.ok,
             "error": None if res.ok else res.reason,
-            "session_id": session_id, "at": _now_iso(),
+            "session_id": session_id, "at": now_iso(),
         })
         return ChatReply(text=text, plan={"intent": "react"}, evidence=res.as_evidence(),
                          tokens_in=res.tokens_in, tokens_out=res.tokens_out, ok=res.ok,
@@ -178,7 +189,7 @@ class ChatDriver:
             return
         await ctx.db.execute(
             ctx, "INSERT INTO agent_messages(session_id, role, content, at) VALUES (?,?,?,?)",
-            (session_id, role, content, _now_iso()))
+            (session_id, role, content, now_iso()))
 
     async def _history(self, ctx, session_id: str, limit: int = HISTORY_LIMIT) -> list[dict]:
         if ctx.get(Services.DB) is None:
@@ -217,7 +228,7 @@ class ChatDriver:
     # ---------- ① 规划 ----------
 
     async def _plan(self, ctx, message: str, prior: list[dict]) -> dict:
-        system = f"<!--chat:plan-->\n{PLAN_SYSTEM}"
+        system = f"{MARK_CHAT_PLAN}\n{PLAN_SYSTEM}"
         mem = await self._memory_block(ctx, message)
         if mem:
             system += "\n\n" + mem
@@ -291,7 +302,7 @@ class ChatDriver:
     async def _narrate(self, ctx, plan: dict, evidence: dict, message: str, prior: list[dict]):
         snippet = json.dumps({"plan": plan, "evidence": evidence},
                              ensure_ascii=False)
-        system = f"<!--chat:answer-->\n{ANSWER_SYSTEM}\n\n证据 JSON:\n{snippet}"
+        system = f"{MARK_CHAT_ANSWER}\n{ANSWER_SYSTEM}\n\n证据 JSON:\n{snippet}"
         mem = await self._memory_block(ctx, message)
         if mem:
             system += "\n\n" + mem

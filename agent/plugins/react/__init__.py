@@ -26,7 +26,7 @@
 
 from __future__ import annotations
 
-from agent.api import Services, plugin
+from agent.api import Services, StateKeys, plugin
 
 from .components import (Actor, DefaultActor, DefaultFinalizer, DefaultObserver,
                          DefaultReasoner, Finalizer, Observer, Reasoner, ReasonOutput,
@@ -75,7 +75,7 @@ class React:
     async def status(self, ctx) -> dict:
         """插件页状态摘要（未跑过则如实报 ``runs: 0``，不给笼统假状态）。"""
         cfg = ((ctx.config or {}).get("agent") or {}).get("react") or {}
-        last = ctx.state.get("react_last") or {"runs": 0}
+        last = ctx.state.get(StateKeys.REACT_LAST) or {"runs": 0}
         return {"max_steps": int(cfg.get("max_steps", 8)),
-                "permission_mode": ctx.state.get("permission_mode", "default"),
+                "permission_mode": ctx.state.get(StateKeys.PERMISSION_MODE, "default"),
                 **last}

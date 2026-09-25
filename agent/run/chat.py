@@ -17,7 +17,7 @@ import json
 import sys
 import uuid
 
-from agent.api import Services
+from agent.api import Services, StateKeys
 from agent.profiles import build_agent
 from agent.sys.progress import tap_progress
 
@@ -566,7 +566,7 @@ async def _serve(args: argparse.Namespace) -> int:
                 "model": getattr(svc, "_model", "?"),
                 "version": __import__("agent").__version__,
                 "session_id": session_id,
-                "budget": {"spent": c.root.state.get("budget_spent", 0),
+                "budget": {"spent": c.root.state.get(StateKeys.BUDGET_SPENT, 0),
                            "max": budget_cfg.get("max_tokens_per_run", 0)}}
 
     @app.get("/api/events")
