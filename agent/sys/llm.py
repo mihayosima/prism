@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
@@ -99,7 +100,13 @@ class LlmService:
             await durable(ctx, Events.LLM_CALL_FAILED, dict(payload))
             await ctx.events.emit(Events.LLM_CALL_FAILED, dict(payload))
             raise
-        tokens_in, tokens_out = _tokens(messages), _tokens(data)
+        # S6：优先用 provider 返回的真实 usage 入账（诚实口径）；无则回退估算。
+        usage = data.pop("usage", None) if isinstance(data, dict) else None
+        if usage and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
+            tokens_in = int(usage.get("prompt_tokens") or 0) or _tokens(messages)
+            tokens_out = int(usage.get("completion_tokens") or 0) or _tokens(data)
+        else:
+            tokens_in, tokens_out = _tokens(messages), _tokens(data)
         await ctx.events.emit(Events.LLM_POST_CALL, {
             "provider": self._model, "tokens_in": tokens_in, "tokens_out": tokens_out,
             "caller": caller,
@@ -224,21 +231,37 @@ class DeepSeekLlm:
 
     key 解析：config.agent.llm.api_key → env DEEPSEEK_API_KEY → 工程根 local_secrets.json。
     ``tools`` 走 native function-calling（wire 转换见 ``_wire_messages`` / ``_wire_tools``）。
+    S6：``AsyncClient`` 懒初始化并跨调用复用（连接池），``close()`` 释放；
+    优先采集响应 ``usage`` 真实 token 数（非流式直读、流式经 ``stream_options.include_usage``），
+    经返回值 ``usage`` 键上交 LlmService 入账。
+    ``transport`` 仅供测试注入 httpx.MockTransport。
     """
 
     interface_version = (1, 0)
     label = "deepseek"
     BASE_URL = "https://api.deepseek.com/chat/completions"
 
-    def __init__(self, model: str, api_key: str):
+    def __init__(self, model: str, api_key: str, transport: Any = None):
         self._model = model
         self._key = api_key
+        self._transport = transport
+        self._client: Any = None
+
+    def _get_client(self) -> Any:
+        import httpx
+
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=90.0, transport=self._transport)
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
 
     async def complete(self, ctx: Any, messages: list[dict],
                        schema: dict | None = None,
                        tools: list[dict] | None = None) -> dict:
-        import httpx
-
         cfg = (((ctx.config or {}).get("agent") or {}).get("llm") or {})
         stream_on = bool(cfg.get("stream", True))      # D5 默认 true
 
@@ -257,82 +280,96 @@ class DeepSeekLlm:
         headers = {"Authorization": f"Bearer {self._key}",
                    "Content-Type": "application/json"}
 
+        client = self._get_client()                    # S6：跨调用复用连接池
+
         if not stream_on:
             # —— 非流式（行为同今天）——
-            async with httpx.AsyncClient(timeout=90.0) as client:
-                resp = await client.post(self.BASE_URL, json=payload, headers=headers)
+            resp = await client.post(self.BASE_URL, json=payload, headers=headers)
             if resp.status_code != 200:
                 raise AgentError(f"deepseek api 异常 {resp.status_code}: {resp.text[:200]}")
-            message = resp.json()["choices"][0]["message"]
+            body = resp.json()
+            message = body["choices"][0]["message"]
+            usage = body.get("usage")                  # S6：真实 token 数（若有）
             content = message.get("content") or ""
             raw_calls = message.get("tool_calls") or []
             if raw_calls:                                  # 工具调用优先（可能 content 为空）
                 return {"text": content,
-                        "tool_calls": [_wire_call(c, name_map) for c in raw_calls]}
+                        "tool_calls": [_wire_call(c, name_map) for c in raw_calls],
+                        **({"usage": usage} if usage else {})}
             if schema is None:
-                return {"text": content}
-            return _parse_json(content)
+                return {"text": content, **({"usage": usage} if usage else {})}
+            parsed = _parse_json(content)
+            if usage:
+                parsed["usage"] = usage
+            return parsed
 
         # —— 流式（B5.2 打字机）——
         payload["stream"] = True                           # 关键：告知 DeepSeek 返回 SSE 而非单条 JSON
+        payload["stream_options"] = {"include_usage": True}  # S6：末帧附带真实 usage
         content_acc = ""
         reasoning_acc = ""                                # D4 思考链（reasoning_content 每片累积）
         tool_acc: dict[int, dict] = {}                     # index -> 归并槽（D3 完整重组）
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            async with client.stream("POST", self.BASE_URL, json=payload, headers=headers) as resp:
-                if resp.status_code != 200:
-                    await resp.aread()                      # 流式下不能 resp.json()
-                    raise AgentError(f"deepseek api 异常 {resp.status_code}: {resp.text[:200]}")
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    if not data:
-                        continue
-                    try:
-                        obj = json.loads(data)
-                    except (TypeError, ValueError):
-                        continue                            # 跳过非 JSON 行（注释/心跳）
-                    choice = (obj.get("choices") or [{}])[0]
-                    delta = choice.get("delta") or {}
-                    # 文本片段：schema 为 None（用户可见散文）才发帧；
-                    # D4 照单全流——带 tool_calls 轮的 content（思考文本）也照发
-                    piece = delta.get("content") or ""
-                    if piece and schema is None:
-                        content_acc += piece
-                        await ctx.events.emit(Events.LLM_TOKEN, {"text": piece})
-                    # D4 思考链（reasoning_content）照单全流：模型把推理过程放在该字段，
-                    # 不并入最终 text（text 仅来自 content），避免思考混入答案。
-                    rpiece = delta.get("reasoning_content") or ""
-                    if rpiece and schema is None:
-                        reasoning_acc += rpiece
-                        await ctx.events.emit(Events.LLM_THINKING, {"text": rpiece})
-                    # 工具调用 delta 归并（按 index）
-                    for tc in (delta.get("tool_calls") or []):
-                        idx = tc.get("index", 0)
-                        slot = tool_acc.setdefault(idx, {
-                            "id": "", "type": "function",
-                            "function": {"name": "", "arguments": ""}})
-                        if tc.get("id"):
-                            slot["id"] = tc["id"]
-                        if tc.get("type"):
-                            slot["type"] = tc["type"]
-                        fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            slot["function"]["name"] += fn["name"]
-                        if fn.get("arguments"):
-                            slot["function"]["arguments"] += fn["arguments"]
-                    if choice.get("finish_reason"):
-                        break
+        usage: dict | None = None
+        async with client.stream("POST", self.BASE_URL, json=payload, headers=headers) as resp:
+            if resp.status_code != 200:
+                await resp.aread()                      # 流式下不能 resp.json()
+                raise AgentError(f"deepseek api 异常 {resp.status_code}: {resp.text[:200]}")
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                if not data:
+                    continue
+                try:
+                    obj = json.loads(data)
+                except (TypeError, ValueError):
+                    continue                            # 跳过非 JSON 行（注释/心跳）
+                usage = obj.get("usage") or usage       # S6：usage 帧不含 choices，照单收下
+                choice = (obj.get("choices") or [{}])[0]
+                delta = choice.get("delta") or {}
+                # 文本片段：schema 为 None（用户可见散文）才发帧；
+                # D4 照单全流——带 tool_calls 轮的 content（思考文本）也照发
+                piece = delta.get("content") or ""
+                if piece and schema is None:
+                    content_acc += piece
+                    await ctx.events.emit(Events.LLM_TOKEN, {"text": piece})
+                # D4 思考链（reasoning_content）照单全流：模型把推理过程放在该字段，
+                # 不并入最终 text（text 仅来自 content），避免思考混入答案。
+                rpiece = delta.get("reasoning_content") or ""
+                if rpiece and schema is None:
+                    reasoning_acc += rpiece
+                    await ctx.events.emit(Events.LLM_THINKING, {"text": rpiece})
+                # 工具调用 delta 归并（按 index）
+                for tc in (delta.get("tool_calls") or []):
+                    idx = tc.get("index", 0)
+                    slot = tool_acc.setdefault(idx, {
+                        "id": "", "type": "function",
+                        "function": {"name": "", "arguments": ""}})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    if tc.get("type"):
+                        slot["type"] = tc["type"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["function"]["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
+                if choice.get("finish_reason"):
+                    break
         raw_calls = [slot for _idx, slot in sorted(tool_acc.items())]
+        usage_kv = {"usage": usage} if usage else {}
         if raw_calls:                                      # 工具调用优先（可能 content 为空）
             return {"text": content_acc,
-                    "tool_calls": [_wire_call(c, name_map) for c in raw_calls]}
+                    "tool_calls": [_wire_call(c, name_map) for c in raw_calls],
+                    **usage_kv}
         if schema is None:
-            return {"text": content_acc}
-        return _parse_json(content_acc)
+            return {"text": content_acc, **usage_kv}
+        parsed = _parse_json(content_acc)
+        if usage:
+            parsed["usage"] = usage
+        return parsed
 
 
 def _resolve_key(ctx) -> str | None:
@@ -385,6 +422,9 @@ class LlmPlugin:
         else:
             provider = PlaceholderLlm(name_)
             model = model or name_
+        close = getattr(provider, "close", None)
+        if close is not None:                          # S6：provider 持有连接池 → teardown 释放
+            ctx.effect(lambda: close())
         ctx.provide(Services.LLM, LlmService(provider, model))
 
 
