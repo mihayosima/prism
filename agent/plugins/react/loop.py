@@ -21,12 +21,15 @@ token 预算           **不用写**：每步都走 ``ctx.llm``，           被
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 
 from agent.api import CapabilityNotImplemented, Events
 from agent.sys.audit import _now_iso, durable
+
+logger = logging.getLogger("agent.react")
 
 from .components import Actor, Finalizer, Observer, Reasoner
 from .prompt import build_system
@@ -150,6 +153,7 @@ class ReactLoop:
                 reason = f"模型调用被拒：{exc}"
                 break
             except Exception as exc:                     # noqa: BLE001 —— 推理失败：诚实失败
+                logger.exception("react 推理失败（step=%s，完整堆栈如下）", steps)
                 reason = f"推理失败：{type(exc).__name__}: {exc}"
                 hard = True
                 break

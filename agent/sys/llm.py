@@ -329,12 +329,13 @@ class DeepSeekLlm:
                 usage = obj.get("usage") or usage       # S6：usage 帧不含 choices，照单收下
                 choice = (obj.get("choices") or [{}])[0]
                 delta = choice.get("delta") or {}
-                # 文本片段：schema 为 None（用户可见散文）才发帧；
-                # D4 照单全流——带 tool_calls 轮的 content（思考文本）也照发
+                # 文本片段：**累积永远执行**（schema 调用也要拿到完整 content 解析 JSON）；
+                # 仅 token 帧受 schema 门控——schema 调用的中间散文不外发（D5 设计）。
                 piece = delta.get("content") or ""
-                if piece and schema is None:
+                if piece:
                     content_acc += piece
-                    await ctx.events.emit(Events.LLM_TOKEN, {"text": piece})
+                    if schema is None:
+                        await ctx.events.emit(Events.LLM_TOKEN, {"text": piece})
                 # D4 思考链（reasoning_content）照单全流：模型把推理过程放在该字段，
                 # 不并入最终 text（text 仅来自 content），避免思考混入答案。
                 rpiece = delta.get("reasoning_content") or ""
