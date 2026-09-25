@@ -17,7 +17,15 @@ def _matrix(ctx) -> dict:
     return ((ctx.config or {}).get("agent") or {}).get("permissions") or {"default": "open"}
 
 
-def _decide(ctx, kind: str, *, target: str | None = None, caller: str = "unknown") -> str:
+def _decide(ctx, kind: str, *, target: str | None = None, caller: str = "unknown",
+            risk: str = "") -> str:
+    """裁决：allow / deny / ask。
+
+    task 裁决顺序（S5）：deny 名单 → 显式 risk 策略（deny/ask/allow 优先）→
+    default open 放行 → 收窄模式走 allow 名单。``risk`` 取值：
+    "allow"（该风险级恒放行）/"deny"（恒拒）/"ask"（留给 approval 插件，
+    MVP 按拒绝处理）/"open"（或未配置 → 走原有名单逻辑，默认行为零回归）。
+    """
     m = _matrix(ctx)
     default = m.get("default", "open")
     if kind == "llm":
@@ -26,6 +34,13 @@ def _decide(ctx, kind: str, *, target: str | None = None, caller: str = "unknown
         deny = m.get("task_deny") or []
         if target in deny:
             return "deny"
+        risk_policy = (m.get("risk") or {}).get(risk)
+        if risk_policy == "deny":
+            return "deny"
+        if risk_policy == "ask":
+            return "ask"
+        if risk_policy == "allow":
+            return "allow"
         if default == "open":
             return "allow"
         allow = m.get("task_allow") or []
@@ -57,13 +72,18 @@ class Guard:
         async def _pre_task(payload: dict, next) -> dict:
             task = payload.get("task", "")
             caller = payload.get("caller", "unknown")
-            decision = _decide(ctx, "task", target=task, caller=caller)
+            risk = payload.get("risk", "")
+            decision = _decide(ctx, "task", target=task, caller=caller, risk=risk)
             await durable(ctx, Events.PERMISSION_DECISION, {
-                "who": caller, "level": "task", "target": task,
+                "who": caller, "level": "task", "target": task, "risk": risk,
                 "decision": decision, "at": _now_iso(),
             })
             if decision == "allow":
                 return await next()
+            if decision == "ask":
+                return {"denied": True,
+                        "reason": f"guard: 任务 {task!r} 风险级 {risk!r} 需人确认（ask）；"
+                                  f"approval 插件未接入前按拒绝处理"}
             return {"denied": True, "reason": f"guard: 任务 {task!r} 未授权（caller={caller!r}）"}
 
         ctx.on(Events.LLM_PRE_CALL, _pre_llm, prepend=True)

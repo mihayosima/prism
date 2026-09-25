@@ -126,7 +126,9 @@ class TaskRegistry:
             raise AgentError(f"任务不存在: {name!r}")
         caller = caller or current_plugin() or "unknown"
         decision = await ctx.events.waterfall(
-            Events.TASKS_PRE_EXECUTE, {"task": name, "kwargs": kwargs, "caller": caller}
+            Events.TASKS_PRE_EXECUTE,
+            {"task": name, "kwargs": kwargs, "caller": caller,
+             "risk": cmd.risk},   # S5：风险元数据随行，供 guard 消费
         )
         if isinstance(decision, dict) and decision.get("denied"):
             raise CapabilityNotImplemented(

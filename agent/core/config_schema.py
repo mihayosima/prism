@@ -24,7 +24,8 @@ _SCHEMA: dict[str, Any] = {
     "agent": {
         "llm": {"provider": str, "model": str, "stream": bool},
         "budget": {"max_tokens_per_run": int, "reset_on_new_session": bool},
-        "permissions": {"default": str, "task_allow": list, "task_deny": list, "llm": str},
+        "permissions": {"default": str, "task_allow": list, "task_deny": list, "llm": str,
+                        "risk": dict},   # S5：按风险级裁决 {"read":"allow","danger":"deny",...}
         "loop": {"deadline_s": (int, float)},
         # 插件自管节
         "memory": "_any",
