@@ -137,6 +137,8 @@ class ChatDriver:
         # 多步 ReAct（plugins.react，目录插件）：装配了则**委托**；缺省回退下方单步路径。
         # 契约不变：chat 只经 ctx.has("react") 感知其存在，不 import 其实现。
         if ctx.has(Services.REACT):
+            # 预算闸（S3）：prior 超输入预算 → 先压缩一次并重建（见 _ensure_react_headroom）
+            prior = await self._ensure_react_headroom(ctx, session_id, message, prior)
             return await self._send_via_react(ctx, message, session_id, prior)
         try:
             plan = await self._plan(ctx, message, prior)
@@ -258,6 +260,8 @@ class ChatDriver:
         - **统一互斥（左开右闭）**：summary 覆盖 ``(0, covers]``、history 覆盖 ``(covers, N]``，
           边界由 ``covers_up_to_seq`` 单一来源派生；两块 ``coverage`` 作**入参**传给治理器
           （governor 不反向查询），重叠由治理器统一剔除，绝不双份注入；
+        - **循环保底（S3）**：``plugins.react`` 已装配时，经 ``reserve_tokens`` 预留
+          ``react_min_chain_tokens``——防 prior 吃满预算致循环内无空间（循环空转）；
         - 单条超大工具/文件结果仍由 ``short_term.truncate_view`` 做可逆截短（安全网，非收窗）。
 
         降级：短期记忆缺失 → 退回旧 ``HISTORY_LIMIT`` 条数硬裁（不劣化、不裸崩）；
@@ -288,10 +292,59 @@ class ChatDriver:
                     "payload": [dict(m) for m in post_view],
                     "weight": 0.60, "coverage": (covers, hi),
                 })
-            return (await self._assemble(ctx, blocks, stage="prior")).prior
+            return (await self._assemble(ctx, blocks, stage="prior",
+                                         reserve_tokens=self._react_reserve(ctx))).prior
         # 降级：旧 HISTORY_LIMIT 条数硬裁（除本轮 user 外）
         history = await self._history(ctx, session_id, limit=HISTORY_LIMIT)
         return history[:-1]
+
+    def _react_reserve(self, ctx) -> int:
+        """会话级装配时为多步循环预留的 chain 保底额度（S3）。
+
+        仅当 ``plugins.react`` 已装配时预留——否则无循环可保底。
+        治理器缺失/无该接缝 → 0（不劣化）。
+        """
+        if not ctx.has(Services.REACT):
+            return 0
+        gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
+        mn = getattr(gov, "react_min_chain_tokens", None)
+        if not callable(mn):
+            return 0
+        try:
+            return max(0, int(mn()))
+        except Exception:      # noqa: BLE001 —— 预算查询异常不阻断对话
+            return 0
+
+    async def _ensure_react_headroom(self, ctx, session_id: str, message: str,
+                                     prior: list[dict]) -> list[dict]:
+        """多步循环前的**预算闸**：prior 超输入预算 → 一次性压缩 + 重建 prior（不重试）。
+
+        职责归属（S3 钉死）：
+        - **决策**在调度层（本方法）——不由 react 发起，也不由治理器发起；
+        - **裁决**仍在内容层 ``plugins.short_term``——只调用既有 ``maybe_compress``，
+          **不自定阈值**（压缩时机由 ``compact_trigger_tokens`` 单独决定）；
+        - 压缩后仍超 → **不拒绝进入**（否则多步能力整体失效），交治理器刚性降级规则
+          诚实标注兜底；只尝试一次，防抖、防死循环。
+        - 无治理器 → 跳过该闸（退回现状，不劣化）。
+        """
+        gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
+        budget = getattr(gov, "input_budget", None)
+        if not callable(budget):
+            return prior
+        try:
+            if estimate_tokens(prior) <= int(budget()):
+                return prior
+        except Exception:      # noqa: BLE001 —— 预算查询异常不阻断对话
+            return prior
+        logging.getLogger("agent.chat").info(
+            "prior 超输入预算，触发一次会话级压缩并重建（session=%s）", session_id)
+        await self._safe_compress(ctx, session_id)
+        try:
+            rebuilt = await self._build_prior(ctx, session_id, message)
+        except Exception as exc:      # noqa: BLE001 —— 重建失败退回原 prior，不裸崩
+            logging.getLogger("agent.chat").warning("prior rebuild failed: %s", exc)
+            return prior
+        return rebuilt or prior
 
     async def _safe_compress(self, ctx, session_id: str) -> None:
         """异步触发压缩（双保险：maybe_compress 内部已吞执行异常并按退避处理）。"""
@@ -311,21 +364,30 @@ class ChatDriver:
             await ctx.events.emit(Events.CHAT_RESET, {"session_id": session_id})
         return n
 
-    async def _assemble(self, ctx, blocks: list[dict], *, stage: str) -> _Assembled:
+    async def _assemble(self, ctx, blocks: list[dict], *, stage: str,
+                        reserve_tokens: int = 0) -> _Assembled:
         """经治理器分块装配（软依赖）；无治理器/无 ``assemble`` 接缝 → 降级拼接（不劣化）。
 
         ``blocks`` 以 **dict** 传入——消费层不 import 插件契约类型（解耦纪律）。
+        ``reserve_tokens`` 为**后续块**预留额度（S3：会话级装配时为多步循环的 chain 留空间）；
+        注入实现不认该参数时自动退回原签名（不劣化）。
         装配后发 ``agent/context/governed`` 遥测事件（各块实占 / 裁剪 / 刚性超限 / 回吐）。
         """
         gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
         asm = None
+        reserve = max(0, int(reserve_tokens or 0))
         if gov is not None:
             fn = getattr(gov, "assemble", None)
             if callable(fn):
-                try:
-                    asm = fn(blocks)
-                except Exception as exc:      # noqa: BLE001 —— 装配失败退降级，绝不裸崩
-                    logging.getLogger("agent.chat").warning("context assemble failed: %s", exc)
+                for kwargs in ({"reserve_tokens": reserve}, {}):
+                    try:
+                        asm = fn(blocks, **kwargs)
+                        break
+                    except TypeError:
+                        continue        # 注入实现不认该参数 → 退回原签名
+                    except Exception as exc:  # noqa: BLE001 —— 装配失败退降级，绝不裸崩
+                        logging.getLogger("agent.chat").warning("context assemble failed: %s", exc)
+                        break
         out = (_Assembled(str(asm.system_text), list(asm.prior), getattr(asm, "report", None))
                if asm is not None else _fallback_assemble(blocks))
         await self._emit_governed(ctx, stage, out)

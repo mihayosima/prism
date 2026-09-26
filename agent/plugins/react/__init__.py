@@ -19,9 +19,13 @@
 - **无自有表**：``tables = ()`` ⇒ 卸载零残留（轨迹落 ``agent_events``，转写落 ``agent_messages``）。
 - **依赖方向单向**：``chat --软--> react --软(读 permission_mode)--> approval``；
   approval 对 react **零依赖**（见《ReAct插件-设计方案.md》§14）。
+- **循环内上下文（S3）**：Think/Act/Observe 是任务级草稿（``TaskContext.chain``），
+  **不进** ``agent_messages``／工作记忆／Redis；窗口经 ``plugins.context`` 装配
+  （``react --软--> context``，单向）。职责不重叠：本插件只做「块内准备·逐条折叠」，
+  治理器只做「预算裁剪·整块丢弃 + 末条保底」。治理器缺失 → 退回 ``_trim`` 条数裁剪。
 
 文件：``prompt.py``（提示词/工具目录/截断）· ``components.py``（四组件接缝）·
-``loop.py``（主循环 + 三把闸）。
+``loop.py``（主循环 + 三把闸 + 循环内窗口）。
 """
 
 from __future__ import annotations
@@ -31,9 +35,9 @@ from agent.api import Services, StateKeys, plugin
 from .components import (Actor, DefaultActor, DefaultFinalizer, DefaultObserver,
                          DefaultReasoner, Finalizer, Observer, Reasoner, ReasonOutput,
                          ToolCall, ToolResult)
-from .loop import ReactConfig, ReactLoop, ReactResult, visible_tools
+from .loop import ReactConfig, ReactLoop, ReactResult, TaskContext, visible_tools
 
-__all__ = ["React", "ReactLoop", "ReactResult", "ReactConfig", "visible_tools",
+__all__ = ["React", "ReactLoop", "ReactResult", "ReactConfig", "TaskContext", "visible_tools",
            "Reasoner", "Actor", "Observer", "Finalizer", "ReasonOutput",
            "ToolCall", "ToolResult", "DefaultReasoner", "DefaultActor",
            "DefaultObserver", "DefaultFinalizer"]
@@ -63,6 +67,8 @@ class React:
             history_keep=int(cfg.get("history_keep", 20)),
             max_rejects=int(cfg.get("max_rejects", 3)),
             finalize_on_exceed=bool(cfg.get("finalize_on_exceed", True)),
+            # S3 兜底默认（折叠阈值归治理器 clip_*；此处仅最近保留条数）
+            react_keep_recent=int(cfg.get("react_keep_recent", 6)),
         )
         # 四组件 = 可选注入的接缝服务（与 ctx.llm 的 provider 选择同构）
         reasoner = ctx.get("react.reasoner") or DefaultReasoner()

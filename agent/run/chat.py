@@ -96,6 +96,12 @@ _SETTING_SCHEMA = {
     "memory_ratio": (float, 0.01, 0.99),
     "history_ratio": (float, 0.01, 0.99),
     "source_clip_tokens": (int, 0, 1_000_000),
+    # ---- S3：循环内（react）上下文治理 ----
+    "clip_max_tokens": (int, 0, 1_000_000),            # 单条观察超此值即首尾折叠
+    "clip_head_tokens": (int, 0, 1_000_000),           # 折叠后头部保留
+    "clip_tail_tokens": (int, 0, 1_000_000),           # 折叠后尾部保留
+    "react_keep_recent": (int, 0, 1000),                  # 最近 N 条链原文保留
+    "react_min_chain_tokens": (int, 0, 1_000_000),        # 循环内 chain 保底额度
 }
 _PLUGIN_OF_KEY = {
     "compact_trigger_tokens": "plugins.short_term",
@@ -104,6 +110,11 @@ _PLUGIN_OF_KEY = {
     "memory_ratio": "plugins.context",
     "history_ratio": "plugins.context",
     "source_clip_tokens": "plugins.context",
+    "clip_max_tokens": "plugins.context",
+    "clip_head_tokens": "plugins.context",
+    "clip_tail_tokens": "plugins.context",
+    "react_keep_recent": "plugins.context",
+    "react_min_chain_tokens": "plugins.context",
 }
 _SETTING_DEFAULTS = {
     "compact_trigger_tokens": 12000,
@@ -112,6 +123,11 @@ _SETTING_DEFAULTS = {
     "memory_ratio": 0.10,
     "history_ratio": 0.60,
     "source_clip_tokens": 8192,
+    "clip_max_tokens": 1000,
+    "clip_head_tokens": 500,
+    "clip_tail_tokens": 500,
+    "react_keep_recent": 6,
+    "react_min_chain_tokens": 2048,
 }
 
 
@@ -539,6 +555,11 @@ function renderSettings(j){
     ['memory_ratio','记忆块占比','长期记忆注入配额占输入预算的比例 (0~1)'],
     ['history_ratio','历史窗口占比','历史消息窗口占输入预算的比例 (0~1)'],
     ['source_clip_tokens','MCP 源头护栏 (token)','外部源头内容的最大裁剪上限'],
+    ['clip_max_tokens','循环内 · 单条观察上限 (token)','多步 ReAct 循环内，单条工具观察超过此值即做首尾折叠'],
+    ['clip_head_tokens','循环内 · 折叠保留头部 (token)','折叠后保留开头部分（含关键结论/参数）'],
+    ['clip_tail_tokens','循环内 · 折叠保留尾部 (token)','折叠后保留结尾部分（错误码通常在尾部）'],
+    ['react_keep_recent','循环内 · 最近保留条数','最近 N 条推理链保留原文，更早的才折叠'],
+    ['react_min_chain_tokens','循环内 · 链保底额度 (token)','装配会话历史时为多步循环预留的额度，防止循环无空间'],
   ];
   const isFloat=k=>(k==='memory_ratio'||k==='history_ratio');
   let h='<h3>上下文管理 <span class="tag blue">plugins.context 已启用</span></h3>'
@@ -554,7 +575,7 @@ function renderSettings(j){
 }
 async function saveSettings(){
   const isFloat=k=>(k==='memory_ratio'||k==='history_ratio');
-  const keys=['compact_trigger_tokens','max_context_tokens','reserve_output_tokens','memory_ratio','history_ratio','source_clip_tokens'];
+  const keys=['compact_trigger_tokens','max_context_tokens','reserve_output_tokens','memory_ratio','history_ratio','source_clip_tokens','clip_max_tokens','clip_head_tokens','clip_tail_tokens','react_keep_recent','react_min_chain_tokens'];
   const patch={};
   for(const k of keys){const el=$('#set_'+k);if(el&&el.value!==''){patch[k]=isFloat(k)?parseFloat(el.value):parseInt(el.value,10);}}
   $('#setMsg').textContent='保存中…';

@@ -1,4 +1,4 @@
-"""agent.plugins.context.governor —— 上下文治理器（G0 骨架 + G1 装配）。
+"""agent.plugins.context.governor —— 上下文治理器（G0 骨架 + G1 装配 + S3 循环内）。
 
 预算模型：输入窗口总预算（``max_context_tokens - reserve_output_tokens``）按块分配——
   记忆块 ``memory_ratio`` · 历史窗口 ``history_ratio`` · 其余归 system/工具块/本轮消息。
@@ -8,6 +8,15 @@ G0 提供预算查询 + 历史收窗（``pick_history``，保留供装配复用�
 G1 提供**分块装配** ``assemble(blocks)`` —— 注册制动态组装 + 统一互斥（左开右闭）+
 刚性超限双通道标注 + 剩余回吐（water-filling）；消费面软依赖
 ``ctx.has(Services.CONTEXT)``——插件停用即退回各消费方现状，不劣化不裸崩。
+S3 提供**循环内（react）预算口径**（``react_budget`` / ``clip_*`` / ``react_keep_recent``
+/ ``react_min_chain_tokens``）+ 块内准备原语 ``clip_head_tail`` + messages 块**通用** ``pinned``
+条目支持（块内先占、额度不足者降级）。
+
+职责边界（S3 钉死，勿越界）：
+- 本治理器**只**回答「内容怎么裁、占多少 token」，是**全仓唯一持有 token 语义**的组件；
+- **不感知任何业务语义**——不认识「任务进度」，也不认识任何**循环步骤类型**：
+  条目上的 `type` 字段属消费方私有语义，治理器**只认通用元数据 `pinned`**（块内先占额度）；
+  ``pinned`` 是**通用**元数据，任何 messages 块都可携带。
 """
 
 from __future__ import annotations
@@ -35,6 +44,11 @@ class ContextGovernor:
         memory_ratio: float = 0.10,
         history_ratio: float = 0.60,
         source_clip_tokens: int = 8192,
+        clip_max_tokens: int = 1000,
+        clip_head_tokens: int = 500,
+        clip_tail_tokens: int = 500,
+        react_keep_recent: int = 6,
+        react_min_chain_tokens: int = 2048,
     ):
         if max_context_tokens <= 0 or reserve_output_tokens < 0:
             raise ValueError("max_context_tokens 须 > 0 且 reserve_output_tokens 须 >= 0")
@@ -42,11 +56,19 @@ class ContextGovernor:
             raise ValueError("reserve_output_tokens 须小于 max_context_tokens")
         if not (0.0 < memory_ratio < 1.0 and 0.0 < history_ratio < 1.0):
             raise ValueError("memory_ratio / history_ratio 须在 (0,1) 区间")
+        if min(clip_max_tokens, clip_head_tokens, clip_tail_tokens,
+               react_keep_recent, react_min_chain_tokens) < 0:
+            raise ValueError("S3 循环内预算参数（clip_* / react_*）须 >= 0")
         self.max_context_tokens = int(max_context_tokens)
         self.reserve_output_tokens = int(reserve_output_tokens)
         self.memory_ratio = float(memory_ratio)
         self.history_ratio = float(history_ratio)
         self.source_clip_tokens = int(source_clip_tokens)
+        self._clip_max_tokens = int(clip_max_tokens)
+        self._clip_head_tokens = int(clip_head_tokens)
+        self._clip_tail_tokens = int(clip_tail_tokens)
+        self._react_keep_recent = int(react_keep_recent)
+        self._react_min_chain_tokens = int(react_min_chain_tokens)
 
     # ---- 构造 ----
 
@@ -60,6 +82,11 @@ class ContextGovernor:
             memory_ratio=float(cfg.get("memory_ratio", 0.10)),
             history_ratio=float(cfg.get("history_ratio", 0.60)),
             source_clip_tokens=int(cfg.get("source_clip_tokens", 8192)),
+            clip_max_tokens=int(cfg.get("clip_max_tokens", 1000)),
+            clip_head_tokens=int(cfg.get("clip_head_tokens", 500)),
+            clip_tail_tokens=int(cfg.get("clip_tail_tokens", 500)),
+            react_keep_recent=int(cfg.get("react_keep_recent", 6)),
+            react_min_chain_tokens=int(cfg.get("react_min_chain_tokens", 2048)),
         )
 
     # ---- 预算查询 ----
@@ -79,6 +106,36 @@ class ContextGovernor:
     def source_clip_budget(self) -> int:
         """MCP 源头护栏上限（G3 接线用；G0 先固化口径）。"""
         return self.source_clip_tokens
+
+    # ---- S3：循环内（react）预算口径 ----
+    #
+    # 口径统一：``react_budget`` 由 ``input_budget()`` 派生，**不另立窗口口径**
+    # （否则「会话级」与「循环级」两套窗口会在配置上打架）。
+    # 注意：结果**可能为负**（prior 已超输入预算）——调用方须显式处置，不可当 0 静默吞掉。
+
+    def react_budget(self, prior_tokens: int) -> int:
+        """循环内可用额度 = 输入预算 - 入口 prior 实占（**可为负**）。"""
+        return self.input_budget() - max(0, int(prior_tokens))
+
+    def react_keep_recent(self) -> int:
+        """循环内最近 N 条链原文保留（更老者才参与首尾折叠）。"""
+        return self._react_keep_recent
+
+    def react_min_chain_tokens(self) -> int:
+        """循环内 chain 保底额度——会话级装配 prior 时为循环预留（防循环空转）。"""
+        return self._react_min_chain_tokens
+
+    def clip_max_tokens(self) -> int:
+        """单条观察结果超此值即触发首尾折叠。"""
+        return self._clip_max_tokens
+
+    def clip_head_tokens(self) -> int:
+        """折叠后头部保留量。"""
+        return self._clip_head_tokens
+
+    def clip_tail_tokens(self) -> int:
+        """折叠后尾部保留量（错误常在尾部）。"""
+        return self._clip_tail_tokens
 
     # ---- 历史收窗（收窗机制已从 chat/compactor 移除调用；保留供装配/未来复用） ----
 
@@ -125,6 +182,27 @@ class ContextGovernor:
         dropped = n - len(keep)
         kept = [m for i, m in enumerate(messages) if i in keep]
         return kept, dropped
+
+    # ---- 块内准备（S3：只折叠、不丢弃） ----
+
+    def clip_head_tail(self, text: str, *, head: int | None = None,
+                       tail: int | None = None) -> tuple[str, bool]:
+        """首尾保留折叠（**只折叠、不丢弃**）：返回 ``(新文本, 是否发生折叠)``。
+
+        - 未超 ``clip_max_tokens`` → 原样返回 ``(text, False)``；
+        - 超过 → 保头 ``head`` + 保尾 ``tail``，中段折叠为省略标注，并保证实占 <= ``head+tail``；
+        - 头尾占比按 ``head:tail`` 换算（错误通常落在尾部，故尾部不缺席）；
+        - 与 ``_trim_messages``（整块丢弃 + 末条保底）**职责不重叠**：本方法绝不丢条目。
+        """
+        h = self._clip_head_tokens if head is None else max(0, int(head))
+        t = self._clip_tail_tokens if tail is None else max(0, int(tail))
+        target = max(1, h + t)
+        if estimate_tokens(text) <= self._clip_max_tokens:
+            return text, False
+        out, omitted = clip_text(text, target, head_ratio=(h / target) or 0.6)
+        if omitted <= 0:
+            return text, False
+        return self._clip_hard(out, target), True
 
     # ---- 分块装配（G1） ----
 
@@ -185,28 +263,62 @@ class ContextGovernor:
             return text, False
         return self._clip_hard(text, budget), True
 
-    def _trim_messages(self, messages: list[dict], budget: int) -> list[dict]:
-        """token 口径从新到旧贪心（pick_history 同口径）；末条超预算则 clip，保证不超上限。"""
-        if not messages or budget <= 0:
-            return []
+    @staticmethod
+    def _msg_id(m: dict, i: int) -> str:
+        """条目 id：优先调用方给的 ``id``，缺省用块内序号（供 pinned 降级追溯）。"""
+        return str(m.get("id") or f"#{i}")
+
+    def _trim_messages(self, messages: list[dict],
+                       budget: int) -> tuple[list[dict], list[str], bool]:
+        """预算裁剪（**只整块丢弃 + 末条保底折叠**；绝不逐条折叠——逐条折叠归块内准备）。
+
+        与 ``clip_head_tail`` 职责**不重叠**，两者互不代劳（杜绝双重截断）。
+
+        顺序：
+          1. **块内 pinned 先占**：按原顺序占额度（不参与 water-filling）；
+          2. 额度用尽的剩余 pinned → **降级为普通条目**，其 id 记入返回值；
+          3. 余额给非 pinned 条目：**从新到旧连续贪心**（保连续性，避免抽空中间导致消息配对断裂）；
+          4. 一条都没保留 → 最新一条 ``_clip_hard`` 到预算（保对话不残）。
+
+        返回 ``(保留条目[原顺序], 刚性失效的 pinned 条目 id, 是否发生末条保底折叠)``。
+        """
+        if not messages:
+            return [], [], False
+        if budget <= 0:                     # 无空间：pinned 全部刚性失效（诚实记录，不静默）
+            return [], [self._msg_id(m, i) for i, m in enumerate(messages) if m.get("pinned")], False
         toks = [estimate_tokens(m) for m in messages]
-        keep: list[dict] = []
+        keep_idx: set[int] = set()
+        downgraded: list[str] = []
         used = 0
-        for i in range(len(messages) - 1, -1, -1):
+        for i, m in enumerate(messages):            # 1) + 2) pinned 先占（按原顺序）
+            if not m.get("pinned"):
+                continue
             if used + toks[i] <= budget:
-                keep.append(messages[i])
+                keep_idx.add(i)
                 used += toks[i]
-            elif not keep:               # 最新一条超预算 → clip 到预算，保对话不残
-                m = dict(messages[i])
-                m["content"] = self._clip_hard(str(m.get("content", "")), budget)
-                keep.append(m)
-                break
+            else:
+                downgraded.append(self._msg_id(m, i))
+        for i in range(len(messages) - 1, -1, -1):  # 3) 余额给非 pinned（连续贪心）
+            if i in keep_idx:
+                continue
+            if used + toks[i] <= budget:
+                keep_idx.add(i)
+                used += toks[i]
             else:
                 break
-        keep.reverse()
-        return keep
+        clipped = False
+        override: dict[int, dict] = {}              # 保底裁剪后的替换条目（按索引回填）
+        if not keep_idx:                            # 4) 末条保底
+            i = len(messages) - 1
+            m = dict(messages[i])
+            m["content"] = self._clip_hard(str(m.get("content", "")), budget)
+            override[i] = m
+            keep_idx.add(i)
+            clipped = True
+        kept = [override.get(i, m) for i, m in enumerate(messages) if i in keep_idx]
+        return kept, downgraded, clipped
 
-    def assemble(self, blocks: list[BlockSpec]) -> Assembly:
+    def assemble(self, blocks: list[BlockSpec], *, reserve_tokens: int = 0) -> Assembly:
         """分块装配：注册制过滤 → 刚性先扣 → 可裁回吐分配 → 块内裁剪 → 互斥输出。
 
         - **注册制**：只对 `present` 且非空的块分配预算；权重在"存在的块"间重归一。
@@ -215,8 +327,12 @@ class ContextGovernor:
         - **剩余回吐**：可裁块 water-filling——未用满余量回吐公共池再分配（`redistributed` 记账）。
         - **互斥**：`messages` 块按 `coverage`（左开右闭）排序，重叠时高阶块胜出，
           绝不双份注入；输出前剥离内部 `seq`。
+        - **pinned（S3，通用元数据）**：`messages` 块内 `pinned` 条目**按原顺序先占额度**，
+          额度不足者降级为普通条目并记入 `BlockReport.pinned_downgraded`（诚实、可追溯）。
+        - **`reserve_tokens`（S3）**：为调用方**后续**块预留额度（如 react 循环的 chain 保底），
+          从输入预算中先扣除后再分配——避免先装配的块吃满致后续块无空间。
         """
-        ib = self.input_budget()
+        ib = max(0, self.input_budget() - max(0, int(reserve_tokens)))
         blocks = [self._coerce(b) for b in blocks]        # 兼容 dict 入参（消费层零 import）
         active = [b for b in blocks if self._present_nonempty(b)]
         active_keys = {b.key for b in active}
@@ -268,13 +384,16 @@ class ContextGovernor:
         out_msgs: dict[str, list[dict]] = {}
         used: dict[str, int] = {}
         trimmed: dict[str, bool] = {}
+        pin_down: dict[str, list[str]] = {}      # S3：刚性失效的 pinned 条目 id（可追溯）
         for b in active:
             alloc = rigid_alloc.get(b.key, 0) if b.rigid else cap.get(b.key, 0)
             if b.kind == "messages":
-                msgs = self._trim_messages(list(b.payload), alloc)
+                msgs, down, clipped = self._trim_messages(list(b.payload), alloc)
                 out_msgs[b.key] = msgs
                 used[b.key] = self._block_tokens("messages", msgs)
-                trimmed[b.key] = len(msgs) < len(b.payload)
+                trimmed[b.key] = (len(msgs) < len(b.payload)) or bool(down) or clipped
+                if down:
+                    pin_down[b.key] = list(down)
             else:
                 text, cut = self._trim_text(str(b.payload), alloc)
                 out_text[b.key] = text
@@ -289,13 +408,15 @@ class ContextGovernor:
             lo, hi = (b.coverage or (0, 0))
             if b.coverage is not None:
                 kept: list[dict] = []
-                for m in out_msgs[b.key]:
+                for idx, m in enumerate(out_msgs[b.key]):
                     if "seq" not in m:        # 无 seq：信任调用方划分，不逐条过滤
                         kept.append(m)
                         continue
                     s = int(m["seq"])
                     # 左开右闭本块范围 (lo, hi] + 不与前块重叠（s > cover_hi）→ 越界/重叠即剔除
                     if s <= lo or s > hi or s <= cover_hi:
+                        if m.get("pinned"):    # 互斥剔除亦可致刚性失效（诚实记录，不静默）
+                            pin_down.setdefault(b.key, []).append(self._msg_id(m, idx))
                         continue
                     kept.append(m)
                 if len(kept) != len(out_msgs[b.key]):
@@ -329,7 +450,8 @@ class ContextGovernor:
                       else "trimmed" if trimmed.get(b.key) else "ok")
             reports.append(BlockReport(b.key, b.present, b.kind, requested=req,
                                        allocated=alloc, used=u,
-                                       trimmed=trimmed.get(b.key, False), reason=reason))
+                                       trimmed=trimmed.get(b.key, False), reason=reason,
+                                       pinned_downgraded=list(pin_down.get(b.key, []))))
         total_used = estimate_tokens(system_text) + self._block_tokens("messages", prior)
         rigid_overflow = [r for r in reports if r.reason == "downgraded"]
         report = AssemblyReport(blocks=reports, total_used=total_used, input_budget=ib,

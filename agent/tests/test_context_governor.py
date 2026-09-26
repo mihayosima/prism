@@ -482,3 +482,133 @@ def test_governor_receives_covers_as_param_not_reverse_query(tmp_path):
         await c.teardown()
 
     _run(s())
+
+
+# ---------------------------------------------------------------------------
+# S3 循环内上下文：预算口径 · 折叠原语 · pinned 先占/降级 · 预留额度 · 职责守卫
+# ---------------------------------------------------------------------------
+
+
+def test_react_budget_derives_from_input_budget_and_can_go_negative():
+    """S3 校正④：``react_budget = input_budget() - prior_tokens``，**可为负**（不静默当 0）。"""
+    g = ContextGovernor(max_context_tokens=1000, reserve_output_tokens=400)
+    assert g.input_budget() == 600
+    assert g.react_budget(0) == 600
+    assert g.react_budget(200) == 400
+    assert g.react_budget(600) == 0
+    assert g.react_budget(900) == -300          # prior 超预算 → 负值，交调用方显式处置
+
+
+def test_clip_head_tail_folds_middle_and_keeps_both_ends():
+    """S3 折叠原语：超阈值 → 保头尾 + 中段省略标注；实占 <= 头+尾。"""
+    g = ContextGovernor(clip_max_tokens=200, clip_head_tokens=100, clip_tail_tokens=100)
+    text = "HEAD" + ("M" * 4000) + "TAIL"
+    out, clipped = g.clip_head_tail(text)
+    assert clipped and out != text
+    assert out.startswith("HEAD") and out.endswith("TAIL")   # 尾部（错误常见处）不缺席
+    assert "省略" in out                                       # 诚实标注，不静默丢弃
+    assert estimate_tokens(out) <= 200
+
+
+def test_clip_head_tail_under_threshold_is_untouched():
+    """未超阈值 → 原样返回（只折叠超限者，不无谓改写）。"""
+    g = ContextGovernor(clip_max_tokens=10_000)
+    assert g.clip_head_tail("短内容") == ("短内容", False)
+
+
+def test_trim_messages_pinned_first_occupy_then_downgrade():
+    """S3 校正②：pinned **按原顺序先占额度**；额度用尽的剩余 pinned **降级**为普通条目。
+
+    同时校验：降级条目 id 记入 ``BlockReport.pinned_downgraded``（dataclass 字段，非裸 dict）。
+    """
+    from agent.plugins.context import BlockSpec
+
+    g = ContextGovernor(max_context_tokens=100_000, reserve_output_tokens=0)
+    big = "x" * 400                                  # ≈100 token
+    msgs = [
+        {"role": "user", "content": big, "pinned": True, "id": "p1"},
+        {"role": "user", "content": big, "pinned": True, "id": "p2"},
+        {"role": "user", "content": big, "pinned": True, "id": "p3"},
+    ]
+    kept, downgraded, _ = g._trim_messages(msgs, 250)      # 只够两条
+    assert [m["id"] for m in kept] == ["p1", "p2"]         # 先占：按原顺序
+    assert downgraded == ["p3"]                            # 剩余者降级（刚性失效，可追溯）
+
+    g2 = ContextGovernor(max_context_tokens=250, reserve_output_tokens=0)
+    asm = g2.assemble([BlockSpec("chain", "messages", True, [dict(m) for m in msgs],
+                                 weight=1.0)])
+    rep = next(r for r in asm.report.blocks if r.key == "chain")
+    assert rep.pinned_downgraded == ["p3"]                 # dataclass 字段，消费方可直接读
+    assert rep.trimmed is True
+
+
+def test_trim_messages_zero_budget_records_all_pinned_downgraded():
+    """无空间时 pinned 全部刚性失效——**诚实记录**，不静默当无事发生。"""
+    g = ContextGovernor()
+    msgs = [{"role": "user", "content": "a", "pinned": True, "id": "z1"}]
+    kept, downgraded, _ = g._trim_messages(msgs, 0)
+    assert kept == [] and downgraded == ["z1"]
+
+
+def test_trim_messages_without_pinned_keeps_contiguous_newest():
+    """无 pinned 时行为不变：从新到旧**连续**贪心（保消息配对不断裂）。"""
+    g = ContextGovernor()
+    msgs = [{"role": "user", "content": "x" * 400, "seq": i} for i in range(3)]
+    kept, downgraded, _ = g._trim_messages(msgs, 250)
+    assert [m["seq"] for m in kept] == [1, 2]              # 连续后缀，不抽空中间
+    assert downgraded == []
+
+
+def test_assemble_reserve_tokens_reduces_effective_budget():
+    """S3 新增：``reserve_tokens`` 为后续块预留额度（防先装配者吃满）。"""
+    from agent.plugins.context import BlockSpec
+
+    g = ContextGovernor(max_context_tokens=1000, reserve_output_tokens=0)
+    blocks = [BlockSpec("history", "messages", True,
+                        [{"role": "user", "content": "y" * 4000, "seq": 1}], weight=1.0)]
+    full = g.assemble(blocks)
+    reserved = g.assemble(blocks, reserve_tokens=400)
+    assert full.report.input_budget == 1000
+    assert reserved.report.input_budget == 600             # 有效预算已扣除预留
+    used_full = next(r.used for r in full.report.blocks if r.key == "history")
+    used_res = next(r.used for r in reserved.report.blocks if r.key == "history")
+    assert used_res <= used_full
+
+
+def test_governor_has_no_business_wording():
+    """S3 校正③守卫：治理器**不感知业务语义**——源码内不出现 ``observe`` 之类字样，
+    只认通用元数据 ``pinned``（``type`` 属消费方私有，治理器不碰）。"""
+    import re
+
+    src = (PLUGIN_DIR / "context" / "governor.py").read_text(encoding="utf-8")
+    assert "pinned" in src                                  # 通用元数据：认识
+    assert not re.search(r"\bobserve", src, re.I)           # 业务字样：不认识
+    assert not re.search(r"\bthink\b|\bact\b", src, re.I)
+
+
+def test_s3_settings_registered_in_all_three_places():
+    """S3 新参数必须**三处同步登记**（schema / owner / 默认值 / 前端 keys），
+    否则前端不可见或后端拒收（G1 教训的制度化）。"""
+    from agent.run import chat as srv
+
+    for k in ("clip_max_tokens", "clip_head_tokens", "clip_tail_tokens",
+              "react_keep_recent", "react_min_chain_tokens"):
+        assert k in srv._SETTING_SCHEMA, f"{k} 未登记 schema"
+        assert srv._PLUGIN_OF_KEY[k] == "plugins.context", f"{k} 归属错误"
+        assert k in srv._SETTING_DEFAULTS, f"{k} 缺默认值"
+        assert srv._coerce_setting(k, srv._SETTING_DEFAULTS[k]) == srv._SETTING_DEFAULTS[k]
+        assert f"'{k}'" in srv._PAGE, f"{k} 未同步到前端 keys/字段表"
+
+
+def test_s3_settings_registered_in_all_three_places():
+    """S3 新参数必须**三处同步登记**（schema / owner / 默认值 / 前端 keys），
+    否则前端不可见或后端拒收（G1 教训的制度化）。"""
+    from agent.run import chat as srv
+
+    for k in ("clip_max_tokens", "clip_head_tokens", "clip_tail_tokens",
+              "react_keep_recent", "react_min_chain_tokens"):
+        assert k in srv._SETTING_SCHEMA, f"{k} 未登记 schema"
+        assert srv._PLUGIN_OF_KEY[k] == "plugins.context", f"{k} 归属错误"
+        assert k in srv._SETTING_DEFAULTS, f"{k} 缺默认值"
+        assert srv._coerce_setting(k, srv._SETTING_DEFAULTS[k]) == srv._SETTING_DEFAULTS[k]
+        assert f"'{k}'" in srv._PAGE, f"{k} 未同步到前端 keys/字段表"

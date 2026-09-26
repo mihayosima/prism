@@ -6,6 +6,14 @@
 G1 新增**分块装配契约**（纯数据，chat 构造、governor 消费）：
 ``BlockSpec`` / ``BlockReport`` / ``AssemblyReport`` / ``Assembly``。
 消费方不触插件内部实现。
+
+S3 扩面（循环内上下文治理）：
+- ``BlockSpec.rigid`` 语义钉死为「**不参与可裁池**」，**不等于「绝对不裁」**——刚性块自身
+  超预算时仍按 priority 降序降级，并双通道标注（见 ``AssemblyReport.rigid_overflow``）；
+- messages 块条目新增**通用元数据** ``pinned``（任何 messages 块可携带）：
+  块内**先占额度**，额度不足者降级为普通条目，记入 ``BlockReport.pinned_downgraded``。
+  —— 注意：``pinned`` 是**通用**词义，治理器不感知任何业务语义（既不认识「任务进度」，
+  也不认识任何循环步骤类型；条目 ``type`` 属消费方私有，治理器只认 ``pinned``）。
 """
 
 from __future__ import annotations
@@ -32,7 +40,7 @@ class BlockSpec:
     payload: str | list[dict] = ""
     weight: float = 0.0                         # 可裁块预算权重；<=0 → 用治理器按 key 的默认
     priority: int = 100                         # 越小越先保留（装配顺序 / 超限裁剪逆序）
-    rigid: bool = False                         # True = 刚性（超预算也不裁，先占预算）
+    rigid: bool = False                         # True = 刚性（先占预算）；自身超限仍会降级并标注
     coverage: tuple[int, int] | None = None     # messages 专用（左开右闭）
 
 
@@ -48,6 +56,9 @@ class BlockReport:
     used: int = 0                               # 实占 token
     trimmed: bool = False                       # 是否被裁剪
     reason: str = ""                            # absent / empty / ok / trimmed / downgraded
+    pinned_downgraded: list[str] = field(default_factory=list)
+    # ↑ 刚性失效的 pinned 条目 id（块内额度不足者；可能被丢弃或截短）。
+    #   无降级时为空 list（字段不省略，便于消费方直接读）。
 
 
 @dataclass(frozen=True)
@@ -71,7 +82,7 @@ class Assembly:
 
 
 class GovernorLike(Protocol):
-    """上下文治理器契约：预算查询 + 历史收窗 + 分块装配（G1）。"""
+    """上下文治理器契约：预算查询 + 历史收窗 + 分块装配（G1）+ 循环内预算（S3）。"""
 
     def input_budget(self) -> int: ...
 
@@ -81,6 +92,17 @@ class GovernorLike(Protocol):
 
     def source_clip_budget(self) -> int: ...
 
+    # ---- S3：循环内（react）预算口径 ----
+    def react_budget(self, prior_tokens: int) -> int: ...
+    def react_keep_recent(self) -> int: ...
+    def react_min_chain_tokens(self) -> int: ...
+    def clip_max_tokens(self) -> int: ...
+    def clip_head_tokens(self) -> int: ...
+    def clip_tail_tokens(self) -> int: ...
+    def clip_head_tail(self, text: str, *,
+                       head: int | None = None,
+                       tail: int | None = None) -> tuple[str, bool]: ...
+
     def pick_history(
         self,
         messages: list[dict],
@@ -89,7 +111,7 @@ class GovernorLike(Protocol):
         keep_first: bool = False,
     ) -> tuple[list[dict], int]: ...
 
-    def assemble(self, blocks: list[BlockSpec]) -> Assembly: ...
+    def assemble(self, blocks: list[BlockSpec], *, reserve_tokens: int = 0) -> Assembly: ...
 
 
 __all__ = [

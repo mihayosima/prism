@@ -74,6 +74,16 @@ class Actor(Protocol):
 
 
 class Observer(Protocol):
+    """观察接缝：把本轮工具结果整理成一条回灌消息。
+
+    返回的 dict 可携带以下**可选**元数据（循环会自动补齐缺省值）：
+
+    - ``pinned: bool``（默认 ``False``）——**通用元数据**：交给上下文治理器识别，
+      标 ``True`` 的条目在块内**先占额度**（不被折叠/丢弃）；实现方按业务判定标注意要观察即可；
+    - ``type`` / ``id`` 由循环统一补齐（``act``/``observe`` 等属**本插件私有语义**，
+      治理器不感知）。
+    """
+
     async def observe(self, ctx, results: list[ToolResult]) -> dict: ...
 
 
@@ -133,10 +143,15 @@ class DefaultActor:
 
 
 class DefaultObserver:
-    """默认观察：把结果整理成一条回灌消息（纯 dict，可 JSON 化 —— 与事件面同纪律）。"""
+    """默认观察：把结果整理成一条回灌消息（纯 dict，可 JSON 化 —— 与事件面同纪律）。
+
+    ``pinned`` 默认 ``False``（**不自动判定**——原方案未定义判定规则，属伪需求；
+    需要时由替换实现按业务标注，见 ``Observer`` 协议）。
+    """
 
     async def observe(self, ctx, results) -> dict:
-        return {"role": "user", "content": {"tool_results": [r.as_dict() for r in results]}}
+        return {"role": "user", "content": {"tool_results": [r.as_dict() for r in results]},
+                "pinned": False}
 
 
 class DefaultFinalizer:
