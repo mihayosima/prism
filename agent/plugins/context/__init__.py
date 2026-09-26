@@ -3,10 +3,12 @@
 目录插件（agent/plugins/context），语义上是**系统组件**（layer=system，
 与 guard/budget 同级）；来源（目录）决定生命周期——经「插件」页可启用 / 停用 / 卸载。
 
-职责（分阶段落地，见 docs/上下文治理-设计方案.md）：
-  G0（本次）：预算模型 + token 化历史收窗；服务键 ``Services.CONTEXT``；
+职责（分阶段落地，见 docs/governance/上下文治理-设计方案.md）：
+  G0（已完成）：预算模型 + token 化历史收窗；服务键 ``Services.CONTEXT``；
               接缝 ``ctx.get("context.governor") or ContextGovernor(...)`` 可注入替换。
-  G1：分块装配（chat 窗口）+ 会话压缩摘要（表 agent_session_summaries，DDL 随插件走 M1 模式）。
+  G1（本次）：**分块装配统一编排** ``assemble(blocks)``——注册制（块自声明存在性）+
+              统一互斥（左开右闭 coverage）+ 刚性超限双通道标注 + 剩余回吐（water-filling）；
+              chat 的 plan / narrate / prior 均经此装配。
   G2–G5：react 窗口 / MCP 源头护栏 / 记忆注入配额反推 / 工具块降载。
 
 解耦纪律：
@@ -21,7 +23,7 @@ from __future__ import annotations
 from agent.api import Services, plugin
 
 from .governor import ContextGovernor
-from .protocols import GovernorLike
+from .protocols import Assembly, AssemblyReport, BlockReport, BlockSpec, GovernorLike
 
 
 @plugin
@@ -43,4 +45,12 @@ class Context:
         ctx.provide(Services.CONTEXT, governor)
 
 
-__all__ = ["Context", "ContextGovernor", "GovernorLike"]
+__all__ = [
+    "Context",
+    "ContextGovernor",
+    "GovernorLike",
+    "BlockSpec",
+    "BlockReport",
+    "AssemblyReport",
+    "Assembly",
+]

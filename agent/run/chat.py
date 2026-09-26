@@ -238,6 +238,7 @@ tr:last-child td{border-bottom:0}
 .tag{font-size:11px;border-radius:6px;padding:2px 8px;font-family:var(--mono)}
 .tag.ok{background:var(--ok-soft);color:#188a46} .tag.err{background:var(--err-soft);color:var(--err)}
 .tag.run{background:var(--warn-soft);color:#a16207} .tag.blue{background:var(--brand-soft);color:var(--brand-ink)}
+.tag.off{background:var(--bg);color:var(--muted2);border:1px solid var(--line)}
 .muted{color:var(--muted)} .e{color:var(--err)}
 .empty{color:var(--muted2);font-size:12.5px}
 .filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
@@ -457,12 +458,40 @@ async function load(name){
         +(j.recent&&j.recent.length?tableFrom(j.recent.slice(0,20),['seq','payload','at']):'<div class="empty">暂无裁决</div>');}
         else if(name==='plugins'){ renderPlugins(j.plugins||[]); }
     else if(name==='memory'){
-      if(j.enabled===false){
-        $('#memoryBox').innerHTML='<h3>记忆</h3><div class="empty">记忆插件（plugins.memory）未启用 —— 在「插件」页点「启用」后生效。</div>';return;}
-      const st=j.stats||{};
-      let h='<h3>记忆（plugins.memory · Zep 式：事实/意图/决策/观察 + 打分衰减）</h3>'
-        +'<div class="card">'+(Object.entries(st.by_kind||{}).map(([k,v])=>'<span class="tag blue" style="margin:0 6px 4px 0;display:inline-block">'+esc(k)+' '+v+'</span>').join('')||'<span class="muted">空</span>')+'<span class="mono muted" style="margin-left:10px">total='+(st.total||0)+'</span></div>'
-        +(j.rows&&j.rows.length?tableFrom(j.rows,['id','kind','content','score_observed','created_at','accessed_count','invalid_at','source']):'<div class="empty">暂无记忆 —— 与 Agent 对话 / 跑技能后会经 LLM 提取写入</div>');
+      const lt=j.long_term||{};
+      let h='<h3>记忆 · 分层总览</h3>'
+        +'<div class="muted" style="margin:-4px 0 12px">三层记忆（系统 / 短期 / 工作）始终可见，无论长期记忆是否启用；长期记忆（plugins.memory）为可选子块。</div>';
+      (j.layers||[]).forEach(L=>{
+        h+='<div class="card" style="margin-bottom:12px"><div style="display:flex;justify-content:space-between;align-items:center">'
+          +'<b>'+esc(L.name)+'</b><span class="tag '+(L.available?'blue':'off')+'">'+(L.available?'已装配':'未启用')+'</span></div>'
+          +'<div class="muted" style="font-size:11px;margin:2px 0 8px">'+esc(L.subtitle)+'</div>';
+        if(!L.available){ h+='<div class="empty">该层未启用 —— 在「插件」页点「启用」后生效。</div>'; }
+        else{
+          const s=L.summary||{};
+          if(L.key==='system_memory'){
+            h+='<div class="mono muted">字符数 '+(s.chars||0)+'</div>';
+            if(s.preview) h+='<pre class="json" style="max-height:160px;overflow:auto">'+esc(s.preview)+'</pre>';
+          } else if(L.key==='short_term'){
+            h+='<span class="tag blue" style="margin:0 6px 4px 0;display:inline-block">消息 '+(s.messages||0)+'</span>'
+              +'<span class="tag blue" style="margin:0 6px 4px 0;display:inline-block">已摘要覆盖至 seq '+(s.summary_covers_seq||0)+'</span>'
+              +'<span class="tag '+(s.has_summary?'blue':'off')+'" style="margin:0 6px 4px 0;display:inline-block">'+(s.has_summary?'有滚动摘要':'无滚动摘要')+'</span>';
+            if(s.compact_stats) h+='<div class="mono muted" style="margin-top:4px">'+esc(json2(s.compact_stats))+'</div>';
+            if(s.latest_summary_preview) h+='<pre class="json" style="max-height:140px;overflow:auto">'+esc(s.latest_summary_preview)+'</pre>';
+          } else if(L.key==='work_memory'){
+            h+='<span class="tag blue" style="display:inline-block">活跃任务 '+(s.count||0)+'</span>';
+            if(s.active_tasks&&s.active_tasks.length) h+='<div class="mono" style="margin-top:4px">'+esc(json2(s.active_tasks))+'</div>';
+            else h+='<div class="empty" style="margin-top:4px">当前无活跃任务</div>';
+          }
+        }
+        h+='</div>';
+      });
+      h+='<h3 style="margin-top:18px">长期记忆（plugins.memory · opt-in）</h3>';
+      if(!lt.enabled){ h+='<div class="empty">未启用 —— 在「插件」页点「启用」后，下方显示其 Zep 式记忆内容。</div>'; }
+      else{
+        const st=lt.stats||{};
+        h+='<div class="card">'+(Object.entries(st.by_kind||{}).map(([k,v])=>'<span class="tag blue" style="margin:0 6px 4px 0;display:inline-block">'+esc(k)+' '+v+'</span>').join('')||'<span class="muted">空</span>')+'<span class="mono muted" style="margin-left:10px">total='+(st.total||0)+'</span></div>';
+        h+=(lt.rows&&lt.rows.length?tableFrom(lt.rows,['id','kind','content','score_observed','created_at','accessed_count','invalid_at','source']):'<div class="empty">暂无记忆</div>');
+      }
       $('#memoryBox').innerHTML=h;}
     else if(name==='tools'){
       const rows=j.tools||[];
@@ -478,13 +507,16 @@ let evFilter='all';
 let plugBusy=false;
 async function plugAction(payload){
   if(plugBusy)return;plugBusy=true;
+  // 立即禁用所有插件按钮并显示“处理中…”，消除“点击后没反应”的观感（重建容器本身需要数秒）
+  document.querySelectorAll('#pluginsBox [data-plug-act]').forEach(b=>{b.disabled=true;b.dataset.lb=b.textContent;b.textContent='处理中…';});
   try{
     const r=await fetch('/api/plugins/'+payload.act,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload.body||{})});
     const j=await r.json();
-    if(!j.ok&&r.status>=400){alert('失败：'+(j.error||r.status));return;}
     if(j.plugins) renderPlugins(j.plugins); else await load('plugins');
-    await loadStatus();
-  }catch(e){alert('失败：'+e.message);}finally{plugBusy=false;}
+    if(!j.ok||j.rebuild_error){alert('注意：'+(j.rebuild_error||j.error||r.status)+' （期望态已保存，实际装配可能需重启）');}
+    // 后台重建完成后再刷新一次，使状态从“启用中（重启生效）”更新为“已启用”
+    setTimeout(()=>{ load('plugins'); loadStatus(); }, 4000);
+  }catch(e){alert('请求失败：'+e.message);}finally{plugBusy=false;await loadStatus();}
 }
 $('#pluginsBox').addEventListener('click',e=>{
   const b=e.target.closest('[data-plug-act]');if(!b)return;
@@ -734,17 +766,75 @@ async def _serve(args: argparse.Namespace) -> int:
     async def _tools() -> dict:
         return {"tools": c.root.tasks.catalog()}
 
-    # ---- 记忆（长期） ----
+    # ---- 记忆（分层总览：系统 / 短期 / 工作 + 长期子块） ----
+    # 解耦纪律：消费面只用 ctx.has(Services.X) 守卫 + 门面方法，不 import 任何插件内部模块。
 
     @app.get("/api/memory")
     async def _memory() -> dict:
-        # 记忆是目录插件（plugins.memory）：未启用 → 友好降级，不裸崩
-        if not c.root.has(Services.MEMORY):
-            return {"enabled": False, "stats": {"by_kind": {}, "total": 0}, "rows": []}
-        stats = await c.root.memory.stats(c.root)
-        # 只读列表经 owner 插件接口获取（零 SQL；2026-09-26 解耦审查 P1 收口）
-        rows = await c.root.memory.list_recent(c.root, limit=40)
-        return {"enabled": True, "stats": stats, "rows": rows}
+        layers: list[dict] = []
+
+        # 第1层 系统记忆（SYSTEM_MEMORY 提供的是纯文本字符串，无门面对象）
+        if c.root.has(Services.SYSTEM_MEMORY):
+            sm_text = c.root.get(Services.SYSTEM_MEMORY) or ""
+            layers.append({"key": "system_memory", "name": "系统记忆",
+                           "subtitle": "第1层 · 身份/边界叙事（启动全量注入）",
+                           "available": True,
+                           "summary": {"chars": len(sm_text),
+                                       "preview": (sm_text[:240] + "…") if len(sm_text) > 240 else sm_text}})
+        else:
+            layers.append({"key": "system_memory", "name": "系统记忆",
+                           "subtitle": "第1层 · 身份/边界叙事",
+                           "available": False, "summary": {}})
+
+        # 第2层 短期记忆（SHORT_TERM 门面 ShortTermMemory）
+        if c.root.has(Services.SHORT_TERM):
+            short = c.root.get(Services.SHORT_TERM)
+            try:
+                cnt = await short.count(c.root, session_id)
+                meta = await short.summary_meta(c.root, session_id)
+                covers = int(meta["covers_up_to_seq"]) if meta else 0
+                latest = await short.latest_summary(c.root, session_id)
+                st_stats = short.stats()
+            except Exception:  # noqa: BLE001 —— 单窗诊断失败不影响整体展示
+                cnt, covers, latest, st_stats = 0, 0, None, {}
+            layers.append({"key": "short_term", "name": "短期记忆",
+                           "subtitle": "第2层 · 会话转写 + 滚动摘要（当前会话）",
+                           "available": True,
+                           "summary": {"messages": cnt, "summary_covers_seq": covers,
+                                       "has_summary": bool(latest),
+                                       "latest_summary_preview": ((latest[:240] + "…") if latest and len(latest) > 240 else (latest or "")),
+                                       "compact_stats": st_stats}})
+        else:
+            layers.append({"key": "short_term", "name": "短期记忆",
+                           "subtitle": "第2层 · 会话转写 + 滚动摘要",
+                           "available": False, "summary": {}})
+
+        # 第3层 工作记忆（WORK_MEMORY 门面 WorkMemory）
+        if c.root.has(Services.WORK_MEMORY):
+            wm = c.root.get(Services.WORK_MEMORY)
+            try:
+                active = await wm.list_active(session_id)
+            except Exception:  # noqa: BLE001
+                active = []
+            layers.append({"key": "work_memory", "name": "工作记忆",
+                           "subtitle": "第3层 · 任务级进度缓存（Redis / 降级内存）",
+                           "available": True,
+                           "summary": {"active_tasks": active, "count": len(active)}})
+        else:
+            layers.append({"key": "work_memory", "name": "工作记忆",
+                           "subtitle": "第3层 · 任务级进度缓存",
+                           "available": False, "summary": {}})
+
+        # 长期记忆（MEMORY 目录插件，opt-in）：独立子块，不影响三层展示
+        long_term = {"enabled": c.root.has(Services.MEMORY), "stats": {}, "rows": []}
+        if c.root.has(Services.MEMORY):
+            try:
+                long_term["stats"] = await c.root.memory.stats(c.root)
+                long_term["rows"] = await c.root.memory.list_recent(c.root, limit=40)
+            except Exception:  # noqa: BLE001
+                long_term["stats"], long_term["rows"] = {"error": "stats failed"}, []
+
+        return {"layers": layers, "long_term": long_term}
 
     # ---- 插件管理（引擎式：desired/actual/delta；改动即时重建生效） ----
 
@@ -776,36 +866,47 @@ async def _serve(args: argparse.Namespace) -> int:
                          "status": status_map.get(m["id"])})
         return {"plugins": rows, "state_exists": pm.state_file.exists()}
 
-    async def _mutate_then_fetch() -> dict:
-        await _apply_rebuild()
-        return await _plugins()
+    async def _bg_rebuild() -> None:
+        """后台重建容器（不阻塞管理请求）。失败仅记录，不回滚期望态。"""
+        try:
+            await _apply_rebuild()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[rebuild] 后台重建失败（期望态已保存，实际装配可能需重启）：{exc}",
+                  file=sys.stderr)
+
+    async def _mutate_then_fetch(background: bool = False) -> dict:
+        # 先返回期望态已更新的当前快照（desired 已写入 state.json）。
+        # 容器重建代价高（含 MCP 子进程拉起等，常需数十秒），故改为后台执行，
+        # 避免管理请求长时间阻塞、前端“点了没反应”。前端会显示“处理中…”并在稍后自动刷新。
+        res = await _plugins()
+        if background:
+            asyncio.create_task(_bg_rebuild())
+            return res
+        try:
+            await _apply_rebuild()
+            res = await _plugins()
+        except Exception as exc:  # noqa: BLE001
+            res = {**res, "rebuild_error": f"重建失败（期望态已保存，实际装配可能需重启）：{exc}"}
+        return res
 
     @app.post("/api/plugins/enable")
     async def _plugin_enable(body: dict):
-        try:
-            pm.set_enabled(str(body.get("id") or ""), bool(body.get("enable", True)))
-            res = await _mutate_then_fetch()
-            return JSONResponse({"ok": True, "plugins": res["plugins"]})
-        except Exception as exc:  # noqa: BLE001
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        pm.set_enabled(str(body.get("id") or ""), bool(body.get("enable", True)))
+        # 无论重建成功与否都返回最新插件状态（含 plugins），保证前端即时刷新表格
+        res = await _mutate_then_fetch(background=True)
+        return JSONResponse({"ok": True, **res})
 
     @app.post("/api/plugins/scaffold")
     async def _plugin_scaffold(body: dict):
-        try:
-            info = pm.scaffold(str(body.get("name") or ""), body.get("provides") or None)
-            res = await _mutate_then_fetch()
-            return JSONResponse({"ok": True, "info": info, "plugins": res["plugins"]})
-        except Exception as exc:  # noqa: BLE001
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        info = pm.scaffold(str(body.get("name") or ""), body.get("provides") or None)
+        res = await _mutate_then_fetch(background=True)
+        return JSONResponse({"ok": True, "info": info, **res})
 
     @app.post("/api/plugins/remove")
     async def _plugin_remove(body: dict):
-        try:
-            info = pm.remove(str(body.get("id") or ""))
-            res = await _mutate_then_fetch()
-            return JSONResponse({"ok": True, "info": info, "plugins": res["plugins"]})
-        except Exception as exc:  # noqa: BLE001
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        info = pm.remove(str(body.get("id") or ""))
+        res = await _mutate_then_fetch(background=True)
+        return JSONResponse({"ok": True, "info": info, **res})
 
     # ---- 设置：上下文管理（前端「设置」页；覆盖持久化 + 即时重建生效） ----
 

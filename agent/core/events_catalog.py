@@ -43,8 +43,10 @@ class Events:
     # 记忆插件
     MEMORY_REMEMBERED = "agent/memory/remembered"
     MEMORY_RECALL = "agent/memory/recall"
-    # 上下文治理插件：agent/context/governed 事件名随 G1 接线（装配元数据 durable）
-    # 一并登记——SSOT 守卫要求常量被源码引用，未接线的名字不提前入册。
+
+    # 上下文治理插件（G1 分块装配）：装配元数据
+    # （各块实占 / 裁剪 / 命中 / 刚性超限 / 回吐；遥测性质，非安全 seam）
+    CONTEXT_GOVERNED = "agent/context/governed"
 
 
 def all_events() -> set[str]:
@@ -79,6 +81,7 @@ EVENT_MODE: dict[str, str] = {
     Events.REACT_EXHAUSTED: "emit",
     Events.MEMORY_REMEMBERED: "emit",
     Events.MEMORY_RECALL: "emit",
+    Events.CONTEXT_GOVERNED: "emit",      # G1：装配元数据遥测（无监听者即 no-op）
 }
 
 

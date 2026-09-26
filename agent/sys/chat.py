@@ -29,6 +29,7 @@ from agent.api import (
     ReactResultLike,
     Services,
     durable,
+    estimate_tokens,
     now_iso,
     plugin,
 )
@@ -74,6 +75,38 @@ def _env_facts(environ: dict | None = None) -> str:
         f"- 桌面: {desktop}\n"
         "- 文件类工具的相对路径以桌面为基准，能用相对路径就用相对路径（如 hello.py）"
     )
+
+
+@dataclass(slots=True)
+class _Assembled:
+    """装配结果（消费层本地视图；governor 的 Assembly 亦按同属性面消费，不 import 其类型）。"""
+
+    system_text: str
+    prior: list[dict]
+    report: Any = None          # governor 的 AssemblyReport（无治理器时为 None）
+
+
+def _fallback_assemble(blocks: list[dict]) -> _Assembled:
+    """无治理器（或治理器无 ``assemble`` 接缝）时的**降级装配**——复刻现状拼接语义。
+
+    规则（与治理器预算充足时逐字节等价，供对拍）：
+      - ``text`` 块：非空且 ``present``，按 ``priority`` 升序，以 ``\\n\\n`` 连接；
+      - ``messages`` 块：非空且 ``present``，按 ``coverage.lo`` 升序拼接，输出剥离内部 ``seq``。
+    """
+    texts = [b for b in blocks
+             if b.get("kind") == "text" and b.get("present")
+             and str(b.get("payload") or "").strip()]
+    texts.sort(key=lambda b: b.get("priority", 100))
+    system_text = "\n\n".join(str(b["payload"]) for b in texts)
+
+    msgs = [b for b in blocks
+            if b.get("kind") == "messages" and b.get("present") and b.get("payload")]
+    msgs.sort(key=lambda b: (b.get("coverage") or (0, 0))[0])
+    prior: list[dict] = []
+    for b in msgs:
+        for m in b["payload"]:
+            prior.append({k: v for k, v in m.items() if k != "seq"})
+    return _Assembled(system_text=system_text, prior=prior)
 
 
 @dataclass(slots=True)
@@ -215,16 +248,20 @@ class ChatDriver:
     # ---------- 短期记忆：prior 构造（内容层提供 + 调度层收窗） ----------
 
     async def _build_prior(self, ctx, session_id: str, message: str) -> list[dict]:
-        """构造喂给模型的会话上下文。
+        """构造喂给模型的会话上下文（经治理器 messages 块装配 + 统一互斥）。
 
         职责边界（关键）：
         - **短期记忆**提供内容（全量历史 + 滚动摘要前情）；
         - 历史**不再做收窗**（``pick_history`` 收窗机制已移除）：未摘要历史随对话增长，
           由短期记忆的滚动摘要（``maybe_compress`` + ``_threshold()``）按 token 阈值压缩晋升，
           压缩时机完全由 ``compact_trigger_tokens`` 决定；
+        - **统一互斥（左开右闭）**：summary 覆盖 ``(0, covers]``、history 覆盖 ``(covers, N]``，
+          边界由 ``covers_up_to_seq`` 单一来源派生；两块 ``coverage`` 作**入参**传给治理器
+          （governor 不反向查询），重叠由治理器统一剔除，绝不双份注入；
         - 单条超大工具/文件结果仍由 ``short_term.truncate_view`` 做可逆截短（安全网，非收窗）。
 
-        降级：短期记忆缺失 → 退回旧 ``HISTORY_LIMIT`` 条数硬裁（不劣化、不裸崩）。
+        降级：短期记忆缺失 → 退回旧 ``HISTORY_LIMIT`` 条数硬裁（不劣化、不裸崩）；
+        治理器缺失 → ``_fallback_assemble`` 降级拼接（与治理器等价）。
         """
         if ctx.has(Services.SHORT_TERM):
             short = ctx.get(Services.SHORT_TERM)
@@ -235,14 +272,23 @@ class ChatDriver:
             post = [m for m in raw_excl if m["seq"] > covers]
             post_view = short.truncate_view(post)
             summary = await short.latest_summary(ctx, session_id)
-            prior: list[dict] = []
+            blocks: list[dict] = []
             if summary:
-                prior.append({
-                    "role": "user",
-                    "content": "[会话前情 · 以下为历史摘要，仅供参考]\n" + summary,
+                blocks.append({
+                    "key": "summary", "kind": "messages", "present": True,
+                    "payload": [{"role": "user",
+                                 "content": "[会话前情 · 以下为历史摘要，仅供参考]\n" + summary,
+                                 "seq": covers}],
+                    "weight": 0.10, "coverage": (0, covers),
                 })
-            prior.extend(post_view)
-            return prior
+            if post_view:
+                hi = max(int(m["seq"]) for m in post_view)
+                blocks.append({
+                    "key": "history", "kind": "messages", "present": True,
+                    "payload": [dict(m) for m in post_view],
+                    "weight": 0.60, "coverage": (covers, hi),
+                })
+            return (await self._assemble(ctx, blocks, stage="prior")).prior
         # 降级：旧 HISTORY_LIMIT 条数硬裁（除本轮 user 外）
         history = await self._history(ctx, session_id, limit=HISTORY_LIMIT)
         return history[:-1]
@@ -265,6 +311,48 @@ class ChatDriver:
             await ctx.events.emit(Events.CHAT_RESET, {"session_id": session_id})
         return n
 
+    async def _assemble(self, ctx, blocks: list[dict], *, stage: str) -> _Assembled:
+        """经治理器分块装配（软依赖）；无治理器/无 ``assemble`` 接缝 → 降级拼接（不劣化）。
+
+        ``blocks`` 以 **dict** 传入——消费层不 import 插件契约类型（解耦纪律）。
+        装配后发 ``agent/context/governed`` 遥测事件（各块实占 / 裁剪 / 刚性超限 / 回吐）。
+        """
+        gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
+        asm = None
+        if gov is not None:
+            fn = getattr(gov, "assemble", None)
+            if callable(fn):
+                try:
+                    asm = fn(blocks)
+                except Exception as exc:      # noqa: BLE001 —— 装配失败退降级，绝不裸崩
+                    logging.getLogger("agent.chat").warning("context assemble failed: %s", exc)
+        out = (_Assembled(str(asm.system_text), list(asm.prior), getattr(asm, "report", None))
+               if asm is not None else _fallback_assemble(blocks))
+        await self._emit_governed(ctx, stage, out)
+        return out
+
+    async def _emit_governed(self, ctx, stage: str, out: _Assembled) -> None:
+        """发装配遥测事件（失败绝不阻断对话）。"""
+        if not ctx.has(Services.EVENTS):
+            return
+        rep = out.report
+        payload: dict = {"stage": stage, "at": now_iso(),
+                         "system_tokens": estimate_tokens(out.system_text)}
+        if rep is not None:
+            payload["input_budget"] = int(getattr(rep, "input_budget", 0))
+            payload["total_used"] = int(getattr(rep, "total_used", 0))
+            payload["redistributed"] = int(getattr(rep, "redistributed", 0))
+            payload["blocks"] = [
+                {"key": r.key, "present": r.present, "reason": r.reason,
+                 "requested": r.requested, "allocated": r.allocated, "used": r.used}
+                for r in getattr(rep, "blocks", [])
+            ]
+            payload["rigid_overflow"] = [r.key for r in getattr(rep, "rigid_overflow", [])]
+        try:
+            await ctx.events.emit(Events.CONTEXT_GOVERNED, payload)
+        except Exception as exc:              # noqa: BLE001 —— 遥测失败不阻断
+            logging.getLogger("agent.chat").warning("context governed emit failed: %s", exc)
+
     async def _memory_block(self, ctx, query: str) -> str:
         if not ctx.has(Services.MEMORY):
             return ""
@@ -277,17 +365,21 @@ class ChatDriver:
 
     async def _plan(self, ctx, message: str, prior: list[dict]) -> dict:
         sm = ctx.get(Services.SYSTEM_MEMORY) or ""
-        system = MARK_CHAT_PLAN
-        if sm:                                       # 系统记忆：静态底座（声明层，前置注入）
-            system += "\n" + sm
-        system += "\n" + PLAN_SYSTEM
         mem = await self._memory_block(ctx, message)
-        if mem:
-            system += "\n\n" + mem
         tools = self._tools_block(ctx)
-        if tools:
-            system += "\n\n" + tools
-        system += "\n\n" + _env_facts()
+        # 头部（标记 + 系统记忆 + 规划器提示）作为**单个刚性块**，保证与降级拼接逐字节一致。
+        head = MARK_CHAT_PLAN + ("\n" + sm if sm else "") + "\n" + PLAN_SYSTEM
+        blocks = [
+            {"key": "plan_head", "kind": "text", "present": True, "payload": head,
+             "rigid": True, "priority": 0},
+            {"key": "memory", "kind": "text", "present": bool(mem), "payload": mem,
+             "weight": 0.0, "priority": 10},
+            {"key": "tools", "kind": "text", "present": bool(tools), "payload": tools,
+             "weight": 0.0, "priority": 20},
+            {"key": "env", "kind": "text", "present": True, "payload": _env_facts(),
+             "rigid": True, "priority": 90},
+        ]
+        system = (await self._assemble(ctx, blocks, stage="plan")).system_text
         messages = ([{"role": "system", "content": system}] + list(prior)
                     + [{"role": "user", "content": message}])
         try:
@@ -355,13 +447,16 @@ class ChatDriver:
         snippet = json.dumps({"plan": plan, "evidence": evidence},
                              ensure_ascii=False)
         sm = ctx.get(Services.SYSTEM_MEMORY) or ""
-        system = MARK_CHAT_ANSWER
-        if sm:                                       # 系统记忆：静态底座（声明层，前置注入）
-            system += "\n" + sm
-        system += "\n" + ANSWER_SYSTEM + "\n\n证据 JSON:\n" + snippet
         mem = await self._memory_block(ctx, message)
-        if mem:
-            system += "\n\n" + mem
+        head = (MARK_CHAT_ANSWER + ("\n" + sm if sm else "") + "\n" + ANSWER_SYSTEM
+                + "\n\n证据 JSON:\n" + snippet)
+        blocks = [
+            {"key": "answer_head", "kind": "text", "present": True, "payload": head,
+             "rigid": True, "priority": 0},
+            {"key": "memory", "kind": "text", "present": bool(mem), "payload": mem,
+             "weight": 0.0, "priority": 10},
+        ]
+        system = (await self._assemble(ctx, blocks, stage="narrate")).system_text
         messages = ([{"role": "system", "content": system}] + list(prior)
                     + [{"role": "user", "content": message}])
         try:

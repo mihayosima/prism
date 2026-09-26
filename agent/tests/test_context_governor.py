@@ -230,3 +230,255 @@ def test_context_config_node_passes_validation(tmp_path):
         assert c.root.has(Services.CONTEXT)
 
     _run(s())
+
+
+# ---- G1 分块装配（assemble） ----
+
+
+def test_assemble_present_filter_and_priority_order():
+    """注册制：present=False / 空内容不参与；text 块按 priority 升序 _SEP 连接。"""
+    from agent.plugins.context import BlockSpec
+    g = ContextGovernor(max_context_tokens=1_000_000, reserve_output_tokens=0)
+    asm = g.assemble([
+        BlockSpec("a", "text", True, "AAA", rigid=True, priority=20),
+        BlockSpec("b", "text", True, "BBB", rigid=True, priority=10),
+        BlockSpec("c", "text", False, "CCC", priority=0),      # absent
+        BlockSpec("d", "text", True, "   ", priority=5),       # empty → 跳过
+    ])
+    assert asm.system_text == "BBB\n\nAAA"
+    by = {r.key: r for r in asm.report.blocks}
+    assert by["c"].reason == "absent" and by["d"].reason == "empty"
+    assert by["a"].reason == "ok" and by["b"].reason == "ok"
+
+
+def test_assemble_report_is_dataclass_not_dict():
+    """Assembly.report 为 AssemblyReport dataclass（非裸 dict）。"""
+    from agent.plugins.context import Assembly, AssemblyReport, BlockReport, BlockSpec
+    g = ContextGovernor()
+    asm = g.assemble([BlockSpec("x", "text", True, "hi")])
+    assert isinstance(asm, Assembly)
+    assert isinstance(asm.report, AssemblyReport)
+    assert all(isinstance(r, BlockReport) for r in asm.report.blocks)
+    assert asm.report.input_budget == g.input_budget()
+
+
+def test_assemble_weight_renormalize_when_block_absent():
+    """存在块间重归一：memory 缺席 → tools 份额上升（静态比例作废）。"""
+    from agent.plugins.context import BlockSpec
+    g = ContextGovernor(max_context_tokens=400, reserve_output_tokens=0)
+    big_tools = "t" * 4000
+    big_hist = [{"role": "user", "content": "h" * 4000, "seq": 1}]
+
+    def alloc(asm, key):
+        return next(r.allocated for r in asm.report.blocks if r.key == key)
+
+    with_mem = g.assemble([
+        BlockSpec("memory", "text", True, "m" * 4000, weight=0.10),
+        BlockSpec("tools", "text", True, big_tools, weight=0.20),
+        BlockSpec("history", "messages", True, big_hist, weight=0.60),
+    ])
+    no_mem = g.assemble([
+        BlockSpec("tools", "text", True, big_tools, weight=0.20),
+        BlockSpec("history", "messages", True, big_hist, weight=0.60),
+    ])
+    assert alloc(no_mem, "tools") > alloc(with_mem, "tools")
+
+
+def test_assemble_redistribute_surplus_to_truncated_block():
+    """剩余回吐（water-filling）：小需求块的未用余量回吐给被截断块，redistributed>0。"""
+    from agent.plugins.context import BlockSpec
+    ib = 1000
+    g = ContextGovernor(max_context_tokens=ib, reserve_output_tokens=0)
+    asm = g.assemble([
+        BlockSpec("memory", "text", True, "x", weight=0.10),          # 需求极小
+        BlockSpec("tools", "text", True, "t" * 8000, weight=0.20),    # 需求巨大
+    ])
+    mem = next(r for r in asm.report.blocks if r.key == "memory")
+    tools = next(r for r in asm.report.blocks if r.key == "tools")
+    assert mem.used == mem.requested            # 小需求块落定（用满）
+    assert tools.allocated > 600                # 回吐抬高（单轮份额 1000×0.2/0.3≈666）
+    assert asm.report.redistributed > 0
+
+
+def test_assemble_rigid_overflow_dual_channel():
+    """刚性超限：report.rigid_overflow 非空 + system_text 含显式降级标注（双通道）。"""
+    from agent.plugins.context import BlockSpec
+    g = ContextGovernor(max_context_tokens=50, reserve_output_tokens=0)
+    asm = g.assemble([
+        BlockSpec("k1", "text", True, "a" * 100, rigid=True, priority=0),   # ≈26 tok，先满足
+        BlockSpec("k2", "text", True, "b" * 400, rigid=True, priority=1),   # ≈101 tok，超限降级
+    ])
+    assert asm.report.rigid_overflow                              # report 通道
+    assert "上下文预算超限" in asm.system_text                      # 文本通道
+    by = {r.key: r for r in asm.report.blocks}
+    assert by["k1"].reason == "ok"
+    assert by["k2"].reason == "downgraded"
+    assert by["k2"].used < by["k2"].requested
+
+
+def test_assemble_coverage_left_open_right_closed():
+    """左开右闭：covers 归 summary（(0,covers]），covers+1 起归 history（(covers,N]），无重复。"""
+    from agent.plugins.context import BlockSpec
+    g = ContextGovernor(max_context_tokens=1_000_000, reserve_output_tokens=0)
+    covers = 3
+    hist = [{"role": "user", "content": f"m{i}", "seq": i} for i in range(covers + 1, 7)]  # 4..6
+    asm = g.assemble([
+        BlockSpec("summary", "messages", True,
+                  [{"role": "user", "content": "前情", "seq": covers}],  # seq=covers 属 summary
+                  weight=0.1, coverage=(0, covers)),
+        BlockSpec("history", "messages", True, hist, weight=0.6, coverage=(covers, 6)),
+    ])
+    contents = [m["content"] for m in asm.prior]
+    assert contents == ["前情", "m4", "m5", "m6"]        # summary 在前，history 在后，无重复
+    assert all("seq" not in m for m in asm.prior)        # 输出剥离内部 seq
+
+
+def test_assemble_mutex_drops_overlap():
+    """重叠区间：history 误含已覆盖 seq → 治理器剔除，绝不双份注入。"""
+    from agent.plugins.context import BlockSpec
+    g = ContextGovernor(max_context_tokens=1_000_000, reserve_output_tokens=0)
+    asm = g.assemble([
+        BlockSpec("summary", "messages", True,
+                  [{"role": "user", "content": "前情", "seq": 3}],
+                  weight=0.1, coverage=(0, 3)),
+        BlockSpec("history", "messages", True,
+                  [{"role": "user", "content": "dup3", "seq": 3},     # 重叠（应被剔除）
+                   {"role": "user", "content": "ok4", "seq": 4}],
+                  weight=0.6, coverage=(3, 4)),
+    ])
+    contents = [m["content"] for m in asm.prior]
+    assert "dup3" not in contents
+    assert "前情" in contents and "ok4" in contents
+
+
+def test_assemble_total_within_budget_when_flexible():
+    """可裁块场景：非刚性块总实占不超过 input_budget（回吐不越界）。"""
+    from agent.plugins.context import BlockSpec
+    ib = 300
+    g = ContextGovernor(max_context_tokens=ib, reserve_output_tokens=0)
+    asm = g.assemble([
+        BlockSpec("tools", "text", True, "t" * 4000, weight=0.2),
+        BlockSpec("history", "messages", True,
+                  [{"role": "user", "content": "h" * 4000, "seq": 1}], weight=0.6),
+    ])
+    flex_used = sum(r.used for r in asm.report.blocks
+                    if r.reason in ("ok", "trimmed", "downgraded"))
+    assert flex_used <= ib
+
+
+# ---- 降级对拍（Step2：plan 段接入不劣化） ----
+
+
+def test_fallback_assemble_replicates_plan_concat():
+    """fallback 精确保留现状拼接语义（头部 \\n、块间 \\n\\n）。"""
+    from agent.sys.chat import _fallback_assemble, MARK_CHAT_PLAN, PLAN_SYSTEM
+    head = MARK_CHAT_PLAN + "\n" + "SM" + "\n" + PLAN_SYSTEM
+    blocks = [
+        {"key": "plan_head", "kind": "text", "present": True, "payload": head,
+         "rigid": True, "priority": 0},
+        {"key": "memory", "kind": "text", "present": True, "payload": "MEM", "priority": 10},
+        {"key": "tools", "kind": "text", "present": True, "payload": "TOOLS", "priority": 20},
+        {"key": "env", "kind": "text", "present": True, "payload": "ENV", "priority": 90},
+    ]
+    assert _fallback_assemble(blocks).system_text == head + "\n\nMEM\n\nTOOLS\n\nENV"
+
+
+def test_fallback_byte_equal_to_governor_when_budget_ample():
+    """预算充足时，governor.assemble（含 dict 入参）与 chat._fallback_assemble 逐字节等价。"""
+    from agent.sys.chat import _fallback_assemble, MARK_CHAT_PLAN, PLAN_SYSTEM
+    g = ContextGovernor(max_context_tokens=1_000_000, reserve_output_tokens=0)
+    head = MARK_CHAT_PLAN + "\n" + "SM" + "\n" + PLAN_SYSTEM
+    blocks = [
+        {"key": "plan_head", "kind": "text", "present": True, "payload": head,
+         "rigid": True, "priority": 0},
+        {"key": "memory", "kind": "text", "present": True, "payload": "MEM", "priority": 10},
+        {"key": "tools", "kind": "text", "present": True, "payload": "TOOLS", "priority": 20},
+        {"key": "env", "kind": "text", "present": True, "payload": "ENV",
+         "rigid": True, "priority": 90},
+        {"key": "summary", "kind": "messages", "present": True,
+         "payload": [{"role": "user", "content": "S", "seq": 1}],
+         "weight": 0.1, "coverage": (0, 1)},
+        {"key": "history", "kind": "messages", "present": True,
+         "payload": [{"role": "user", "content": "H", "seq": 2}],
+         "weight": 0.6, "coverage": (1, 2)},
+    ]
+    asm_gov = g.assemble(blocks)                 # dict 入参（同时覆盖 _coerce）
+    asm_fb = _fallback_assemble(blocks)
+    assert asm_gov.system_text == asm_fb.system_text
+    assert asm_gov.prior == asm_fb.prior
+
+
+def test_fallback_byte_equal_when_block_absent():
+    """块缺失（memory/tools absent）时两者仍等价——空块不占位、不产生多余分隔符。"""
+    from agent.sys.chat import _fallback_assemble, MARK_CHAT_PLAN, PLAN_SYSTEM
+    g = ContextGovernor(max_context_tokens=1_000_000, reserve_output_tokens=0)
+    head = MARK_CHAT_PLAN + "\n" + PLAN_SYSTEM       # 无系统记忆
+    blocks = [
+        {"key": "plan_head", "kind": "text", "present": True, "payload": head,
+         "rigid": True, "priority": 0},
+        {"key": "memory", "kind": "text", "present": False, "payload": "", "priority": 10},
+        {"key": "tools", "kind": "text", "present": False, "payload": "", "priority": 20},
+        {"key": "env", "kind": "text", "present": True, "payload": "ENV",
+         "rigid": True, "priority": 90},
+    ]
+    assert g.assemble(blocks).system_text == head + "\n\nENV"
+    assert g.assemble(blocks).system_text == _fallback_assemble(blocks).system_text
+
+
+def test_governor_receives_covers_as_param_not_reverse_query(tmp_path):
+    """架构约束⑤：``covers`` 由 chat 经 ``BlockSpec.coverage`` **入参**传入，
+    governor 不反向查询 short_term（避免循环依赖）。"""
+    from agent.api import plugin as plugin_dec
+
+    captured: dict = {}
+
+    @plugin_dec
+    class SpyGovPlugin:
+        name = "aaa.spy_gov"          # 排在 plugins.context 之前 → 接缝注入生效
+        provides: list = []
+        inject: list = []
+
+        async def apply(self, ctx) -> None:
+            class _Spy:
+                def input_budget(self) -> int:
+                    return 1_000_000
+
+                def memory_budget(self) -> int:
+                    return 0
+
+                def history_budget(self) -> int:
+                    return 0
+
+                def source_clip_budget(self) -> int:
+                    return 0
+
+                def pick_history(self, messages, budget=None, *, keep_first=False):
+                    return (list(messages), 0)
+
+                def assemble(self, blocks):
+                    import agent.plugins.context as _ctxpkg
+                    captured["blocks"] = list(blocks)
+                    return _ctxpkg.Assembly(system_text="", prior=[],
+                                            report=_ctxpkg.AssemblyReport())
+
+            ctx.provide("context.governor", _Spy())
+
+    pm = _pm(tmp_path)
+    pm.set_enabled("plugins.short_term", True)
+    c = build_agent(config={"db_path": str(tmp_path / "agent.db")}, plugin_mgr=pm,
+                    extra_plugins=(SpyGovPlugin,))
+
+    async def s():
+        await c.assemble()
+        short = c.root.get(Services.SHORT_TERM)
+        for i in range(6):
+            await short.append(c.root, "z", "user", f"消息{i}")
+        await short._store.upsert_summary(c.root, "z", summary="前情", version=1,
+                                          covers_up_to_seq=4, tokens=5)
+        await c.root.chat._build_prior(c.root, "z", "x")
+        blocks = {b["key"]: b for b in captured["blocks"]}
+        assert blocks["summary"]["coverage"] == (0, 4)      # 左开右闭：summary=(0,covers]
+        assert blocks["history"]["coverage"] == (4, 5)      # history=(covers,N]，N=末条历史 seq
+        await c.teardown()
+
+    _run(s())
