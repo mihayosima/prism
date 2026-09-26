@@ -8,8 +8,7 @@
 
 from __future__ import annotations
 
-from agent.api import Events, Services, StateKeys, durable, now_iso, plugin
-from agent.sys.llm import _tokens
+from agent.api import Events, Services, StateKeys, durable, estimate_tokens, now_iso, plugin
 
 
 @plugin
@@ -29,9 +28,9 @@ class Budget:
 
         async def _pre(payload: dict, next) -> dict:
             # est 覆盖 messages + tools 目录 + schema（S1：不再漏算请求侧开销）
-            est = (_tokens(payload.get("messages", []))
-                   + _tokens(payload.get("tools") or [])
-                   + _tokens(payload.get("schema") or {}))
+            est = (estimate_tokens(payload.get("messages", []))
+                   + estimate_tokens(payload.get("tools") or [])
+                   + estimate_tokens(payload.get("schema") or {}))
             spent = ctx.state.get(StateKeys.BUDGET_SPENT, 0)
             if max_tokens and spent + est > max_tokens:
                 return {"denied": True,

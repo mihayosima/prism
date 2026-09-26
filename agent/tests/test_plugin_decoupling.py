@@ -34,7 +34,8 @@ def _py_files() -> list[Path]:
         if "__pycache__" in parts or "tests" in parts:
             continue
         rel = fp.relative_to(AGENT)
-        if rel.parts[0] not in ("core", "sys", "plugins") and rel.name != "api.py":
+        # run/ 纳入扫描（2026-09-26 审查 P1：run/chat.py 曾直连 agent_memories 漏检）
+        if rel.parts[0] not in ("core", "sys", "plugins", "run") and rel.name != "api.py":
             continue
         out.append(fp)
     return sorted(out)
@@ -174,20 +175,40 @@ def test_inject_never_couples_two_plugins():
 # 3) 数据表归属
 # ---------------------------------------------------------------------------
 
-# 业务表 -> 归属插件（唯一 owner）
+# 业务表 -> 归属插件（唯一 owner）。
+# 注意：键必须是**真实表名**（tables.py 建表名）。曾误登记 `agent_memory`（实际表
+# `agent_memories` 的子串）→ 子串断言空转、run 层直连漏检（2026-09-26 审查 P1）。
 TABLE_OWNER = {
     "agent_messages": "plugins/short_term",
     "agent_session_summaries": "plugins/short_term",
-    "agent_memory": "plugins/memory",
+    "agent_memories": "plugins/memory",
     "agent_memory_edges": "plugins/memory",
     "agent_entities": "plugins/memory",
+    "agent_budget_log": "sys",   # owner = sys/budget（唯一写方；sys 层内互信，插件/run 不得直连）
 }
-# 内核表：审计脊柱 / 运行状态 / 插件状态，各层只读可接受
-KERNEL_TABLES = {"agent_events", "agent_runs", "agent_plugin_state"}
+# 内核审计脊柱：各层只读展示可接受（agent_events 落盘于库；agent_plugin_state 是
+# **JSON 文件**不是表、agent_runs 已废弃——二者不得出现在本清单，见存在性精确断言）。
+KERNEL_TABLES = {"agent_events"}
 # 建表与迁移：集中登记点，正当
 MIGRATION_FILES = {"tables.py", "storage.py"}
 
 _SQL = re.compile(r"(?:FROM|INSERT\s+INTO|UPDATE|DELETE\s+FROM|JOIN)\s+(agent_\w+)", re.I)
+
+
+def _sql_text(fp: Path) -> str:
+    """提取文件全部字符串字面量（AST 级）拼接，供 SQL 归属比对。
+
+    行级启发式会被跨行字符串拼接（SQL 换行书写，如 run/chat.py 的多行 SELECT）
+    绕过——动词与表名不在同一物理行即漏检。AST 提取不受换行影响；docstring 亦为
+    字符串常量，但比对只认「SQL 动词短语 + agent_ 表名」同现，纯叙述不触发。
+    """
+    try:
+        tree = ast.parse(fp.read_text(encoding="utf-8"))
+    except Exception:                                    # pragma: no cover
+        return ""
+    parts = [n.value for n in ast.walk(tree)
+             if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    return "\n".join(parts)
 
 
 def test_table_ownership_respected():
@@ -196,32 +217,31 @@ def test_table_ownership_respected():
         if fp.name in MIGRATION_FILES:
             continue
         who = _layer(fp)
-        try:
-            lines = fp.read_text(encoding="utf-8").splitlines()
-        except Exception:                                # pragma: no cover
+        text = _sql_text(fp)
+        if not text:
             continue
-        for ln in lines:
-            s = ln.strip()
-            if s.startswith("#") or s.startswith('"""') or s.startswith("'''"):
-                continue                                  # 注释/docstring 里的表名不算访问
-            if not re.search(r"SELECT|INSERT|UPDATE|DELETE", ln, re.I):
+        for t in _SQL.findall(text):
+            owner = TABLE_OWNER.get(t)
+            if owner is None:
                 continue
-            for t in _SQL.findall(ln):
-                owner = TABLE_OWNER.get(t)
-                if owner is None:
-                    continue
-                if t in KERNEL_TABLES:
-                    continue
-                if who == owner:
-                    continue
-                bad.append((str(fp.relative_to(AGENT)), t, owner))
+            if t in KERNEL_TABLES:
+                continue
+            if who == owner:
+                continue
+            bad.append((str(fp.relative_to(AGENT)), t, owner))
     assert not bad, (
         "数据表被非归属方直连（数据层耦合，应经 owner 插件的接口）:\n"
         + "\n".join(f"  {f} 直连 {t}（归 {o}）" for f, t, o in bad))
 
 
 def test_every_owned_table_exists_in_migrations():
-    """归属声明必须与建表清单对得上（防止 owner 表写错名字 / 表被删后残留声明）。"""
-    tables_py = (AGENT / "tables.py").read_text(encoding="utf-8")
+    """归属声明必须与建表清单**精确**对应（防幻影表名 / 子串假阳性）。
+
+    曾用子串断言 `t in tables_py`："agent_memory" 是 "agent_memories" 的子串 →
+    幻影表名空转通过（2026-09-26 审查 P1 三层失守之一）。改为按 DDL 精确提取表名集合。
+    """
+    text = (AGENT / "tables.py").read_text(encoding="utf-8")
+    declared = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", text))
+    assert declared, "tables.py 未提取到任何建表语句（正则与 DDL 形状脱节）"
     for t in TABLE_OWNER:
-        assert t in tables_py, f"{t} 未出现在 agent/tables.py 建表清单中"
+        assert t in declared, f"{t} 未在 agent/tables.py 建表（幻影表名或拼写错误）"

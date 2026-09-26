@@ -53,6 +53,10 @@ class ShortTermMemory:
     async def latest_summary(self, ctx: Any, session_id: str) -> str | None:
         return await self._store.latest_summary(ctx, session_id)
 
+    async def summary_meta(self, ctx: Any, session_id: str) -> dict | None:
+        """摘要元数据（含 ``covers_up_to_seq``），供装配时排除已被摘要覆盖的历史。"""
+        return await self._store.get_summary_meta(ctx, session_id)
+
     async def get_original_messages(self, ctx: Any, session_id: str,
                                     start_seq: int, end_seq: int) -> list[dict]:
         return await self._store.get_original_messages(ctx, session_id, start_seq, end_seq)

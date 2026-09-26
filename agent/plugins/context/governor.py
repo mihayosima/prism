@@ -4,7 +4,8 @@
   记忆块 ``memory_ratio`` · 历史窗口 ``history_ratio`` · 其余归 system/工具块/本轮消息。
 裁剪一律按 token（``core.tokens.estimate_tokens``），不再按条数。
 
-G0 只提供预算查询 + 历史收窗（``pick_history``）；分块装配（G1）、
+G0 提供预算查询 + 历史收窗（``pick_history``，收窗机制已从消费方移除、当前未调用，
+保留供未来 G1 分块装配复用）；分块装配（G1）、
 会话压缩摘要（G1）、MCP 源头护栏（G3）按阶段接线，消费面全部软依赖
 ``ctx.has(Services.CONTEXT)``——插件停用即退回各消费方现状，不劣化不裸崩。
 """
@@ -72,7 +73,7 @@ class ContextGovernor:
         """MCP 源头护栏上限（G3 接线用；G0 先固化口径）。"""
         return self.source_clip_tokens
 
-    # ---- 历史收窗 ----
+    # ---- 历史收窗（收窗机制已从 chat/compactor 移除调用；本方法暂未使用，保留供 G1 复用） ----
 
     def pick_history(
         self,

@@ -219,27 +219,29 @@ class ChatDriver:
 
         职责边界（关键）：
         - **短期记忆**提供内容（全量历史 + 滚动摘要前情）；
-        - **上下文治理**做调度收窗（``pick_history`` 决定窗口留多少条）；
-        - 本地截短（窗口内可逆）属内容层，由 ``short_term.truncate_view`` 对选中老内容凝练。
+        - 历史**不再做收窗**（``pick_history`` 收窗机制已移除）：未摘要历史随对话增长，
+          由短期记忆的滚动摘要（``maybe_compress`` + ``_threshold()``）按 token 阈值压缩晋升，
+          压缩时机完全由 ``compact_trigger_tokens`` 决定；
+        - 单条超大工具/文件结果仍由 ``short_term.truncate_view`` 做可逆截短（安全网，非收窗）。
 
-        降级：短期记忆或治理器缺失 → 退回旧 ``HISTORY_LIMIT`` 条数硬裁（不劣化、不裸崩）。
+        降级：短期记忆缺失 → 退回旧 ``HISTORY_LIMIT`` 条数硬裁（不劣化、不裸崩）。
         """
-        if ctx.has(Services.SHORT_TERM) and ctx.has(Services.CONTEXT):
+        if ctx.has(Services.SHORT_TERM):
             short = ctx.get(Services.SHORT_TERM)
-            raw = await short.get_history(ctx, session_id)      # seq ASC，含本轮 user（最新）
-            raw_excl = raw[:-1] if raw else []                 # 排除本轮 user（调用方单独追加）
+            raw = await short.get_history(ctx, session_id)
+            raw_excl = raw[:-1] if raw else []
+            meta = await short.summary_meta(ctx, session_id)
+            covers = int(meta["covers_up_to_seq"]) if meta else 0
+            post = [m for m in raw_excl if m["seq"] > covers]
+            post_view = short.truncate_view(post)
             summary = await short.latest_summary(ctx, session_id)
-            governor = ctx.get(Services.CONTEXT)
-            budget = governor.history_budget()
-            kept, _ = governor.pick_history(raw_excl, budget, keep_first=True)
-            kept_view = short.truncate_view(kept)               # 内容层窗口内截短（老内容，可逆）
             prior: list[dict] = []
             if summary:
                 prior.append({
                     "role": "user",
                     "content": "[会话前情 · 以下为历史摘要，仅供参考]\n" + summary,
                 })
-            prior.extend(kept_view)
+            prior.extend(post_view)
             return prior
         # 降级：旧 HISTORY_LIMIT 条数硬裁（除本轮 user 外）
         history = await self._history(ctx, session_id, limit=HISTORY_LIMIT)

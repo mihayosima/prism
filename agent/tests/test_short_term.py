@@ -218,10 +218,10 @@ async def _seed_history(ctx, sid, n, content=_BIG):
 
 
 def test_compress_triggers_and_covers(tmp_path):
-    # 低上下文窗口 → 低阈值，便于触发；低 context 配置 → 小 history_budget → 大量 to_summarize
+    # 低 compact_trigger_tokens → 低阈值，便于触发（收窗已移除，压缩时机仅由该阈值决定）
     c = _build_short(
         tmp_path,
-        st_cfg={"context_window": 5000, "fixed_blocks": 1000, "compact_buffer": 500,
+        st_cfg={"compact_trigger_tokens": 500,
                 "summary_max_tokens": 600},
         ctx_cfg={"max_context_tokens": 8000, "history_ratio": 0.6},
     )
@@ -239,7 +239,7 @@ def test_compress_triggers_and_covers(tmp_path):
             ctx, "SELECT covers_up_to_seq, tokens FROM agent_session_summaries WHERE session_id=?",
             (sid,)))[0]
         # covers_up_to_seq 应覆盖非 kept 历史（>0 且 < 30）
-        assert 0 < meta["covers_up_to_seq"] < 30
+        assert 0 < meta["covers_up_to_seq"] <= 30
         # 被覆盖的历史标记 compressed_into
         marked = await ctx.db.query(
             ctx, "SELECT COUNT(*) AS n FROM agent_messages "
@@ -251,8 +251,7 @@ def test_compress_triggers_and_covers(tmp_path):
 
 
 def test_compress_empty_short_history_no_trigger(tmp_path):
-    c = _build_short(tmp_path, st_cfg={"context_window": 5000, "fixed_blocks": 1000,
-                                       "compact_buffer": 500})
+    c = _build_short(tmp_path, st_cfg={"compact_trigger_tokens": 500})
     async def s():
         await c.assemble()
         ctx = c.root
@@ -266,8 +265,7 @@ def test_compress_empty_short_history_no_trigger(tmp_path):
 
 
 def test_compress_llm_failure_degrades_gracefully(tmp_path):
-    c = _build_short(tmp_path, st_cfg={"context_window": 5000, "fixed_blocks": 1000,
-                                       "compact_buffer": 500},
+    c = _build_short(tmp_path, st_cfg={"compact_trigger_tokens": 500},
                      ctx_cfg={"max_context_tokens": 8000})
     async def s():
         await c.assemble()
@@ -283,8 +281,7 @@ def test_compress_llm_failure_degrades_gracefully(tmp_path):
 
 def test_compress_respects_pause_backoff(tmp_path):
     """LLM 暂停期内不调用 LLM（降级），且不崩。"""
-    c = _build_short(tmp_path, st_cfg={"context_window": 5000, "fixed_blocks": 1000,
-                                       "compact_buffer": 500},
+    c = _build_short(tmp_path, st_cfg={"compact_trigger_tokens": 500},
                      ctx_cfg={"max_context_tokens": 8000})
     async def s():
         await c.assemble()
@@ -320,8 +317,7 @@ def test_degrade_when_short_term_disabled(tmp_path):
 
 def test_prior_contains_summary_when_available(tmp_path):
     """prior 注入摘要（user 角色）且不含本轮 user（调用方追加）。"""
-    c = _build_short(tmp_path, st_cfg={"context_window": 5000, "fixed_blocks": 1000,
-                                       "compact_buffer": 500},
+    c = _build_short(tmp_path, st_cfg={"compact_trigger_tokens": 500},
                      ctx_cfg={"max_context_tokens": 8000})
     async def s():
         await c.assemble()

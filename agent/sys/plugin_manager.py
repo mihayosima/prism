@@ -6,6 +6,14 @@
 - 诚实边界：装配在启动时一次性完成 → 启停为「重启/重建后生效」（不热插拔）；卸载 = 停用 + 删目录 + removed 标记。
 
 独立实现：零 import 引擎（与 agent 运行时同一纪律）。
+
+⚠️ 双命名空间语义（有意取舍，消费方须知）：
+目录插件经本管理器以文件路径加载，模块登记在 ``agent_plugins.<包名>`` 命名空间下——
+与常规导入路径 ``agent.plugins.<包名>`` 下的同名类**不是同一对象**。因此：
+- 对目录插件实例做 ``isinstance(x, agent.plugins.xxx.Cls)`` 会**失败**；
+  比较类型请用 ``type(x).__name__``，或依赖 ``@plugin`` 元数据（name/provides）。
+- 插件之间、插件对内核**不得**经 ``agent.plugins.*`` 导入互通（分层守卫本就禁止）；
+  本语义只影响测试/诊断中的类型识别，不影响装配与运行。
 """
 
 from __future__ import annotations
@@ -187,6 +195,11 @@ class PluginManager:
         return out
 
     # ---------- 内部 ----------
+
+    @property
+    def state_file(self) -> Path:
+        """期望态文件路径（公开只读；诊断/控制台展示用，勿写）。"""
+        return self._state_file
 
     def _read_state(self) -> dict:
         if not self._state_file.exists():

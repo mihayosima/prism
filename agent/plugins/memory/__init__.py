@@ -183,6 +183,16 @@ class MemoryStore:
         rows = await self._db.query(ctx, "SELECT * FROM agent_memories WHERE kind=?", (kind,))
         return [_from_row(r) for r in rows]
 
+    async def recent_rows(self, ctx, limit: int = 40) -> list[dict]:
+        """只读：最近记忆行（UI 展示用；归属表唯一出口在 owner 插件内）。"""
+        return await self._db.query(
+            ctx,
+            "SELECT id, kind, content, score_observed, created_at, last_accessed_at,"
+            " accessed_count, invalid_at, source FROM agent_memories"
+            " ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+
     async def delete(self, ctx, mid: str) -> None:
         await self._db.execute(ctx, "DELETE FROM agent_memories WHERE id=?", (mid,))
 
@@ -294,6 +304,10 @@ class MemoryDriver:
             out.append(d)
         await durable(ctx, Events.MEMORY_RECALL, {"query": query, "hits": len(out), "at": now})
         return out
+
+    async def list_recent(self, ctx, limit: int = 40) -> list[dict]:
+        """只读：最近记忆行（无打分、不 touch）——UI 展示走本接口，消费方零 SQL。"""
+        return await self._store.recent_rows(ctx, limit)
 
     async def context(self, ctx, query: str, limit: int = 5, max_chars: int = 1200) -> str:
         """组装记忆上下文块（to_messages 本地版），翻越上限即截断。"""

@@ -11,7 +11,6 @@ from agent.api import Services
 from agent.core.tokens import clip_json, clip_text, estimate_tokens
 from agent.plugins.context import ContextGovernor
 from agent.profiles import build_agent
-from agent.sys.llm import _tokens
 from agent.sys.plugin_manager import PluginManager
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent / "plugins"
@@ -37,13 +36,11 @@ def _build(tmp_path, *, enable: bool = True, patch: dict | None = None):
 
 
 def test_estimate_tokens_cjk_ascii_mixed():
-    """CJK 0.75 token/字、ASCII 4 字符/token（json.dumps 含引号包装，计入开销）；
-    sys.llm._tokens 别名与 core 同源。"""
+    """CJK 0.75 token/字、ASCII 4 字符/token（json.dumps 含引号包装，计入开销）。"""
     assert estimate_tokens("abcd") == 1                     # '"abcd"' 6 字符 → 1 token
     assert estimate_tokens("你好") == 2                     # '"你好"' 4 字符 + 2 CJK×0.75
     assert estimate_tokens("你是谁") > estimate_tokens("hi")  # 中文不再被 len//4 低估
-    long_cjk = "上下文治理" * 50
-    assert estimate_tokens(long_cjk) == _tokens(long_cjk)   # 兼容别名同源
+    assert estimate_tokens("上下文治理" * 50) > 100          # 长中文按 0.75 token/字增长
 
 
 def test_clip_text_under_limit_and_head_tail():

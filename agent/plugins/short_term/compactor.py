@@ -7,8 +7,9 @@
 - **失败处理**：递增退避（§8）+ 按原因分类 + 恢复探测（探测失败只续期）+ 降级路径
   （LLM 失败→仅本地截短；本地截短失败→不截短喂原文；插件/治理器停用→HISTORY_LIMIT 硬裁）。
 
-严格不在本模块做"调度决策"（收窗 = ``ctx.get(Services.CONTEXT).pick_history`` 是治理器的事）；
-本模块只决定"被丢弃的历史怎么凝练成前情"。
+本模块只决定"被丢弃的历史怎么凝练成前情"。收窗机制已移除，本模块不再咨询治理器
+``pick_history``；压缩候选直接取全部未摘要历史（seq > covers），压缩时机由 ``_threshold()``
+（``compact_trigger_tokens``，可配）单独决定。
 """
 
 from __future__ import annotations
@@ -48,10 +49,13 @@ class HistoryCompactor:
     # ---- 配置 ----
 
     def _threshold(self) -> int:
-        cw = int(self._cfg.get("context_window", 300000))
-        fb = int(self._cfg.get("fixed_blocks", 80000))
-        cb = int(self._cfg.get("compact_buffer", 13000))
-        return max(0, (cw - fb) - cb)
+        """压缩触发门槛（token）：未摘要历史（本地截短后）达到此值即压缩。
+
+        收窗机制已移除，压缩时机完全由本阈值决定。对用户开放可调：
+        ``agent.short_term.compact_trigger_tokens``（默认 12000，与旧收窗预算同量级，
+        远小于模型上下文窗口，确保未摘要历史一增长即压缩，上下文紧致、成本低）。
+        """
+        return int(self._cfg.get("compact_trigger_tokens", 12000))
 
     def _budgets(self) -> dict[str, int]:
         return {
@@ -91,18 +95,9 @@ class HistoryCompactor:
         meta = await self._store.get_summary_meta(ctx, session_id)
         covers = int(meta["covers_up_to_seq"]) if meta else 0
 
-        # 调度层收窗（短期记忆**咨询**治理器，不拥有该决策）
-        governor = ctx.get(Services.CONTEXT)
-        if governor is not None and hasattr(governor, "pick_history"):
-            budget = governor.history_budget()
-            keep_first = bool(self._cfg.get("keep_first", True))
-            kept, _ = governor.pick_history(raw, budget, keep_first=keep_first)
-        else:
-            kept = raw                                   # 无治理器：全部 kept，不压缩
-        kept_seqs = {m["seq"] for m in kept}
-
-        # 被裁历史 = 未被 kept 且未被旧摘要覆盖
-        to_sum = [m for m in raw if m["seq"] > covers and m["seq"] not in kept_seqs]
+        # 收窗机制已移除：压缩时机完全由 _threshold() 决定（compact_trigger_tokens，可配）。
+        # 压缩候选 = 全部未摘要历史（seq > covers，即上一轮摘要尚未覆盖的部分）。
+        to_sum = [m for m in raw if m["seq"] > covers]
         if len(to_sum) < self._min_messages():
             return                                     # 没多少可压：不算失败
 

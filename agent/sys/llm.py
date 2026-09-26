@@ -36,14 +36,6 @@ class LlmResult:
     provider: str = "fixture"
 
 
-def _tokens(obj: Any) -> int:
-    """tokens 估算——兼容别名：实现已转正 ``core.tokens.estimate_tokens``（G0）。
-
-    旧口径 ``len//4`` 对中文系统性低估 2–3 倍（S1 修正），budget 预借以本函数为准。
-    """
-    return estimate_tokens(obj)
-
-
 class PlaceholderLlm:
     """占位 Provider（无法直接 import 大模型 SDK 的真实实现未接入 → 诚实拒绝，不虚标）。"""
 
@@ -72,6 +64,11 @@ class LlmService:
     @property
     def provider_label(self) -> str:
         return getattr(self._provider, "label", type(self._provider).__name__)
+
+    @property
+    def model(self) -> str:
+        """当前模型名（公开只读；控制台状态栏展示用）。"""
+        return self._model
 
     async def complete(self, ctx, messages: list[dict], *,
                        schema: dict | None = None, tools: list[dict] | None = None,
@@ -103,10 +100,10 @@ class LlmService:
         # S6：优先用 provider 返回的真实 usage 入账（诚实口径）；无则回退估算。
         usage = data.pop("usage", None) if isinstance(data, dict) else None
         if usage and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
-            tokens_in = int(usage.get("prompt_tokens") or 0) or _tokens(messages)
-            tokens_out = int(usage.get("completion_tokens") or 0) or _tokens(data)
+            tokens_in = int(usage.get("prompt_tokens") or 0) or estimate_tokens(messages)
+            tokens_out = int(usage.get("completion_tokens") or 0) or estimate_tokens(data)
         else:
-            tokens_in, tokens_out = _tokens(messages), _tokens(data)
+            tokens_in, tokens_out = estimate_tokens(messages), estimate_tokens(data)
         await ctx.events.emit(Events.LLM_POST_CALL, {
             "provider": self._model, "tokens_in": tokens_in, "tokens_out": tokens_out,
             "caller": caller,
@@ -429,4 +426,4 @@ class LlmPlugin:
         ctx.provide(Services.LLM, LlmService(provider, model))
 
 
-__all__ = ["LlmPlugin", "LlmResult", "LlmService", "LlmProvider", "PlaceholderLlm", "_tokens"]
+__all__ = ["LlmPlugin", "LlmResult", "LlmService", "LlmProvider", "PlaceholderLlm"]

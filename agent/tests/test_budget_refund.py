@@ -6,9 +6,8 @@ import asyncio
 
 import pytest
 
-from agent.api import CapabilityNotImplemented
+from agent.api import CapabilityNotImplemented, estimate_tokens
 from agent.profiles import build_agent
-from agent.sys.llm import _tokens
 
 
 def _run(coro):
@@ -51,7 +50,7 @@ def test_successful_call_reconciles_to_actual(tmp_path):
             await asyncio.sleep(0)
         spent = c.root.state.get("budget_spent", 0)
         # 实际入账 = tokens_in(messages) + tokens_out(响应)；预借多出的部分已回冲
-        actual = _tokens(messages) + _tokens({"text": "（fixture 默认响应）"})
+        actual = estimate_tokens(messages) + estimate_tokens({"text": "（fixture 默认响应）"})
         assert spent == actual, f"对账后 spent 应等于实际入账 {actual}，得到 {spent}"
         assert not c.root.state.get("budget_pending_est")
         rows = await c.root.db.query(
@@ -65,7 +64,7 @@ def test_successful_call_reconciles_to_actual(tmp_path):
 def test_cjk_estimate_no_longer_undercounts():
     """旧口径 len//4 对中文低估 2–3 倍；新口径 CJK 按 0.75 token/字。"""
     payload = {"t": "你好" * 100}          # 200 个 CJK 字符
-    est = _tokens(payload)
+    est = estimate_tokens(payload)
     import json
     legacy = len(json.dumps(payload, ensure_ascii=False)) // 4
     assert est >= 120, f"CJK 估算应 ≥ 0.6 token/字，得到 {est}"

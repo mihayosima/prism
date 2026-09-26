@@ -16,6 +16,7 @@ import asyncio
 import json
 import sys
 import uuid
+from pathlib import Path
 
 from agent.api import Services, StateKeys
 from agent.profiles import build_agent
@@ -43,11 +44,92 @@ def _cfg(args: argparse.Namespace) -> dict:
             "agent": {"llm": {"provider": provider, "model": args.model}}}
 
 
+# ---- 插件配置覆盖（前端「设置」持久化；与插件启停期望态分离，单文件存储） ----
+_OVERRIDE_FILE = Path("data/agent_plugin_config.json")
+
+
+def _load_overrides() -> dict:
+    """读取用户对插件运行时配置的覆盖（data/agent_plugin_config.json）。
+
+    形态：``{ "plugins.<名>": {键: 值, ...}, ... }``；缺失/损坏返回空 dict（不裸崩）。
+    """
+    if not _OVERRIDE_FILE.exists():
+        return {}
+    try:
+        return json.loads(_OVERRIDE_FILE.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 —— 损坏按空处理，不阻断启动
+        return {}
+
+
+def _save_overrides(data: dict) -> None:
+    _OVERRIDE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _OVERRIDE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(_OVERRIDE_FILE)
+
+
+def _merge_cfg(args: argparse.Namespace) -> dict:
+    """基础 config（_cfg）+ 用户覆盖，注入 build_agent。
+
+    覆盖按 ``plugins.<名>`` → ``agent.<名>`` 映射并入对应插件配置节（均为 _any，免改 schema）。
+    """
+    cfg = _cfg(args)
+    ov = _load_overrides()
+    agent = cfg.setdefault("agent", {})
+    for pid, pconf in (ov or {}).items():
+        if not isinstance(pid, str) or not pid.startswith("plugins."):
+            continue
+        if not isinstance(pconf, dict):
+            continue
+        base = pid[len("plugins."):]
+        node = agent.setdefault(base, {})
+        node.update(pconf)
+    return cfg
+
+
+# ---- 上下文管理设置项 schema（前端「设置 → 上下文管理」可调） ----
+# 校验/钳制：键 → (类型, 下限, 上限)；归属插件由 _PLUGIN_OF_KEY 路由。
+_SETTING_SCHEMA = {
+    "compact_trigger_tokens": (int, 256, 1_000_000),      # 来自 plugins.short_term
+    "max_context_tokens": (int, 1024, 1_000_000),
+    "reserve_output_tokens": (int, 0, 1_000_000),
+    "memory_ratio": (float, 0.01, 0.99),
+    "history_ratio": (float, 0.01, 0.99),
+    "source_clip_tokens": (int, 0, 1_000_000),
+}
+_PLUGIN_OF_KEY = {
+    "compact_trigger_tokens": "plugins.short_term",
+    "max_context_tokens": "plugins.context",
+    "reserve_output_tokens": "plugins.context",
+    "memory_ratio": "plugins.context",
+    "history_ratio": "plugins.context",
+    "source_clip_tokens": "plugins.context",
+}
+_SETTING_DEFAULTS = {
+    "compact_trigger_tokens": 12000,
+    "max_context_tokens": 24000,
+    "reserve_output_tokens": 4000,
+    "memory_ratio": 0.10,
+    "history_ratio": 0.60,
+    "source_clip_tokens": 8192,
+}
+
+
+def _coerce_setting(key: str, raw) -> int | float:
+    if key not in _SETTING_SCHEMA:
+        raise ValueError(f"未知设置项: {key}")
+    typ, lo, hi = _SETTING_SCHEMA[key]
+    val = typ(raw)
+    if val < lo or val > hi:
+        raise ValueError(f"{key} 须落在 [{lo}, {hi}]")
+    return val
+
+
 async def _boot(args: argparse.Namespace):
     from agent.sys.plugin_manager import PluginManager
 
     pm = PluginManager(plugin_dir="agent/plugins", state_file="data/agent_plugin_state.json")
-    c = build_agent(config=_cfg(args), plugin_mgr=pm)
+    c = build_agent(config=_merge_cfg(args), plugin_mgr=pm)
     await c.assemble()
     await c.start()
     return c, pm
@@ -179,6 +261,7 @@ pre.json{background:#0d0f13;color:#c9d6ec;padding:10px 12px;border-radius:8px;ov
   <button class="nav-item" data-view="plugins"><span class="ic">🔌</span>插件</button>
   <button class="nav-item" data-view="memory"><span class="ic">🧠</span>记忆</button>
   <button class="nav-item" data-view="tools"><span class="ic">🛠️</span>工具</button>
+  <button class="nav-item" data-view="settings"><span class="ic">⚙️</span>设置</button>
   <div class="nav-foot" id="machine">…</div>
 </nav>
 <div class="main">
@@ -207,6 +290,7 @@ pre.json{background:#0d0f13;color:#c9d6ec;padding:10px 12px;border-radius:8px;ov
   <section data-view="perms"><div class="panel" id="permsBox"></div></section>
   <section data-view="memory"><div class="panel" id="memoryBox"></div></section>
   <section data-view="tools"><div class="panel" id="toolsBox"></div></section>
+  <section data-view="settings"><div class="panel" id="settingsBox"></div></section>
   <section data-view="plugins">
     <div class="panel">
       <div class="rowline" style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
@@ -342,6 +426,23 @@ async function loadSession(){
     $('#messages').innerHTML='';
     (j.history||[]).forEach(m=>addMsg(m.role==='user'?'user':'agent', m.content, null));
   }catch(e){}}
+function renderPlugins(rows){
+  let h='<h3>插件（agent/plugins · 改后立即重建生效）</h3><table><tr><th>id</th><th>layer</th><th>provides</th><th>版本</th><th>状态</th><th>操作</th></tr>';
+  h+=rows.map(p=>{const key=esc(p.name||p.id);let ops='—';
+    if(p.delta!=='system/builtin'){
+      ops='<button class="chip" data-plug-act="enable" data-key="'+key+'" data-enable="'+(p.desired?'false':'true')+'">'+(p.desired?'停用':'启用')+'</button> '
+        +'<button class="chip" data-plug-act="remove" data-key="'+key+'" style="color:var(--err)">移除</button>';}
+    let st,cls;
+    if(p.delta==='system/builtin'){st='系统/内置';cls='ok';}
+    else if(p.desired&&p.actual){st='已启用';cls='ok';}
+    else if(p.desired&&!p.actual){st='启用中（重启生效）';cls='run';}
+    else if(!p.desired&&p.actual){st='未启用（重启生效）';cls='run';}
+    else {st='未启用';cls='';}
+    return '<tr><td>'+key+'</td><td>'+esc(p.layer||'')+'</td><td>'+esc((p.provides||[]).join(','))+'</td><td>'+esc(p.version||'')+'</td>'
+      +'<td><span class="tag '+cls+'">'+esc(st)+'</span></td><td>'+ops+'</td></tr>';}).join('');
+  h+='</table><div class="muted" style="margin-top:6px;font-size:11.5px">新增插件：填名字与 provides → 新增插件（自动启用并重建生效）；系统/内置业务不可管理（与引擎同语义）。</div>';
+  $('#pluginsBox').innerHTML=h;
+}
 async function load(name){
   try{const j=await (await fetch('/api/'+name)).json();
     if(name==='events'){
@@ -354,17 +455,7 @@ async function load(name){
         +'<div class="card"><pre class="json">'+esc(json2(jj))+'</pre></div>'
         +'<h3>最近裁决（agent/permission/decision，durable）</h3>'
         +(j.recent&&j.recent.length?tableFrom(j.recent.slice(0,20),['seq','payload','at']):'<div class="empty">暂无裁决</div>');}
-    else if(name==='plugins'){
-      const rows=j.plugins||[];
-      let h='<h3>插件（agent/plugins · 改后立即重建生效）</h3><table><tr><th>id</th><th>layer</th><th>provides</th><th>版本</th><th>状态</th><th>操作</th></tr>';
-      h+=rows.map(p=>{const key=esc(p.name||p.id);let ops='—';
-        if(p.delta!=='system/builtin'){
-          ops='<button class="chip" data-plug-act="enable" data-key="'+key+'" data-enable="'+(p.desired?'false':'true')+'">'+(p.desired?'停用':'启用')+'</button> '
-            +'<button class="chip" data-plug-act="remove" data-key="'+key+'" style="color:var(--err)">移除</button>';}
-        return '<tr><td>'+key+'</td><td>'+esc(p.layer||'')+'</td><td>'+esc((p.provides||[]).join(','))+'</td><td>'+esc(p.version||'')+'</td>'
-          +'<td><span class="tag '+(String(p.delta||'').startsWith('enabled')?'ok':'run')+'">'+esc(p.delta||'')+'</span></td><td>'+ops+'</td></tr>';}).join('');
-      h+='</table><div class="muted" style="margin-top:6px;font-size:11.5px">新增插件：填名字与 provides → 新增插件（自动启用并重建生效）；系统/内置业务不可管理（与引擎同语义）。</div>';
-      $('#pluginsBox').innerHTML=h;}
+        else if(name==='plugins'){ renderPlugins(j.plugins||[]); }
     else if(name==='memory'){
       if(j.enabled===false){
         $('#memoryBox').innerHTML='<h3>记忆</h3><div class="empty">记忆插件（plugins.memory）未启用 —— 在「插件」页点「启用」后生效。</div>';return;}
@@ -381,6 +472,7 @@ async function load(name){
         +'<div class="mono" style="margin-top:4px">params='+esc(json2(t.params||{}))+' · required='+esc((t.required||[]).join(','))+'</div></div>').join('')
         :'<div class="empty">暂无工具（接入 windows-mcp 等工具插件后出现）</div>';
       $('#toolsBox').innerHTML=h;}
+    else if(name==='settings'){ renderSettings(j); }
   }catch(e){$('#'+name+'Box').innerHTML='<div class="card e">'+esc(e.message)+'</div>';}}
 let evFilter='all';
 let plugBusy=false;
@@ -389,18 +481,64 @@ async function plugAction(payload){
   try{
     const r=await fetch('/api/plugins/'+payload.act,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload.body||{})});
     const j=await r.json();
-    if(!j.ok&&r.status>=400)alert('失败：'+(j.error||r.status));
-    await load('plugins');await loadStatus();
+    if(!j.ok&&r.status>=400){alert('失败：'+(j.error||r.status));return;}
+    if(j.plugins) renderPlugins(j.plugins); else await load('plugins');
+    await loadStatus();
   }catch(e){alert('失败：'+e.message);}finally{plugBusy=false;}
 }
 $('#pluginsBox').addEventListener('click',e=>{
   const b=e.target.closest('[data-plug-act]');if(!b)return;
   const act=b.dataset.plugAct, key=b.dataset.key;
   if(act==='remove'&&!confirm('移除 '+key+' ？'))return;
+  if(act==='enable'&&b.dataset.enable==='false'&&!confirm('确定停用 '+key+' ？\n停用后需重启服务才会彻底卸载，期间仍装配于当前进程。'))return;
   plugAction(act==='enable'
     ?{act:'enable',body:{id:key,enable:b.dataset.enable==='true'}}
     :{act:'remove',body:{id:key}});
 });
+function renderSettings(j){
+  const box=$('#settingsBox');
+  if(j.context_plugin_enabled!==true){
+    box.innerHTML='<h3>上下文管理</h3><div class="card muted">上下文管理插件（plugins.context）未启用 —— 在「插件」页点「启用」后，可在此调整参数。</div>';return;}
+  const v=j.values||{};
+  const fields=[
+    ['compact_trigger_tokens','压缩触发阈值 (token)','未摘要历史达到此值即压缩（压缩时机由该阈值单独决定）'],
+    ['max_context_tokens','上下文窗口上限 (token)','治理器输入窗口总预算上限'],
+    ['reserve_output_tokens','输出余量 (token)','预留给模型输出的 token，不计入输入预算'],
+    ['memory_ratio','记忆块占比','长期记忆注入配额占输入预算的比例 (0~1)'],
+    ['history_ratio','历史窗口占比','历史消息窗口占输入预算的比例 (0~1)'],
+    ['source_clip_tokens','MCP 源头护栏 (token)','外部源头内容的最大裁剪上限'],
+  ];
+  const isFloat=k=>(k==='memory_ratio'||k==='history_ratio');
+  let h='<h3>上下文管理 <span class="tag blue">plugins.context 已启用</span></h3>'
+    +'<div class="card"><div class="muted" style="margin-bottom:10px">启用上下文管理插件时可调；保存后立即重建容器生效。覆盖写入 data/agent_plugin_config.json，重启后保持。</div>';
+  h+=fields.map(([k,label,hint])=>'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px">'+esc(label)+'</div>'
+    +'<input id="set_'+k+'" type="number" step="'+(isFloat(k)?'0.01':'1')+'" value="'+esc(v[k])+'" style="width:240px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit">'
+    +'<div class="muted" style="font-size:11px;margin-top:3px">'+esc(hint)+'</div></label>').join('');
+  h+='<div style="margin-top:16px"><button class="btn" id="saveSettings">保存</button> '
+    +'<button class="btn ghost" id="resetSettings">恢复默认</button> <span class="muted" id="setMsg"></span></div></div>';
+  box.innerHTML=h;
+  $('#saveSettings').onclick=saveSettings;
+  $('#resetSettings').onclick=resetSettings;
+}
+async function saveSettings(){
+  const isFloat=k=>(k==='memory_ratio'||k==='history_ratio');
+  const keys=['compact_trigger_tokens','max_context_tokens','reserve_output_tokens','memory_ratio','history_ratio','source_clip_tokens'];
+  const patch={};
+  for(const k of keys){const el=$('#set_'+k);if(el&&el.value!==''){patch[k]=isFloat(k)?parseFloat(el.value):parseInt(el.value,10);}}
+  $('#setMsg').textContent='保存中…';
+  try{const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({patch})});
+    const j=await r.json();if(!j.ok){$('#setMsg').textContent='失败：'+(j.error||r.status);return;}
+    $('#setMsg').textContent='已保存并重建生效 ✓';renderSettings(j.settings);}
+  catch(e){$('#setMsg').textContent='失败：'+e.message;}
+}
+async function resetSettings(){
+  if(!confirm('恢复上下文管理默认参数？当前覆盖将被清除。'))return;
+  $('#setMsg').textContent='恢复中…';
+  try{const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset:true})});
+    const j=await r.json();if(!j.ok){$('#setMsg').textContent='失败：'+(j.error||r.status);return;}
+    $('#setMsg').textContent='已恢复默认 ✓';renderSettings(j.settings);}
+  catch(e){$('#setMsg').textContent='失败：'+e.message;}
+}
 document.addEventListener('DOMContentLoaded',()=>{
   $('#chips').innerHTML=chips.map(c=>'<button class="chip">'+c+'</button>').join('');
   loadStatus();loadSession();
@@ -422,7 +560,7 @@ document.addEventListener('DOMContentLoaded',()=>{
     const provides=$('#pprovides').value.split(',').map(s=>s.trim()).filter(Boolean);
     plugAction({act:'scaffold',body:{name,provides:provides.length?provides:null}});
     $('#pname').value='';$('#pprovides').value='';};
-  load('perms');load('plugins');load('memory');load('tools');
+  load('perms');load('plugins');load('memory');load('tools');load('settings');
 });
 </script></body></html>
 """
@@ -466,9 +604,9 @@ async def _serve(args: argparse.Namespace) -> int:
                                      ensure_ascii=False) + "\n\n"
 
     async def _apply_rebuild() -> None:
-        """按当前 config + 当前插件期望态重建容器（管理操作即时生效）。"""
+        """按当前 config（含用户覆盖）+ 当前插件期望态重建容器（管理操作即时生效）。"""
         old = c._c
-        c2 = build_agent(config=dict(old.root.config), plugin_mgr=pm)
+        c2 = build_agent(config=_merge_cfg(args), plugin_mgr=pm)
         await c2.assemble()
         await c2.start()
         try:
@@ -563,7 +701,7 @@ async def _serve(args: argparse.Namespace) -> int:
         svc = c.root.get(Services.LLM)
         budget_cfg = ((c.root.config or {}).get("agent") or {}).get("budget") or {}
         return {"provider_label": getattr(svc, "provider_label", "?"),
-                "model": getattr(svc, "_model", "?"),
+                "model": getattr(svc, "model", "?"),
                 "version": __import__("agent").__version__,
                 "session_id": session_id,
                 "budget": {"spent": c.root.state.get(StateKeys.BUDGET_SPENT, 0),
@@ -604,10 +742,8 @@ async def _serve(args: argparse.Namespace) -> int:
         if not c.root.has(Services.MEMORY):
             return {"enabled": False, "stats": {"by_kind": {}, "total": 0}, "rows": []}
         stats = await c.root.memory.stats(c.root)
-        rows = await c.root.db.query(
-            c.root, "SELECT id, kind, content, score_observed, created_at, last_accessed_at,"
-                    " accessed_count, invalid_at, source FROM agent_memories"
-                    " ORDER BY created_at DESC LIMIT 40")
+        # 只读列表经 owner 插件接口获取（零 SQL；2026-09-26 解耦审查 P1 收口）
+        rows = await c.root.memory.list_recent(c.root, limit=40)
         return {"enabled": True, "stats": stats, "rows": rows}
 
     # ---- 插件管理（引擎式：desired/actual/delta；改动即时重建生效） ----
@@ -638,7 +774,7 @@ async def _serve(args: argparse.Namespace) -> int:
             rows.append({**m, "name": m["id"], "desired": True, "actual": True,
                          "delta": "system/builtin",
                          "status": status_map.get(m["id"])})
-        return {"plugins": rows, "state_exists": pm._state_file.exists()}
+        return {"plugins": rows, "state_exists": pm.state_file.exists()}
 
     async def _mutate_then_fetch() -> dict:
         await _apply_rebuild()
@@ -670,6 +806,52 @@ async def _serve(args: argparse.Namespace) -> int:
             return JSONResponse({"ok": True, "info": info, "plugins": res["plugins"]})
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    # ---- 设置：上下文管理（前端「设置」页；覆盖持久化 + 即时重建生效） ----
+
+    @app.get("/api/settings")
+    async def _settings() -> dict:
+        ctx_enabled = "plugins.context" in set(pm.enabled())
+        ov = _load_overrides()
+        st = ov.get("plugins.short_term", {}) or {}
+        cx = ov.get("plugins.context", {}) or {}
+        values: dict[str, int | float] = {}
+        for k in _SETTING_SCHEMA:
+            try:
+                values[k] = _coerce_setting(k, cx.get(k, st.get(k, _SETTING_DEFAULTS[k])))
+            except (ValueError, TypeError):
+                values[k] = _SETTING_DEFAULTS[k]
+        return {"context_plugin_enabled": ctx_enabled, "values": values}
+
+    @app.post("/api/settings")
+    async def _settings_update(body: dict):
+        try:
+            if bool(body.get("reset")):
+                ov = _load_overrides()
+                for pid in ("plugins.context", "plugins.short_term"):
+                    ov.pop(pid, None)
+                _save_overrides(ov)
+                await _apply_rebuild()
+                return JSONResponse({"ok": True, "settings": await _settings()})
+            patch = body.get("patch") or {}
+            if not isinstance(patch, dict) or not patch:
+                return JSONResponse({"ok": False, "error": "patch 为空"}, status_code=400)
+            buckets: dict[str, dict] = {}
+            for k, v in patch.items():
+                if k not in _SETTING_SCHEMA:
+                    return JSONResponse({"ok": False, "error": f"未知设置项: {k}"}, status_code=400)
+                coerced = _coerce_setting(k, v)
+                buckets.setdefault(_PLUGIN_OF_KEY[k], {})[k] = coerced
+            ov = _load_overrides()
+            for pid, b in buckets.items():
+                cur = dict(ov.get(pid, {}))
+                cur.update(b)
+                ov[pid] = cur
+            _save_overrides(ov)
+            await _apply_rebuild()
+            return JSONResponse({"ok": True, "settings": await _settings()})
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"ok": False, "error": f"参数错误: {exc}"}, status_code=400)
 
     url = f"http://{args.host}:{args.port}"
     print(f"Agent Harness 就绪: {url}   （Ctrl+C 退出）", file=sys.stderr)
