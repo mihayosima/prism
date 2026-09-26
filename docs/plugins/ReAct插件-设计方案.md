@@ -181,6 +181,9 @@ class Finalizer(Protocol):    # 收敛/触顶时产出最终答复（默认：�
 
 - **消息形状**：`{role: "system"|"assistant"|"user", content: str, tool_calls?: [...], tool_results?: [...]}`（纯 dict，可 JSON 化 —— 与事件面 payload 同纪律）。
 - **工具结果截断**：默认 2000 字符（配置 `tool_result_max_chars`），超出截断并附 `…(truncated)`。**这是本次必做**，否则多步必然撑爆上下文。
+  > **2026-09-26（S4）变更**：该字符口径**已废弃**。单条结果上限统一为 **token 口径的源头护栏**
+  > （`core.tokens.guard_source`，在 `sys/tasks.invoke` 内执行，上限由 `context.source_clip_budget()` 决定，
+  > 默认 8192）。Actor 只做 `as_text`，不再截断；`tool_result_max_chars` 配置键已删。
 - **历史裁剪**：保留 首条 system + 最近 `history_keep` 条（默认 20）；中间的旧工具结果可折叠为一行摘要（先做简单裁剪，摘要压缩留后续）。
 - **与短期记忆的关系**：本轮 transcript 写入 `agent_messages`（session_id 维度），与现有一致；`react` **不读**记忆插件（记忆暂缓）。
 
@@ -226,7 +229,7 @@ class Finalizer(Protocol):    # 收敛/触顶时产出最终答复（默认：�
 [agent.react]              # 即 config["agent"]["react"]
 max_steps = 8              # 循环上限
 deadline_s = 120           # 整任务时延上限
-tool_result_max_chars = 2000
+# tool_result_max_chars = 2000   # ← S4 已删除：单条上限统一归 context.source_clip_tokens（源头护栏）
 history_keep = 20          # 保最近 N 条
 max_rejects = 3            # 同一工具被拒多少次即终止
 finalize_on_exceed = true  # 触顶时再答一次（不给工具）

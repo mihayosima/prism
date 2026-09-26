@@ -78,13 +78,10 @@ def as_text(value) -> str:
         return str(value)
 
 
-def truncate(value, max_chars: int) -> str:
-    """结果截断（多步循环的必备上下文治理）：超长即截断并**标注**截掉多少。"""
-    s = as_text(value)
-    if max_chars <= 0 or len(s) <= max_chars:
-        return s
-    return s[:max_chars] + f"…(truncated {len(s) - max_chars} chars)"
+# 注：旧 ``truncate(value, max_chars)``（字符口径 + ``…(truncated N chars)`` 标注）已随
+# S4 删除 —— 结果体积上限统一归**源头护栏**（``core.tokens.guard_source``，token 口径），
+# Actor 只做 ``as_text``。旧字样由 ``tests/test_source_guard.py`` 静态守卫禁回。
 
 
 __all__ = ["TURN_MARK", "FINAL_MARK", "REACT_SYSTEM", "FINAL_SYSTEM",
-           "env_facts", "render_tools", "build_system", "as_text", "truncate"]
+           "env_facts", "render_tools", "build_system", "as_text"]

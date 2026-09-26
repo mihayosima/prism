@@ -24,7 +24,7 @@
   （``react --软--> context``，单向）。职责不重叠：本插件只做「块内准备·逐条折叠」，
   治理器只做「预算裁剪·整块丢弃 + 末条保底」。治理器缺失 → 退回 ``_trim`` 条数裁剪。
 
-文件：``prompt.py``（提示词/工具目录/截断）· ``components.py``（四组件接缝）·
+文件：``prompt.py``（提示词/工具目录）· ``components.py``（四组件接缝）·
 ``loop.py``（主循环 + 三把闸 + 循环内窗口）。
 """
 
@@ -63,7 +63,6 @@ class React:
         rcfg = ReactConfig(
             max_steps=int(cfg.get("max_steps", 8)),
             deadline_s=float(cfg.get("deadline_s", 120.0)),
-            tool_result_max_chars=int(cfg.get("tool_result_max_chars", 2000)),
             history_keep=int(cfg.get("history_keep", 20)),
             max_rejects=int(cfg.get("max_rejects", 3)),
             finalize_on_exceed=bool(cfg.get("finalize_on_exceed", True)),
@@ -72,8 +71,7 @@ class React:
         )
         # 四组件 = 可选注入的接缝服务（与 ctx.llm 的 provider 选择同构）
         reasoner = ctx.get("react.reasoner") or DefaultReasoner()
-        actor = ctx.get("react.actor") or DefaultActor(
-            max_chars=rcfg.tool_result_max_chars)
+        actor = ctx.get("react.actor") or DefaultActor(caller="plugins.react")
         observer = ctx.get("react.observer") or DefaultObserver()
         finalizer = ctx.get("react.finalizer") or DefaultFinalizer()
         ctx.provide(Services.REACT, ReactLoop(reasoner, actor, observer, finalizer, rcfg))

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent.api import clip_text, estimate_tokens
+from agent.api import clip_text, clip_text_hard, estimate_tokens
 
 from .protocols import Assembly, AssemblyReport, BlockReport, BlockSpec
 
@@ -244,17 +244,12 @@ class ContextGovernor:
         )
 
     def _clip_hard(self, text: str, budget: int) -> str:
-        """``clip_text`` 的省略标注自身有 token 开销，可能致结果略超预算 →
-        按超出比例迭代收缩目标，直至实占 <= 预算（保证装配合约）。"""
-        if budget <= 0:
-            return ""
-        out = text
-        for _ in range(4):
-            t = estimate_tokens(out)
-            if t <= budget:
-                break
-            out, _ = clip_text(out, max(1, int(budget * budget / max(1, t))))
-        return out
+        """定点硬裁：保证 ``estimate_tokens(结果) <= budget``（省略标注开销已计入）。
+
+        **复用 ``core.tokens.clip_text_hard``**（S4 起全仓唯一硬裁实现，本方法仅留薄封装，
+        供块内既有调用点 ``clip_head_tail`` / ``_trim_text`` 不改动）。
+        """
+        return clip_text_hard(text, budget)[0]
 
     def _trim_text(self, text: str, budget: int) -> tuple[str, bool]:
         if budget <= 0:
@@ -311,7 +306,14 @@ class ContextGovernor:
         if not keep_idx:                            # 4) 末条保底
             i = len(messages) - 1
             m = dict(messages[i])
-            m["content"] = self._clip_hard(str(m.get("content", "")), budget)
+            content = str(m.get("content", ""))
+            # 外壳开销入账：message dict 自身（role/seq/…）也占额度，须先扣再裁 content。
+            # （漏扣则整块 used 会超出 allocated —— 旧 _clip_hard 的过度收缩曾掩盖此缺陷。）
+            reserve = max(0, toks[i] - estimate_tokens(content))
+            m["content"] = self._clip_hard(content, max(1, budget - reserve))
+            over = estimate_tokens(m) - budget      # 单字段裁 + 骨架开销的舍入残差，再收一次
+            if over > 0:
+                m["content"] = self._clip_hard(content, max(1, budget - reserve - over - 1))
             override[i] = m
             keep_idx.add(i)
             clipped = True

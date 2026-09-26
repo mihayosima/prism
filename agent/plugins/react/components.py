@@ -18,7 +18,7 @@ from typing import Protocol
 
 from agent.api import AgentError, CapabilityNotImplemented
 
-from .prompt import FINAL_SYSTEM, truncate
+from .prompt import FINAL_SYSTEM, as_text
 
 
 @dataclass(slots=True)
@@ -118,10 +118,14 @@ class DefaultActor:
     - ``CapabilityNotImplemented``（guard/预算拒绝）→ ``denied=True`` 的 error 观察；
     - ``AgentError``（参数错 / 工具不存在）→ error 观察；
     - 其它异常（工具内部 bug）→ error 观察（不让一次工具崩溃掀翻整轮）。
+
+    **结果体积上限归源头护栏**（S4）：工具结果在 ``ctx.tasks.invoke`` 内即被
+    ``guard_source`` 按 ``context.source_clip_budget()`` 裁到 token 上限，
+    故本类**不再做字符截断**（旧 ``max_chars=2000`` 字符口径已删——字符与 token
+    在 CJK/ASCII 下差 3 倍，且与治理器口径互相打架）。此处只做 ``as_text`` 转文本。
     """
 
-    def __init__(self, *, max_chars: int = 2000, caller: str = "plugins.react"):
-        self._max_chars = max_chars
+    def __init__(self, *, caller: str = "plugins.react"):
         self._caller = caller
 
     async def act(self, ctx, calls) -> list[ToolResult]:
@@ -139,7 +143,7 @@ class DefaultActor:
         except Exception as exc:  # noqa: BLE001
             return ToolResult(call.name, f"异常：{type(exc).__name__}: {exc}", is_error=True,
                               tool_call_id=call.id)
-        return ToolResult(call.name, truncate(result, self._max_chars), tool_call_id=call.id)
+        return ToolResult(call.name, as_text(result), tool_call_id=call.id)
 
 
 class DefaultObserver:

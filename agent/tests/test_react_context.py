@@ -282,52 +282,7 @@ def test_ten_plus_step_chain_stays_within_budget(tmp_path):
     这是 S3 的原始动机——旧 ``_trim`` 只按**条数**裁剪，一条大观察即可撑爆窗口。
     """
     c = _build(tmp_path, patch={"agent": {
-        "react": {"max_steps": 12, "tool_result_max_chars": 8000},
-        "context": {"max_context_tokens": 4096, "reserve_output_tokens": 0}}})
-
-    async def s():
-        await c.assemble()
-
-        async def _big():
-            return "D" * 6000                                  # 每步 ≈1500 token
-
-        c.root.tasks.register(c.root, "test.big", schema={}, handler=_big,
-                              owner="test", description="返回大结果")
-
-        class _AlwaysTool:
-            async def reason(self, ctx, messages, tools):
-                from agent.plugins.react.components import ReasonOutput, ToolCall
-                return ReasonOutput(text="继续取数", tool_calls=[ToolCall("test.big", {}, "c1")],
-                                    tokens_in=1, tokens_out=1)
-
-        loop = c.root.react
-        loop._reasoner = _AlwaysTool()                          # 恒定请求工具 → 必然多步
-        got = _capture_governed(c.root)
-        r = await loop.run(c.root, "请反复取数直到触顶")
-        assert r.exhausted and r.steps == 12                    # 确实跑到步数闸
-        assert len(got) >= 10, f"步数不足（治理遥测 {len(got)} 条）"
-        for p in got:
-            assert p["total_used"] <= p["input_budget"]         # 每步都不溢出
-            rt = p["react"]
-            assert rt["chain_tokens"] <= max(1, rt["budget"])   # chain 实占不超其额度
-        assert got[-1]["react"]["chain_peak_tokens"] <= got[-1]["input_budget"]
-        await c.teardown()
-
-    _run(s())
-
-
-# ---------------------------------------------------------------------------
-# 端到端：10+ 步工具链不溢出（验收项 1）
-# ---------------------------------------------------------------------------
-
-
-def test_ten_plus_step_chain_stays_within_budget(tmp_path):
-    """12 步大观察工具链：循环内每步装配 **total_used <= input_budget**，chain 不超额度。
-
-    这是 S3 的原始动机——旧 ``_trim`` 只按**条数**裁剪，一条大观察即可撑爆窗口。
-    """
-    c = _build(tmp_path, patch={"agent": {
-        "react": {"max_steps": 12, "tool_result_max_chars": 8000},
+        "react": {"max_steps": 12},
         "context": {"max_context_tokens": 4096, "reserve_output_tokens": 0}}})
 
     async def s():

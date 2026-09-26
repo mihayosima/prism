@@ -275,12 +275,13 @@ ctx.react.run(ctx, prompt, *, session_id="default", prior=None) -> ReactResult
 - **三把闸**：`max_steps`（默认 8）· `deadline_s`（默认 120）· **token 预算**（不另写——每步都走 `ctx.llm`，`agent/llm/pre-call` 上 guard/budget 已生效）。
 - **失败即观察**：工具异常 / 参数错 / 被拒一律转成 `ToolResult(is_error=True)` 回灌，让模型自纠（**永不抛出**）；被拒另带 `denied=True`，同一工具连拒超 `max_rejects`（默认 3）才终止，防死循环。
 - **触顶诚实收尾**：durable `agent/react/exhausted` + 标注原因；可选再问一次模型（`finalize_on_exceed`，不给工具），失败退回证据兜底文本。**不崩、不静默、不假成功。**
-- **上下文治理**：工具结果按 `tool_result_max_chars`（默认 2000）截断并标注；喂给模型的窗口按 `history_keep` 裁剪（保 system + 首个用户请求 + 最近 N 条）。
+- **上下文治理**：工具结果由 **S4 源头护栏**（`sys/tasks.invoke` → `core.tokens.guard_source`，token 口径，上限 `context.source_clip_budget()`，默认 8192）在**离开工具时**裁掉并标注；喂给模型的窗口按 `history_keep` 裁剪（保 system + 首个用户请求 + 最近 N 条）。旧 `tool_result_max_chars`（2000 **字符**口径）已于 S4 删除。
 - **四组件接缝**（可换）：`Reasoner / Actor / Observer / Finalizer` 均为 Protocol；`ctx.provide("react.actor", ...)` 等任一注入即替换缺省实现（与 `ctx.llm` 的 provider 选择同构）。**approval 将来只需替换 `Actor`**。
 - **事件**：durable `agent/react/start|step|final|exhausted`（可重建一次 run 的轨迹）；live `agent/react/step/start|end`（前端进度）。
 - **零特权**：模型一律 `ctx.llm`，工具一律 `ctx.tasks.invoke`；`tables=()` ⇒ 卸载零残留。
 - **权限模式接口预留**（本次只落位置，行为不变）：`ctx.state["permission_mode"]` 状态位、`visible_tools(ctx)` 裁剪点（**恒返回全量**）、`Tool.risk` 元数据。
-- 配置 `config["agent"]["react"]`：`{max_steps, deadline_s, tool_result_max_chars, history_keep, max_rejects, finalize_on_exceed}`。
+- 配置 `config["agent"]["react"]`：`{max_steps, deadline_s, history_keep, max_rejects, finalize_on_exceed, react_keep_recent}`。
+  （单条工具结果上限**不在**此处：归 `config["agent"]["context"]["source_clip_tokens"]`，见 S4。）
 - 详见《ReAct插件-设计方案.md》（含四组件定义、启停组合矩阵、与 approval 的依赖方向）。
 
 ---

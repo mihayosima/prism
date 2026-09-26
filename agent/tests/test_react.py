@@ -22,18 +22,20 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _pm(tmp_path, *, react: bool = True) -> PluginManager:
+def _pm(tmp_path, *, react: bool = True, context: bool = False) -> PluginManager:
     """指向真实 agent/plugins 的管理器；期望态落 tmp，避免污染 data/。"""
     pm = PluginManager(plugin_dir=str(PLUGIN_DIR),
                        state_file=str(tmp_path / "state.json"))
     if react:
         pm.set_enabled("plugins.react", True)
+    if context:
+        pm.set_enabled("plugins.context", True)     # 源头护栏（S4）需治理器在线
     return pm
 
 
-def _build(tmp_path, *, react: bool = True, patch: dict | None = None):
+def _build(tmp_path, *, react: bool = True, context: bool = False, patch: dict | None = None):
     return build_agent(config={"db_path": str(tmp_path / "agent.db")},
-                       patch=patch, plugin_mgr=_pm(tmp_path, react=react))
+                       patch=patch, plugin_mgr=_pm(tmp_path, react=react, context=context))
 
 
 async def _echo(text: str = "hi"):
@@ -168,25 +170,32 @@ def test_token_budget_deny_exhausts_gracefully(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 用例 7：上下文治理（结果截断）
+# 用例 7：上下文治理（源头护栏）
 # ---------------------------------------------------------------------------
 
 
 def test_large_tool_result_truncated(tmp_path):
-    """用例 7：超长工具结果被截断并**标注**（多步循环不会撑爆上下文）。"""
-    c = _build(tmp_path, patch={"agent": {"react": {"tool_result_max_chars": 200}}})
+    """用例 7：超长工具结果被**源头护栏**裁到 token 上限并标注（多步循环不会撑爆上下文）。
+
+    S4 起：单条结果上限由 ``context.source_clip_budget()`` 唯一决定，在 ``tasks.invoke``
+    内生效（旧 ``tool_result_max_chars`` 字符口径已删——字符与 token 在 CJK/ASCII 下
+    差 3 倍）。此处刻意把上限定得很小以便断言。
+    """
+    c = _build(tmp_path, context=True,
+               patch={"agent": {"context": {"source_clip_tokens": 200}}})
 
     async def s():
         await c.assemble()
 
         async def _big():
-            return "X" * 5000
+            return "X" * 5000                                   # ≈1250 token，远超 200
 
         c.root.tasks.register(c.root, "test.big", schema={}, handler=_big, owner="test",
                               description="返回超大结果")
         r = await c.root.react.run(c.root, "请拿一次大结果")
         assert r.ok and not r.exhausted
-        assert any("truncated" in o["content"] for o in r.observations)
+        bodies = [o["content"] for o in r.observations]
+        assert bodies and any("[...省略" in b and "tokens...]" in b for b in bodies)
         await c.teardown()
 
     _run(s())

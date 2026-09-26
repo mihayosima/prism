@@ -63,7 +63,9 @@ class ReactConfig:
 
     max_steps: int = 8                 # 循环上限（步数闸）
     deadline_s: float = 120.0          # 整任务时延上限（时延闸）
-    tool_result_max_chars: int = 2000  # 单条工具结果截断（上下文治理）
+    # 注：单条工具结果上限**不在此处** —— 归源头护栏（S4：``context.source_clip_budget()``
+    #     经 ``sys/tasks.invoke`` 在结果离开工具时净化，token 口径）。
+    #     旧 ``tool_result_max_chars``（字符口径）已删除，避免与治理器口径打架。
     history_keep: int = 20             # 喂给模型的最近消息条数（**降级路径**裁剪口径）
     max_rejects: int = 3               # 同一工具被拒多少次即终止（防死循环）
     finalize_on_exceed: bool = True    # 触顶时再答一次（不给工具）

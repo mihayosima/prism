@@ -3,7 +3,8 @@
 - ``register(ctx, name, *, schema, handler, owner, risk)`` 注册即逆（teardown 对称移除）；
   ``risk`` 是工具风险元数据（read/write/danger，默认 write），随 ``catalog()`` 输出。
 - ``invoke`` 先过 ``agent/tasks/pre-execute``（capability，guard 挂这）→ schema 校验 → 执行
-  → ``agent/tasks/post-execute``（emit）→ 返回。
+  → **S4 源头护栏**（``_guard_result``：按 ``context.source_clip_budget()`` 净化结果体积）
+  → ``agent/tasks/post-execute``（emit，随行 ``clipped/omitted_tokens/limit_tokens``）→ 返回。
 - ``resolve(name)`` 返回 ``lambda **kw`` 可调用入口（面向 loop/桥，与引擎 TargetRegistry 同约定）。
 """
 
@@ -20,11 +21,36 @@ from agent.api import (
     Events,
     Services,
     current_plugin,
+    guard_source,
     now_iso,
     plugin,
 )
 
 logger = logging.getLogger("agent.tasks")
+
+
+# ---- 源头护栏（S4）--------------------------------------------------------
+# 巨量工具 / MCP 输出在**离开工具时**即按 token 口径裁到上限，堵住"注入入口未净化"。
+# 额度**唯一来源**是 `plugins.context.source_clip_budget()`（软依赖查询，本层不持数字）。
+def _guard_result(ctx, result: Any) -> tuple[Any, tuple[bool, int, int | None]]:
+    """把一次工具结果按 context 给的额度净化（源头护栏）。
+
+    - **软依赖**：无 ``context`` 插件 / 无 ``source_clip_budget`` → 不裁（与全线降级一致）；
+    - **整函数体 self-try**：任何异常都不外抛，返回**原值** —— 护栏**不得**成为新的失败点
+      （故日志用 ``warning``：任务本身是成功的，但护栏失效必须可见）；
+    - 返回 ``(净化后的结果, (clipped, omitted_tokens, limit_tokens))``。
+    """
+    try:
+        gov = ctx.get(Services.CONTEXT)
+        budget = getattr(gov, "source_clip_budget", None)
+        if not callable(budget):
+            return result, (False, 0, None)
+        limit = int(budget())
+        guarded, omitted = guard_source(result, limit)
+        return guarded, (omitted > 0, omitted, limit)
+    except Exception:  # noqa: BLE001 —— 护栏失效不得掀翻工具调用
+        logger.warning("source guard 失效，回退原值（本次工具结果未净化）", exc_info=True)
+        return result, (False, 0, None)
 
 # 工具风险分级（**元数据**，供 approval/权限模式消费；本次只落字段，无判定行为）
 #   read   只读（查询/读取，可自动放行）
@@ -133,8 +159,11 @@ class TaskRegistry:
             )
         started = time.monotonic()
         ok, error = True, None
+        clipped, omitted, limit = False, 0, None
         try:
             result = await cmd.invoke(kwargs)
+            # S4 源头护栏：在 emit 之前净化，使事件能带上裁剪遥测（异常由 _guard_result 内部兜住）
+            result, (clipped, omitted, limit) = _guard_result(ctx, result)
         except Exception as exc:
             ok, error = False, str(exc)     # S7：失败也发 post 事件（审计不缺失败样本）
             raise
@@ -143,6 +172,7 @@ class TaskRegistry:
             await ctx.events.emit(Events.TASKS_POST_EXECUTE, {
                 "task": name, "caller": caller,
                 "ok": ok, "span_ms": span_ms, "error": error,
+                "clipped": clipped, "omitted_tokens": omitted, "limit_tokens": limit,
             })
         return result
 
