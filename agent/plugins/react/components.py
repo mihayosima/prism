@@ -48,11 +48,13 @@ class ToolResult:
     content: str
     is_error: bool = False
     denied: bool = False          # 被 guard/预算拒绝（与"工具本身出错"区分，用于防死循环）
+    denied_by: str = ""           # 拒绝来源（第 3 期）："user"=用户本轮主动拒（不计连拒）
     tool_call_id: str = ""
 
     def as_dict(self) -> dict:
         return {"tool_call_id": self.tool_call_id, "name": self.name,
-                "content": self.content, "is_error": self.is_error, "denied": self.denied}
+                "content": self.content, "is_error": self.is_error, "denied": self.denied,
+                "denied_by": self.denied_by}
 
 
 @dataclass(slots=True)
@@ -137,6 +139,7 @@ class DefaultActor:
                                             **dict(call.arguments or {}))
         except CapabilityNotImplemented as exc:
             return ToolResult(call.name, f"被拒绝：{exc}", is_error=True, denied=True,
+                              denied_by=str(getattr(exc, "denied_by", "") or ""),
                               tool_call_id=call.id)
         except AgentError as exc:
             return ToolResult(call.name, f"出错：{exc}", is_error=True, tool_call_id=call.id)

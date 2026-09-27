@@ -240,12 +240,13 @@ def test_chat_falls_back_when_react_disabled(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 用例 10：权限模式接口预留（锁住"本次不改行为"）
+# 用例 10：权限模式可见集（第 3 期启用：plan ⇒ 裁为只读子集）
 # ---------------------------------------------------------------------------
 
 
-def test_permission_mode_placeholder_keeps_full_tools(tmp_path):
-    """用例 10：``permission_mode='plan'`` 下 ``visible_tools`` 占位仍返回全量。"""
+def test_permission_mode_plan_trims_to_read_only(tmp_path):
+    """用例 10（第 3 期更新）：``permission_mode='plan'`` ⇒ ``visible_tools`` 只留
+    ``risk=="read"``（软约束）；其余模式恒全量（行为不变）。"""
     c = _build(tmp_path)
 
     async def s():
@@ -253,7 +254,11 @@ def test_permission_mode_placeholder_keeps_full_tools(tmp_path):
         full = c.root.react.visible_tools(c.root)
         assert full and all("risk" in t for t in full)             # risk 元数据已就位
         c.root.state["permission_mode"] = "plan"
-        assert len(c.root.react.visible_tools(c.root)) == len(full)  # 行为不变（预留）
+        vis = c.root.react.visible_tools(c.root)
+        assert all(t["risk"] == "read" for t in vis)               # 只留只读
+        assert len(vis) <= len(full)
+        c.root.state["permission_mode"] = "default"
+        assert len(c.root.react.visible_tools(c.root)) == len(full)  # 其余模式恒全量
         await c.teardown()
 
     _run(s())

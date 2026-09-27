@@ -131,15 +131,17 @@ class ReactResult:
 
 
 def visible_tools(ctx) -> list[dict]:
-    """工具可见集（权限模式 **接口预留**）。
+    """工具可见集（权限模式裁剪；第 3 期启用预留，依据《审批插件》§6.1）。
 
-    本次**恒返回全量**（锁住"行为不变"）。将来 approval 插件落地后，``plan`` 模式在此
-    裁为只读子集即可（``Tool.risk`` 字段已就位）：
-
-        if ctx.state.get("permission_mode") == "plan":
-            return [t for t in catalog if t.get("risk") == "read"]
+    ``plan`` 模式 ⇒ 只保留 ``risk == "read"``（**软约束**：模型看不见写工具，
+    防误导；幻觉调用仍由 approval 的 plan 硬兜底拒绝——软硬两层缺一不可）。
+    判定只读 ``permission_mode`` 状态键（SSOT 前向契约），对 approval **零耦合**。
+    其余模式恒全量（行为不变）。
     """
-    return ctx.tasks.catalog()
+    catalog = ctx.tasks.catalog()
+    if str(ctx.state.get(StateKeys.PERMISSION_MODE, "") or "") == "plan":
+        return [t for t in catalog if t.get("risk") == "read"]
+    return catalog
 
 
 def _trim(messages: list[dict], keep: int) -> list[dict]:
@@ -269,11 +271,18 @@ class ReactLoop:
             for r in results:
                 tool_trace.append(r.name)
                 observed.append(r.as_dict())
-                if r.denied:                             # 同一工具反复被拒 → 终止（防死循环）
-                    rejected[r.name] += 1
-                    if rejected[r.name] > cfg.max_rejects:
-                        stop_reason = (f"工具 {r.name!r} 反复被拒"
-                                       f"（超过 {cfg.max_rejects} 次），终止")
+                if r.denied:
+                    # 连拒闸（防死循环）——第 3 期语义细化：``denied_by == "user"``
+                    # 是「用户本轮主动拒」（拒绝理由已回灌，模型应读理由换方案），
+                    # **不计连拒**；步数/时延闸仍兜底。策略类拒绝（guard/approval
+                    # 名单/超时）重试无益，照旧计数。
+                    if str(getattr(r, "denied_by", "") or "") == "user":
+                        pass
+                    else:
+                        rejected[r.name] += 1
+                        if rejected[r.name] > cfg.max_rejects:
+                            stop_reason = (f"工具 {r.name!r} 反复被拒"
+                                           f"（超过 {cfg.max_rejects} 次），终止")
             obs = dict(await self._observer.observe(ctx, results))
             obs.setdefault("type", "observe")
             obs.setdefault("id", f"step{steps}_observe")

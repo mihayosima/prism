@@ -70,10 +70,17 @@ class EventDispatchError(AgentError):
 
 
 class CapabilityNotImplemented(AgentError):
-    """诚实边界：能力未实现/未配置/缺数据 → 该插槽不虚标能力。"""
+    """诚实边界：能力未实现/未配置/缺数据 → 该插槽不虚标能力。
 
-    def __init__(self, capability: str, reason: str = ""):
+    ``denied_by``：拒绝来源标记（第 3 期语义化，设计稿《审批插件》§9-1 配套）——
+    ``""``（缺省，guard/预算等既有拒绝）| ``"approval"``（审批判定：名单/plan/超时，
+    重试无益）| ``"user"``（用户本轮主动拒，模型应读理由换方案）。消费方
+    （react 连拒闸）据此区分「工具坏循环」与「人不同意」，其余场合可忽略。
+    """
+
+    def __init__(self, capability: str, reason: str = "", *, denied_by: str = ""):
         self.capability = capability
+        self.denied_by = str(denied_by or "")
         suffix = f"（{reason}）" if reason else ""
         super().__init__(f"能力未就绪: {capability}{suffix}")
 

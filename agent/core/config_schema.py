@@ -31,6 +31,7 @@ _SCHEMA: dict[str, Any] = {
         "memory": "_any",
         "react": "_any",
         "context": "_any",
+        "approval": "_any",
         "system_memory": "_any",
         "work_memory": "_any",
         "short_term": "_any",

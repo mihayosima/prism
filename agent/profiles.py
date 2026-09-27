@@ -35,6 +35,8 @@ BASE_AGENT_CONFIG: dict = {
         "llm": {"provider": "fixture", "model": "fixture", "stream": True},
         "budget": {"max_tokens_per_run": 200000, "reset_on_new_session": True},
         "permissions": {"default": "open", "task_allow": ["*"], "task_deny": [], "llm": "open"},
+        "approval": {"provider": "web", "allow": ["*"], "deny": [], "ask": [],
+                      "timeout_s": 30, "default": "deny"},
         "loop": {"deadline_s": 60},
     },
 }

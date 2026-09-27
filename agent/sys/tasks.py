@@ -155,13 +155,21 @@ class TaskRegistry:
         )
         if isinstance(decision, dict) and decision.get("denied"):
             raise CapabilityNotImplemented(
-                f"agent.tasks.{name}", decision.get("reason", "被 guard/约束否决")
-            )
+                f"agent.tasks.{name}", decision.get("reason", "被 guard/约束否决"),
+                denied_by=str(decision.get("denied_by") or ""))
+        # 第 3 期（设计稿 §9-1）：updated_input —— 决策回读改写后的 kwargs（参数
+        # 修订后继续执行）。waterfall 链底默认原样返回 payload（其 kwargs 与本地
+        # kwargs 同值）⇒ 以「值不等」判定被改写；改写者须**替换**该 dict
+        # （就地改键值同引用时无法区分，不支持）。
+        effective = kwargs
+        if isinstance(decision, dict) and isinstance(decision.get("kwargs"), dict) \
+                and decision["kwargs"] != kwargs:
+            effective = decision["kwargs"]
         started = time.monotonic()
         ok, error = True, None
         clipped, omitted, limit = False, 0, None
         try:
-            result = await cmd.invoke(kwargs)
+            result = await cmd.invoke(effective)
             # S4 源头护栏：在 emit 之前净化，使事件能带上裁剪遥测（异常由 _guard_result 内部兜住）
             result, (clipped, omitted, limit) = _guard_result(ctx, result)
         except Exception as exc:

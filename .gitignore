@@ -10,3 +10,10 @@ agent_runtime.egg-info/
 
 # secrets——绝不入库
 local_secrets.json
+
+# runtime log
+agent_chat_server.log
+
+# temp patch scripts
+patch_remove_windowing.py
+patch_remove_windowing2.py

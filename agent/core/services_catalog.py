@@ -23,6 +23,7 @@ class Services:
     LOOP = "loop"
     GUARD = "guard"
     BUDGET = "budget"
+    APPROVAL = "approval"
     REACT = "react"
     MEMORY = "memory"
     CONTEXT = "context"
@@ -44,6 +45,7 @@ ALL = frozenset(
         Services.LOOP,
         Services.GUARD,
         Services.BUDGET,
+        Services.APPROVAL,
         Services.REACT,
         Services.MEMORY,
         Services.CONTEXT,

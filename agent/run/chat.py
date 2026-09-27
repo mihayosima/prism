@@ -18,7 +18,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from agent.api import Services, StateKeys
+from agent.api import AgentError, Services, StateKeys
 from agent.profiles import build_agent
 from agent.sys.progress import tap_progress
 
@@ -102,6 +102,10 @@ _SETTING_SCHEMA = {
     "clip_tail_tokens": (int, 0, 1_000_000),           # 折叠后尾部保留
     "react_keep_recent": (int, 0, 1000),                  # 最近 N 条链原文保留
     "react_min_chain_tokens": (int, 0, 1_000_000),        # 循环内 chain 保底额度
+    # ---- 审批插件（plugins.approval）：通道 / 超时 / 必问名单 ----
+    "provider": ("choice", ["auto-deny", "auto-allow", "web", "cli"]),
+    "timeout_s": (int, 1, 3600),
+    "ask": ("list",),                                      # fnmatch 工具名名单
 }
 _PLUGIN_OF_KEY = {
     "compact_trigger_tokens": "plugins.short_term",
@@ -115,6 +119,9 @@ _PLUGIN_OF_KEY = {
     "clip_tail_tokens": "plugins.context",
     "react_keep_recent": "plugins.context",
     "react_min_chain_tokens": "plugins.context",
+    "provider": "plugins.approval",
+    "timeout_s": "plugins.approval",
+    "ask": "plugins.approval",
 }
 _SETTING_DEFAULTS = {
     "compact_trigger_tokens": 12000,
@@ -128,13 +135,32 @@ _SETTING_DEFAULTS = {
     "clip_tail_tokens": 500,
     "react_keep_recent": 6,
     "react_min_chain_tokens": 2048,
+    "provider": "web",
+    "timeout_s": 30,
+    "ask": [],
 }
 
 
-def _coerce_setting(key: str, raw) -> int | float:
+def _coerce_setting(key: str, raw):
+    """按 schema 校验设置项：数字钳制 / 枚举校验 / 列表规整。"""
     if key not in _SETTING_SCHEMA:
         raise ValueError(f"未知设置项: {key}")
-    typ, lo, hi = _SETTING_SCHEMA[key]
+    spec = _SETTING_SCHEMA[key]
+    kind = spec[0]
+    if kind == "choice":                                   # 枚举：provider 通道名
+        val = str(raw or "").strip()
+        if val not in spec[1]:
+            raise ValueError(f"{key} 须 ∈ {spec[1]}")
+        return val
+    if kind == "list":                                     # 列表：ask 名单（fnmatch）
+        if isinstance(raw, str):
+            parts = raw.replace("，", ",").replace("、", ",").split(",")
+        elif isinstance(raw, (list, tuple)):
+            parts = list(raw)
+        else:
+            parts = [raw]
+        return [str(x).strip() for x in parts if str(x).strip()]
+    typ, lo, hi = spec
     val = typ(raw)
     if val < lo or val > hi:
         raise ValueError(f"{key} 须落在 [{lo}, {hi}]")
@@ -260,6 +286,36 @@ tr:last-child td{border-bottom:0}
 .filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 .filters .chip.active{background:var(--brand);color:#fff;border-color:var(--brand)}
 pre.json{background:#0d0f13;color:#c9d6ec;padding:10px 12px;border-radius:8px;overflow:auto;font-family:var(--mono);font-size:11.5px}
+/* ------- human-in-the-loop cards（workbuddy 风格：内嵌对话流、扁平白卡、无阴影） ------- */
+.modebar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.modebar .mlabel{font-size:11.5px;color:var(--muted2)}
+.modebar .chip{cursor:pointer;user-select:none}
+.modebar .chip.active{background:var(--brand);color:#fff;border-color:var(--brand)}
+.modebar .chip[data-mode="bypass"].active{background:var(--err);border-color:var(--err)}
+.modebar .chip[data-mode="bypass"]:not(.active){color:var(--err);border-color:#f3c1c1}
+.hitcard{width:100%;background:var(--card);border:.5px solid var(--line);border-radius:12px;padding:14px 16px}
+.hithd{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.hitic{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;font-size:12px;font-weight:500;flex:none}
+.hitic.approval{background:var(--warn-soft);color:#a16207}
+.hitic.ask{background:var(--brand-soft);color:var(--brand-ink)}
+.hittt{flex:1;min-width:0}
+.hittt b{display:block;font-size:13.5px;font-weight:500}
+.hittt span{font-size:11.5px;color:var(--muted)}
+.hitbd{font-size:13px;line-height:1.6;margin:0 0 10px}
+.hitmeta{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.hitkw{margin:0 0 10px;background:#0d0f13;color:#c9d6ec;padding:10px 12px;border-radius:8px;overflow:auto;font-family:var(--mono);font-size:11.5px;white-space:pre-wrap}
+.hitops{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px}
+.hitops .chip.selected{background:var(--brand);color:#fff;border-color:var(--brand)}
+.hitrow{display:flex;gap:8px;align-items:center}
+.hitinput{flex:1;font:inherit;font-size:13px;border:1px solid var(--line);border-radius:8px;padding:8px 10px;outline:none;min-width:120px}
+.hitinput:focus{border-color:var(--brand2)}
+.hitft{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.hitft .btn{padding:7px 16px;font-size:12.5px;border-radius:8px}
+.hitft .btn.ghost2{background:var(--card);color:var(--brand-ink);border:1px solid #d7e5ff}
+.hitft .btn.ghost2:hover{background:var(--brand-soft)}
+.hitft .btn.danger{background:var(--card);color:var(--err);border:1px solid #f3c1c1}
+.hitft .btn.danger:hover{background:var(--err-soft)}
+.hitst{font-size:12px;color:var(--muted)}
 </style></head><body>
 <div class="top">
   <div class="brand"><div class="mark">◈</div>prism</div>
@@ -284,6 +340,14 @@ pre.json{background:#0d0f13;color:#c9d6ec;padding:10px 12px;border-radius:8px;ov
 <div class="main">
   <section data-view="chat" class="active">
     <div class="chat">
+      <div class="modebar" id="modebar">
+        <span class="mlabel">权限档位</span>
+        <button class="chip" data-mode="default">默认</button>
+        <button class="chip" data-mode="plan" title="只读浏览，工具被裁剪，模型只能提交计划等你批">规划</button>
+        <button class="chip" data-mode="auto" title="非只读工具都要你审批">审批</button>
+        <button class="chip" data-mode="bypass" title="跳过一切审批（高危）">跳过</button>
+        <span class="mlabel" id="modehint"></span>
+      </div>
       <div class="messages" id="messages"></div>
       <div class="chips" id="chips"></div>
       <div class="hint">Enter 发送 · Shift+Enter 换行</div>
@@ -421,6 +485,10 @@ async function send(){
         else if(ev==='token'){box.appendToken(p.data?p.data.text:'');}
         else if(ev==='final'){box.finish(p.text,p.evidence);}
         else if(ev==='cancelled'){box.cancel();}
+        else if(ev==='approval'){showApproval(p.data||{});}
+        else if(ev==='approval_done'){dismissApproval(p.data||{});}
+        else if(ev==='ask_user'){showAskUser(p.data||{});}
+        else if(ev==='ask_user_done'){dismissAskUser(p.data||{});}
         else if(ev==='error'){box.finish('请求失败：'+(p.error||''),null);}
       }
     }
@@ -430,6 +498,98 @@ async function send(){
   }finally{
     _streaming=false;_ctrl=null;
     $('#send').disabled=false;$('#send').textContent='发送';$('#txt').focus();}}
+// ---- approval popup（人在环中，第 2 期）：SSE pending 帧弹出，应答经 /api/approval/answer ----
+const appr={};
+function scrollMsg(){const m=$('.messages');m.scrollTop=m.scrollHeight;}
+function hitCard(kind,badge,title,sub){                 // workbuddy 风格：内嵌对话流的扁平卡片
+  const el=document.createElement('div');el.className='hitcard';
+  el.innerHTML='<div class="hithd"><div class="hitic '+kind+'">'+badge+'</div>'
+    +'<div class="hittt"><b>'+esc(title)+'</b><span>'+esc(sub)+'</span></div>'
+    +'<span class="tag run">待处理</span></div>';
+  $('#messages').appendChild(el);scrollMsg();
+  return el;}
+function showApproval(d){
+  if(!d||!d.call_id||appr[d.call_id])return;           // 同 call_id 只弹一次
+  const el=hitCard('approval','审批','请求执行工具',d.tool?('tool · '+d.tool):'需要你的批准后才会执行');
+  const tag=el.querySelector('.tag');
+  const riskCls=d.risk==='danger'?'err':(d.risk==='write'?'run':'ok');
+  el.insertAdjacentHTML('beforeend',
+    '<div class="hitmeta">'
+    +(d.risk?'<span class="tag '+riskCls+'">风险 · '+esc(d.risk)+'</span>':'')
+    +(d.mode?'<span class="tag off">档位 · '+esc(d.mode)+'</span>':'')
+    +'</div>'
+    +(d.kwargs&&Object.keys(d.kwargs).length?'<pre class="hitkw">'+esc(json2(d.kwargs))+'</pre>':'')
+    +'<div class="hitft"><button class="btn hityes">批准</button>'
+    +'<button class="btn ghost2 hitalways">总是允许</button>'
+    +'<button class="btn danger hitno">拒绝</button>'
+    +'<span class="hitst"></span></div>');
+  appr[d.call_id]=el;
+  const st=el.querySelector('.hitst');
+  const done=(txt,cls)=>{el.querySelectorAll('button,input').forEach(x=>x.disabled=true);
+    tag.className='tag '+cls;tag.textContent=txt;st.textContent='';scrollMsg();};
+  const answer=async(approved,always)=>{
+    st.textContent='提交中…';
+    try{const r=await fetch('/api/approval/answer',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({call_id:d.call_id,approved,always:!!always})});
+      const j=await r.json();
+      if(j.ok&&j.resolved)done(approved?(always?'已批准 · 本会话同类不再问':'已批准'):'已拒绝',approved?'ok':'err');
+      else done('已超时 · 默认拒绝','err');
+    }catch(e){st.textContent='提交失败：'+e.message;}};
+  el.querySelector('.hityes').onclick=()=>answer(true);
+  el.querySelector('.hitalways').onclick=()=>answer(true,true);
+  el.querySelector('.hitno').onclick=()=>answer(false);
+}
+function dismissApproval(d){
+  const id=d&&d.call_id,el=id&&appr[id];if(!el)return;  // 他处应答/超时：原卡片转为已了结态
+  el.querySelectorAll('button,input').forEach(x=>x.disabled=true);
+  const tag=el.querySelector('.tag');
+  const ok=d&&d.approved;
+  tag.className='tag '+(ok?'ok':'err');
+  tag.textContent=ok?'已批准':'已了结 · 默认拒绝';
+  const st=el.querySelector('.hitst');if(st)st.textContent='';
+}
+const asku={};                                         // call_id → 问询卡片元素
+function showAskUser(d){
+  if(!d||!d.call_id||asku[d.call_id])return;
+  const el=hitCard('ask','问询','Agent 想确认你的想法','点选方案或输入文字指示，答复后将继续执行');
+  const tag=el.querySelector('.tag');
+  let h='<div class="hitbd">'+esc(d.question||'（无问题文本）')+'</div>';
+  if(Array.isArray(d.options)&&d.options.length)
+    h+='<div class="hitops">'+d.options.map(o=>'<button class="chip apopt" data-o="'+esc(o)+'">'+esc(o)+'</button>').join('')+'</div>';
+  if(d.allow_free_text!==false)
+    h+='<div class="hitrow"><input class="hitinput" placeholder="或输入文字指示…"><button class="btn hitsend">发送</button></div>';
+  h+='<div class="hitst" style="margin-top:8px"></div>';
+  el.insertAdjacentHTML('beforeend',h);
+  asku[d.call_id]=el;
+  const st=el.querySelector('.hitst');
+  const done=(txt,cls)=>{el.querySelectorAll('button,input').forEach(x=>x.disabled=true);
+    tag.className='tag '+(cls||'ok');tag.textContent=txt;st.textContent='';scrollMsg();};
+  const answer=async payload=>{
+    st.textContent='提交中…';
+    try{const r=await fetch('/api/approval/answer',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({call_id:d.call_id,...payload})});
+      const j=await r.json();
+      if(j.ok&&j.resolved)done('已答复 · Agent 继续中','ok');
+      else done('已超时 · Agent 将按假设继续','run');
+    }catch(e){st.textContent='提交失败：'+e.message;}};
+  el.querySelectorAll('.apopt').forEach(b=>b.onclick=()=>{
+    el.querySelectorAll('.apopt').forEach(x=>x.classList.toggle('selected',x===b));
+    answer({answered:true,choice:b.dataset.o});});
+  const send=()=>{const t=el.querySelector('.hitinput');const v=t?t.value.trim():'';
+    if(!v)return;answer({answered:true,text:v});};
+  const sb=el.querySelector('.hitsend');if(sb)sb.onclick=send;
+  const tx=el.querySelector('.hitinput');
+  if(tx)tx.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();send();}});
+}
+function dismissAskUser(d){
+  const id=d&&d.call_id,el=id&&asku[id];if(!el)return;
+  el.querySelectorAll('button,input').forEach(x=>x.disabled=true);
+  const tag=el.querySelector('.tag');
+  const ok=d&&d.answered;
+  tag.className='tag '+(ok?'ok':'run');
+  tag.textContent=ok?'已答复':'已超时 · Agent 将按假设继续';
+  const st=el.querySelector('.hitst');if(st)st.textContent='';
+}
 function fmt(x){return x===null||x===undefined?'-':(typeof x==='object'?json2(x):x);}
 function tableFrom(rows,cols){return '<table><tr>'+cols.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr>'
   +rows.map(r=>'<tr>'+cols.map(c=>'<td>'+esc(fmt(r[c]))+'</td>').join('')+'</tr>').join('')+'</table>';}
@@ -468,10 +628,18 @@ async function load(name){
       $('#eventsBox').innerHTML=(rows.length?tableFrom(rows,['seq','event','at','payload']):'<div class="empty">无匹配事件</div>');}
     else if(name==='perms'){
       const jj=j.policy||{};
-      $('#permsBox').innerHTML='<h3>权限矩阵（config.agent.permissions，默认 open）</h3>'
+      let h='';
+      if(j.mode){                                        // approval 插件启用时才显示档位切换
+        const modes=[['default','默认'],['plan','计划'],['auto','自动'],['bypass','跳过']];
+        h+='<h3>会话档位（approval mode）</h3><div class="filters" id="modeBar">'
+          +modes.map(([k,l])=>'<button class="chip'+(j.mode===k?' active':'')+'" data-mode="'+k+'">'+l+'</button>').join('')
+          +'</div><div class="muted" style="margin:-6px 0 12px;font-size:11.5px">plan=只读计划 · auto=写类触发审批 · bypass=跳过审批（高危，需确认）</div>';
+      }
+      h+='<h3>权限矩阵（config.agent.permissions，默认 open）</h3>'
         +'<div class="card"><pre class="json">'+esc(json2(jj))+'</pre></div>'
         +'<h3>最近裁决（agent/permission/decision，durable）</h3>'
-        +(j.recent&&j.recent.length?tableFrom(j.recent.slice(0,20),['seq','payload','at']):'<div class="empty">暂无裁决</div>');}
+        +(j.recent&&j.recent.length?tableFrom(j.recent.slice(0,20),['seq','payload','at']):'<div class="empty">暂无裁决</div>');
+      $('#permsBox').innerHTML=h;}
         else if(name==='plugins'){ renderPlugins(j.plugins||[]); }
     else if(name==='memory'){
       const lt=j.long_term||{};
@@ -567,8 +735,27 @@ function renderSettings(j){
   h+=fields.map(([k,label,hint])=>'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px">'+esc(label)+'</div>'
     +'<input id="set_'+k+'" type="number" step="'+(isFloat(k)?'0.01':'1')+'" value="'+esc(v[k])+'" style="width:240px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit">'
     +'<div class="muted" style="font-size:11px;margin-top:3px">'+esc(hint)+'</div></label>').join('');
+  h+='</div>';                                             // 上下文管理卡片收口
+  if(j.approval_enabled===false){
+    h+='<div class="card muted" style="margin-top:16px">审批插件（plugins.approval）未启用 —— 在「插件」页点「启用」后，可在此调整。</div>';
+  }else{
+    const aps=['auto-deny','auto-allow','web','cli'];
+    const apl={'auto-deny':'问人即拒（fail-safe，无弹窗）','auto-allow':'问人即批（开发用，无弹窗）','web':'网页弹窗审批（推荐）','cli':'终端问答（y=批 / a=本会话总是允许）'};
+    h+='<div class="card" style="margin-top:16px"><h3 style="margin-top:0">审批 · 人在循环（plugins.approval）</h3>'
+      +'<div class="muted" style="margin-bottom:10px">调整审批通道与名单；保存后立即重建容器生效（会话档位回到默认）。覆盖写入 data/agent_plugin_config.json，重启后保持。</div>'
+      +'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px">问人通道 provider</div>'
+      +'<select id="set_provider" style="width:340px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit;background:#fff">'
+      +aps.map(o=>'<option value="'+o+'"'+(v.provider===o?' selected':'')+'>'+o+'（'+apl[o]+'）</option>').join('')
+      +'</select><div class="muted" style="font-size:11px;margin-top:3px">仅 web / cli 为交互式，会真正等人答复（web 才有网页弹窗）</div></label>'
+      +'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px">等待时限 timeout_s（秒）</div>'
+      +'<input id="set_timeout_s" type="number" step="1" min="1" value="'+esc(v.timeout_s)+'" style="width:240px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit">'
+      +'<div class="muted" style="font-size:11px;margin-top:3px">无人应答超过此时限 → 默认拒绝（fail-safe）</div></label>'
+      +'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px">必问名单 ask（fnmatch，逗号分隔）</div>'
+      +'<input id="set_ask" type="text" value="'+esc((v.ask||[]).join(', '))+'" placeholder="如 t.write*, *delete*" style="width:360px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit">'
+      +'<div class="muted" style="font-size:11px;margin-top:3px">命中名单的工具执行前必问人；配合对话页「审批」档可让所有非只读工具都问</div></label></div>';
+  }
   h+='<div style="margin-top:16px"><button class="btn" id="saveSettings">保存</button> '
-    +'<button class="btn ghost" id="resetSettings">恢复默认</button> <span class="muted" id="setMsg"></span></div></div>';
+    +'<button class="btn ghost" id="resetSettings">恢复默认</button> <span class="muted" id="setMsg"></span></div>';
   box.innerHTML=h;
   $('#saveSettings').onclick=saveSettings;
   $('#resetSettings').onclick=resetSettings;
@@ -578,6 +765,9 @@ async function saveSettings(){
   const keys=['compact_trigger_tokens','max_context_tokens','reserve_output_tokens','memory_ratio','history_ratio','source_clip_tokens','clip_max_tokens','clip_head_tokens','clip_tail_tokens','react_keep_recent','react_min_chain_tokens'];
   const patch={};
   for(const k of keys){const el=$('#set_'+k);if(el&&el.value!==''){patch[k]=isFloat(k)?parseFloat(el.value):parseInt(el.value,10);}}
+  const pv=$('#set_provider');if(pv)patch.provider=pv.value;      // 审批插件三项
+  const tv=$('#set_timeout_s');if(tv&&tv.value!=='')patch.timeout_s=parseInt(tv.value,10);
+  const av=$('#set_ask');if(av)patch.ask=av.value.split(',').map(s=>s.trim()).filter(Boolean);
   $('#setMsg').textContent='保存中…';
   try{const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({patch})});
     const j=await r.json();if(!j.ok){$('#setMsg').textContent='失败：'+(j.error||r.status);return;}
@@ -585,12 +775,26 @@ async function saveSettings(){
   catch(e){$('#setMsg').textContent='失败：'+e.message;}
 }
 async function resetSettings(){
-  if(!confirm('恢复上下文管理默认参数？当前覆盖将被清除。'))return;
+  if(!confirm('恢复默认参数？当前覆盖（上下文管理 / 审批插件）将被清除。'))return;
   $('#setMsg').textContent='恢复中…';
   try{const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset:true})});
     const j=await r.json();if(!j.ok){$('#setMsg').textContent='失败：'+(j.error||r.status);return;}
     $('#setMsg').textContent='已恢复默认 ✓';renderSettings(j.settings);}
   catch(e){$('#setMsg').textContent='失败：'+e.message;}
+}
+const MODE_LABEL={default:'默认',plan:'规划：模型只读浏览，计划需你批准',auto:'审批：非只读工具都要你确认',bypass:'跳过审批（高危）'};
+function setModeUI(m){
+  document.querySelectorAll('#modebar .chip').forEach(x=>x.classList.toggle('active',x.dataset.mode===m));
+  $('#modehint').textContent=MODE_LABEL[m]||m;}
+async function switchMode(m){
+  const post=c=>fetch('/api/approval/mode',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({mode:m,confirm:c})}).then(r=>r.json());
+  try{
+    if(m==='bypass'&&!confirm('bypass 将跳过所有审批确认（高危），确定切换？'))return;
+    const j=await post(m==='bypass');
+    if(!j.ok)return alert('切换失败：'+(j.error||''));
+    setModeUI(j.mode);
+  }catch(e){alert('请求失败：'+e.message);}
 }
 document.addEventListener('DOMContentLoaded',()=>{
   $('#chips').innerHTML=chips.map(c=>'<button class="chip">'+c+'</button>').join('');
@@ -608,6 +812,21 @@ document.addEventListener('DOMContentLoaded',()=>{
     if(!e.target.classList.contains('chip'))return;
     document.querySelectorAll('#evFilters .chip').forEach(x=>x.classList.remove('active'));
     e.target.classList.add('active');evFilter=e.target.dataset.ev;load('events');});
+  $('#permsBox').addEventListener('click',e=>{          // 会话档位切换（bypass 需二次确认）
+    const b=e.target.closest('[data-mode]');if(!b)return;
+    const m=b.dataset.mode;
+    const doSet=c=>fetch('/api/approval/mode',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode:m,confirm:c})}).then(r=>r.json()).then(j=>{
+        if(!j.ok)alert('失败：'+(j.error||''));else setModeUI(j.mode);load('perms');}).catch(e=>alert('请求失败：'+e.message));
+    if(m==='bypass'){if(confirm('bypass 将跳过所有审批确认（高危），确定切换？'))doSet(true);}else doSet(false);});
+  (async()=>{try{                                        // 刷新后恢复档位显示 + 在途弹窗/问询卡
+    const j=await (await fetch('/api/approval/pending')).json();
+    if(j.mode)setModeUI(j.mode);else setModeUI('default');
+    (j.items||[]).forEach(it=>{const q=it.req||{};
+      if(q.kind==='ask_user')showAskUser(q);
+      else if(q.call_id)showApproval(q);});}catch(e){setModeUI('default');}})();
+  $('#modebar').addEventListener('click',e=>{            // 对话页内直接切换权限档位
+    const b=e.target.closest('[data-mode]');if(b)switchMode(b.dataset.mode);});
   $('#pscaffold').onclick=async()=>{
     const name=$('#pname').value.trim();if(!name)return alert('填插件名');
     const provides=$('#pprovides').value.split(',').map(s=>s.trim()).filter(Boolean);
@@ -749,6 +968,80 @@ async def _serve(args: argparse.Namespace) -> int:
         task.cancel()
         return JSONResponse({"ok": True, "run_id": rid})
 
+    # ---- 审批（人在环中，第 2 期）：入站应答 + 在途快照 + 会话档位 ----
+    # 解耦纪律：只经 Services.APPROVAL 门面（ctx.approval），不 import 插件内部模块。
+
+    def _approval_or_none():
+        if not c.root.has(Services.APPROVAL):
+            return None
+        return c.root.get(Services.APPROVAL)
+
+    @app.post("/api/approval/answer")
+    async def _approval_answer(body: dict):
+        """人对在途请求的应答：审批（批/驳）与澄清问询（choice/text）共用。
+
+        经待答表 resolve 唤醒在途等待者；附加键（answered/choice/text/note/
+        always/kwargs）原样透传，由等待方按自身语义消费。
+        未知/已了结的 call_id → 404（前端据此提示「已超时，默认拒绝」）。
+        fail-safe 在插件侧：无人应答/超时一律默认拒绝，本端点只投喂不裁决。
+        """
+        svc = _approval_or_none()
+        if svc is None:
+            return JSONResponse({"ok": False, "error": "审批插件未启用"}, status_code=404)
+        call_id = str(body.get("call_id") or "")
+        if not call_id:
+            return JSONResponse({"ok": False, "error": "缺少 call_id"}, status_code=400)
+        answer: dict = {"approved": bool(body.get("approved")), "by": "user"}
+        if body.get("always"):                       # 第 3 期：批量确认（本会话同类不再问）
+            answer["always"] = True
+        note = body.get("note")                      # 第 3 期：计划拒绝意见（回灌给模型）
+        if isinstance(note, str) and note.strip():
+            answer["note"] = note.strip()[:500]
+        rw = body.get("kwargs")                      # 第 3 期：updated_input（参数修订）
+        if isinstance(rw, dict):
+            answer["kwargs"] = rw
+        if "answered" in body:                       # 澄清问询：answered/choice/text 透传
+            answer["answered"] = bool(body.get("answered"))
+        if "choice" in body:
+            answer["choice"] = body.get("choice")
+        if isinstance(body.get("text"), str):
+            answer["text"] = body["text"][:2000]
+        resolved = svc.pending.resolve(call_id, answer)
+        if not resolved:
+            return JSONResponse(
+                {"ok": False, "resolved": False,
+                 "error": "请求不存在或已了结（超时默认拒绝）"}, status_code=404)
+        return JSONResponse({"ok": True, "resolved": True, "call_id": call_id})
+
+    @app.get("/api/approval/pending")
+    async def _approval_pending():
+        """在途审批快照（页面刷新后恢复弹窗用）。"""
+        svc = _approval_or_none()
+        if svc is None:
+            return {"items": [], "enabled": False}
+        return {"items": svc.pending.snapshot(), "enabled": True,
+                "mode": svc.mode()}
+
+    @app.post("/api/approval/mode")
+    async def _approval_mode(body: dict):
+        """切换会话档位（default/plan/auto/bypass）。
+
+        OPEN-5：切 bypass 属高危（跳过一切问人），需 ``confirm=true`` 二次确认。
+        """
+        svc = _approval_or_none()
+        if svc is None:
+            return JSONResponse({"ok": False, "error": "审批插件未启用"}, status_code=404)
+        mode = str(body.get("mode") or "")
+        if mode == "bypass" and not bool(body.get("confirm")):
+            return JSONResponse(
+                {"ok": False, "error": "bypass 将跳过所有审批，需二次确认"},
+                status_code=409)
+        try:
+            await svc.set_mode(c.root, mode, by="user")
+        except AgentError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, "mode": svc.mode()})
+
     @app.get("/api/status")
     async def _status() -> dict:
         svc = c.root.get(Services.LLM)
@@ -771,7 +1064,9 @@ async def _serve(args: argparse.Namespace) -> int:
         recent = await c.root.db.query(
             c.root, "SELECT seq, payload, at FROM agent_events"
                     " WHERE event='agent/permission/decision' ORDER BY seq DESC LIMIT 30")
-        return {"policy": c.root.guard.policy(c.root), "recent": recent}
+        approval = c.root.get(Services.APPROVAL) if c.root.has(Services.APPROVAL) else None
+        return {"policy": c.root.guard.policy(c.root), "recent": recent,
+                "mode": approval.mode() if approval else None}
 
     @app.get("/api/session")
     async def _session() -> dict:
@@ -935,22 +1230,23 @@ async def _serve(args: argparse.Namespace) -> int:
     async def _settings() -> dict:
         ctx_enabled = "plugins.context" in set(pm.enabled())
         ov = _load_overrides()
-        st = ov.get("plugins.short_term", {}) or {}
-        cx = ov.get("plugins.context", {}) or {}
-        values: dict[str, int | float] = {}
+        values: dict = {}
         for k in _SETTING_SCHEMA:
+            cur = (ov.get(_PLUGIN_OF_KEY.get(k, ""), {}) or {}).get(k, _SETTING_DEFAULTS[k])
             try:
-                values[k] = _coerce_setting(k, cx.get(k, st.get(k, _SETTING_DEFAULTS[k])))
+                values[k] = _coerce_setting(k, cur)
             except (ValueError, TypeError):
                 values[k] = _SETTING_DEFAULTS[k]
-        return {"context_plugin_enabled": ctx_enabled, "values": values}
+        ap_enabled = "plugins.approval" in set(pm.enabled())
+        return {"context_plugin_enabled": ctx_enabled,
+                "approval_enabled": ap_enabled, "values": values}
 
     @app.post("/api/settings")
     async def _settings_update(body: dict):
         try:
             if bool(body.get("reset")):
                 ov = _load_overrides()
-                for pid in ("plugins.context", "plugins.short_term"):
+                for pid in ("plugins.context", "plugins.short_term", "plugins.approval"):
                     ov.pop(pid, None)
                 _save_overrides(ov)
                 await _apply_rebuild()

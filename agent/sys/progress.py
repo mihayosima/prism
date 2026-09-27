@@ -31,13 +31,22 @@ PROGRESS_EVENTS: tuple[str, ...] = (
     Events.TASKS_POST_EXECUTE,
     Events.LLM_TOKEN,                              # B5.2 打字机帧
     Events.LLM_THINKING,                           # B5.2 思考流帧（D4）
+    Events.APPROVAL_PENDING,                       # 第 2 期：待审批弹窗信号（web provider 才发）
+    Events.APPROVAL_ANSWERED,                      # 第 2 期：审批了结（前端弹窗消隐）
+    Events.ASK_USER_PENDING,                       # 澄清问询卡片（ask_user 工具）
+    Events.ASK_USER_ANSWERED,                      # 问询了结（前端卡片消隐）
 )
 
 # 内核事件名 → 传输层帧类型（其余默认 "progress"）。
 # B5.2：LLM_TOKEN 映射为 "token" 帧，前端据此追加文本而非渲染步骤卡片。
+# 第 2 期：approval 两帧独立成帧型，前端弹窗/消隐，不混入通用步骤卡片。
 FRAME_TYPES: dict[str, str] = {
     Events.LLM_TOKEN: "token",
     Events.LLM_THINKING: "thinking",
+    Events.APPROVAL_PENDING: "approval",
+    Events.APPROVAL_ANSWERED: "approval_done",
+    Events.ASK_USER_PENDING: "ask_user",
+    Events.ASK_USER_ANSWERED: "ask_user_done",
 }
 
 

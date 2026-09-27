@@ -32,6 +32,16 @@ class Events:
     # 权限决策（guard 落审计；前端「权限」过滤用同名）
     PERMISSION_DECISION = "agent/permission/decision"
 
+    # 审批插件（plugins.approval）：asked/answered/timeout/mode_changed 由 durable
+    # 直写 agent_events（不经总线）；PENDING 为 live emit（第 2 期前端弹窗消费）
+    APPROVAL_ASKED = "agent/approval/asked"
+    APPROVAL_ANSWERED = "agent/approval/answered"
+    APPROVAL_TIMEOUT = "agent/approval/timeout"
+    APPROVAL_MODE_CHANGED = "agent/approval/mode_changed"
+    APPROVAL_PENDING = "agent/approval/pending"
+    ASK_USER_PENDING = "agent/ask_user/pending"        # 澄清问询：选项+自由文本卡片
+    ASK_USER_ANSWERED = "agent/ask_user/answered"      # 问询了结（前端卡片消隐）
+
     # ReAct 插件
     REACT_START = "agent/react/start"
     REACT_STEP_START = "agent/react/step/start"
@@ -73,6 +83,13 @@ EVENT_MODE: dict[str, str] = {
     Events.CHAT_DONE: "emit",
     Events.CHAT_RESET: "emit",
     Events.PERMISSION_DECISION: "emit",   # durable 落盘（审计脊柱）
+    Events.APPROVAL_ASKED: "emit",        # durable 直写（审计脊柱）；bus 无监听者
+    Events.APPROVAL_ANSWERED: "emit",     # 同上
+    Events.APPROVAL_TIMEOUT: "emit",      # 同上
+    Events.APPROVAL_MODE_CHANGED: "emit",  # 同上
+    Events.APPROVAL_PENDING: "emit",      # live：待审批弹窗信号（第 2 期前端消费）
+    Events.ASK_USER_PENDING: "emit",      # live：澄清问询卡片信号（ask_user 工具）
+    Events.ASK_USER_ANSWERED: "emit",     # live：问询了结（前端卡片消隐）
     Events.REACT_START: "emit",
     Events.REACT_STEP_START: "emit",
     Events.REACT_STEP: "emit",
