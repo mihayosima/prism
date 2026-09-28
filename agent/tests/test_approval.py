@@ -753,7 +753,8 @@ def test_ask_user_choice_roundtrip(tmp_path):
         snap = c.root.approval.pending.snapshot()
         assert snap and snap[0]["req"]["kind"] == "ask_user"
         assert snap[0]["req"]["question"] == "数据库选 MySQL 还是 SQLite？"
-        assert snap[0]["req"]["options"] == ["MySQL", "SQLite"]
+        # 第 4 期起 options 归一为选择规格（label/value/desc/group），前端据此定形态
+        assert [o["label"] for o in snap[0]["req"]["options"]] == ["MySQL", "SQLite"]
         call_id = snap[0]["req"]["call_id"]
         assert c.root.approval.pending.resolve(
             call_id, {"answered": True, "choice": "MySQL", "by": "user"})
@@ -813,6 +814,122 @@ def test_ask_user_non_interactive_degrades(tmp_path):
         assert out["answered"] is False
         assert "非交互" in out["reason"]
         assert c.root.approval.pending.size() == 0, "非交互不应产生在途等待"
+        await c.teardown()
+
+    _run(s())
+
+
+# ---------------------------------------------------------------------------
+# 第 4 期：选择规格（结构化选项 + 多选 + 分组）——卡片形态随决策而定
+# ---------------------------------------------------------------------------
+
+def test_normalize_options_shapes():
+    """归一纯函数：JSON 数组 / 对象数组 / 逗号兜底 / 引号残渣 四类形态。"""
+    from agent.plugins.approval.options import normalize_options
+
+    assert [o["label"] for o in normalize_options('["A","B"]')] == ["A", "B"]
+    objs = normalize_options('[{"label":"方案A","desc":"改动最小","value":"a","group":"技术"},'
+                             '{"label":"方案B","desc":"能力最强","group":"技术"}]')
+    assert objs[0] == {"label": "方案A", "value": "a", "desc": "改动最小", "group": "技术"}
+    assert objs[1]["value"] == "方案B" and objs[1]["group"] == "技术"
+    # 选项文本内含逗号：JSON 优先 ⇒ 不被切碎（旧实现按逗号硬切）
+    assert [o["label"] for o in normalize_options('["先做A，因为快","后做B"]')] \
+        == ["先做A，因为快", "后做B"]
+    # 兜底路径：逗号分隔 + 剥引号/括号残渣（历史事故：回传值带着引号）
+    got = normalize_options('"电影主题曲", "电视剧主题曲"')
+    assert [o["label"] for o in got] == ["电影主题曲", "电视剧主题曲"]
+    # 映射写法 {方案: 说明} 视作带说明的候选；空值一律为空表
+    mapped = normalize_options({"先做导出": "用户最急", "先做统计": "看数据"})
+    assert mapped[0]["label"] == "先做导出" and mapped[0]["desc"] == "用户最急"
+    assert normalize_options("") == [] and normalize_options(None) == []
+
+
+def test_ask_user_options_structured(tmp_path):
+    """结构化候选项：卡片收到 label/desc/group 规格，答复回灌单项取值。"""
+    c = _build(tmp_path, approval={"provider": "web", "timeout_s": 5})
+
+    async def s():
+        await c.assemble()
+        inv = asyncio.ensure_future(c.root.tasks.invoke(
+            c.root, "approval.ask_user", caller="t", question="走哪条路？",
+            options='[{"label":"方案A","desc":"改动最小","group":"技术"},'
+                    '{"label":"方案B","desc":"能力最强","group":"产品"}]'))
+        await asyncio.sleep(0.05)
+        req = c.root.approval.pending.snapshot()[0]["req"]
+        assert [o["label"] for o in req["options"]] == ["方案A", "方案B"]
+        assert req["options"][0]["desc"] == "改动最小"
+        assert req["options"][1]["group"] == "产品"
+        assert req["multi"] is False
+        c.root.approval.pending.resolve(
+            req["call_id"], {"answered": True, "choice": "方案A", "by": "user"})
+        out = await inv
+        assert out["answered"] is True
+        assert out["choice"] == "方案A" and out["choices"] == ["方案A"]
+        await c.teardown()
+
+    _run(s())
+
+
+def test_ask_user_multi_choices_roundtrip(tmp_path):
+    """多选：用户勾选多项一次提交 → 模型收到 choices 列表。"""
+    c = _build(tmp_path, approval={"provider": "web", "timeout_s": 5})
+
+    async def s():
+        await c.assemble()
+        inv = asyncio.ensure_future(c.root.tasks.invoke(
+            c.root, "approval.ask_user", caller="t", question="要哪些能力？",
+            options='[{"label":"导出"},{"label":"导入"},{"label":"统计"}]', multi=True))
+        await asyncio.sleep(0.05)
+        req = c.root.approval.pending.snapshot()[0]["req"]
+        assert req["multi"] is True
+        c.root.approval.pending.resolve(
+            req["call_id"], {"answered": True, "choices": ["导出", "统计"], "by": "user"})
+        out = await inv
+        assert out["choices"] == ["导出", "统计"]
+        assert out["multi"] is True and out.get("choice") is None
+        assert "多项" in out["hint"]
+        await c.teardown()
+
+    _run(s())
+
+
+def test_ask_user_multi_without_options_degrades(tmp_path):
+    """multi=true 但无候选 → 退回单选语义（无候选项时多选无意义）。"""
+    c = _build(tmp_path, approval={"provider": "web", "timeout_s": 5})
+
+    async def s():
+        await c.assemble()
+        inv = asyncio.ensure_future(c.root.tasks.invoke(
+            c.root, "approval.ask_user", caller="t", question="随便说说？", multi=True))
+        await asyncio.sleep(0.05)
+        req = c.root.approval.pending.snapshot()[0]["req"]
+        assert req["options"] == [] and req["multi"] is False
+        c.root.approval.pending.resolve(
+            req["call_id"], {"answered": True, "text": "都行", "by": "user"})
+        out = await inv
+        assert out["answered"] is True and out["text"] == "都行"
+        await c.teardown()
+
+    _run(s())
+
+
+def test_ask_user_audit_records_options(tmp_path):
+    """审计补记候选项与多选标记（旧版只记 question，事后调试只能靠猜）。"""
+    c = _build(tmp_path, approval={"provider": "web", "timeout_s": 5})
+
+    async def s():
+        await c.assemble()
+        inv = asyncio.ensure_future(c.root.tasks.invoke(
+            c.root, "approval.ask_user", caller="t", question="选哪个？",
+            options="A, B", multi=True))
+        await asyncio.sleep(0.05)
+        req = c.root.approval.pending.snapshot()[0]["req"]
+        c.root.approval.pending.resolve(
+            req["call_id"], {"answered": True, "text": "都行", "by": "user"})
+        await inv
+        asked = await _events(c, Events.APPROVAL_ASKED)
+        assert any("'A'" in str(e) or '"A"' in str(e) for e in asked), "审计应记下候选项"
+        assert any("multi" in str(e) for e in asked), "审计应记下多选标记"
         await c.teardown()
 
     _run(s())

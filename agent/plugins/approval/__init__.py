@@ -27,6 +27,7 @@ import uuid
 from agent.api import (AgentError, Events, Services, StateKeys, durable,
                        now_iso, plugin)
 
+from .options import normalize_options
 from .pending import PendingTable
 from .policy import MODES, decide
 from .providers import build_provider
@@ -43,12 +44,26 @@ DEFAULT_CONFIG: dict = {
 }
 
 
+def _picked(ans: dict) -> list[str]:
+    """把应答里的单选 ``choice`` / 多选 ``choices`` 统一成取值列表（保序去空去重）。"""
+    raw = ans.get("choices")
+    if raw is None:
+        raw = ans.get("choice")
+    items = list(raw) if isinstance(raw, (list, tuple)) else ([raw] if raw is not None else [])
+    out: list[str] = []
+    for it in items:
+        s = str(it).strip() if it is not None else ""
+        if s and s not in out:
+            out.append(s[:200])
+    return out
+
+
 @plugin
 class Approval:
     """ctx.approval —— 人在环中审批 + 权限模式（会话档位持有者）。"""
 
     name = "plugins.approval"
-    version = "0.3.0"
+    version = "0.4.0"
     layer = "system"
     provides = [Services.APPROVAL]
     inject = [Services.EVENTS, Services.DB]
@@ -77,13 +92,24 @@ class Approval:
                 "question": {"type": "str", "required": True,
                              "description": "要问用户的问题（具体、可决策）"},
                 "options": {"type": "str", "required": False, "default": "",
-                            "description": "候选方案，逗号分隔（如：方案A,方案B,方案C）"},
+                            "description": (
+                                "候选方案。**推荐传 JSON 数组字符串**，元素可为纯文本或对象；"
+                                "对象字段：label（选项名，必填）、desc（一句话说明为什么可行）、"
+                                "value（回传值，缺省同 label）、group（分组名，用于按维度分区）。"
+                                '例：\'[{"label":"方案A","desc":"改动最小","group":"技术"},'
+                                '{"label":"方案B","desc":"能力最强","group":"产品"}]\'。'
+                                "也兼容逗号/换行分隔的纯文本（如 方案A,方案B）")},
+                "multi": {"type": "bool", "required": False, "default": False,
+                          "description": ("是否允许多选（默认单选）。多选时用户勾选若干项后"
+                                          "一次提交，你会收到 choices 列表")},
                 "allow_free_text": {"type": "bool", "required": False, "default": True,
                                     "description": "是否允许用户自由输入文字补充指示"},
             },
             handler=self._ask_user, owner="plugins.approval",
             description=("当你不确定用户想要哪个方案/方向时，调用此工具向用户提问："
                          "会弹出交互卡片，用户可点选方案或输入文字指示，答复前执行暂停；"
+                         "候选较多或需要说明差异时，用 options 的 JSON 对象数组给出"
+                         "label + desc，需要用户同时定多个点时把 multi 设为 true；"
                          "超时未答将收到未应答通知，届时按最合理假设继续并说明假设"),
             risk="read")
 
@@ -246,8 +272,12 @@ class Approval:
     # ---------- 澄清问询（ask_user：不止二元审批，人可点选/输入文字指示） ----------
 
     async def _ask_user(self, question: str = "", options: str = "",
-                        allow_free_text: bool = True, **_) -> dict:
-        """模型主动问用户：发交互卡片（选项按钮 + 自由文本），等答复后回灌。
+                        multi: bool = False, allow_free_text: bool = True, **_) -> dict:
+        """模型主动问用户：发交互卡片（选择规格 + 自由文本），等答复后回灌。
+
+        ``options`` 经 ``normalize_options`` 归一为选择规格（label/value/desc/group），
+        卡片据此渲染形态匹配的选择栏（单选/多选、带说明、分区），而非把所有候选
+        压进同一个扁平选择栏；``multi=True`` 时用户可勾选多项，回灌 ``choices`` 列表。
 
         fail-safe：非交互通道（问不等人）⇒ 立即告知模型自行假设；
         超时/未应答 ⇒ 返回 ``answered=False`` 并附假设提示，模型可继续推进。
@@ -260,12 +290,16 @@ class Approval:
                                "无法等待用户输入；请按最合理假设继续，并在答复中说明该假设")}
         call_id = uuid.uuid4().hex
         started = time.monotonic()
-        opts = [s.strip() for s in str(options or "").replace("，", ",").split(",") if s.strip()]
+        opts = normalize_options(options)
+        is_multi = bool(multi) and bool(opts)          # 无候选时多选无意义，退回单选语义
         req = {"call_id": call_id, "kind": "ask_user", "question": question,
-               "options": opts, "allow_free_text": bool(allow_free_text)}
+               "options": opts, "multi": is_multi,
+               "allow_free_text": bool(allow_free_text)}
         await self._audit(Events.APPROVAL_ASKED,
                           {"call_id": call_id, "tool": "approval.ask_user",
-                           "risk": "read", "mode": self.mode(), "question": question})
+                           "risk": "read", "mode": self.mode(), "question": question,
+                           "multi": is_multi,
+                           "options": [o["label"] for o in opts]})
         try:
             await ctx.events.emit(Events.ASK_USER_PENDING, req)
         except Exception:                           # noqa: BLE001 —— 遥测失败不阻断问询
@@ -278,24 +312,32 @@ class Approval:
         waited_ms = int((time.monotonic() - started) * 1000)
         by = str(ans.get("by", "unknown"))
         answered = bool(ans.get("answered"))
-        choice = ans.get("choice")
+        picked = _picked(ans)                       # 单选 choice / 多选 choices 统一为列表
+        choice = picked[0] if len(picked) == 1 else None
         text = str(ans.get("text") or "").strip()
         await self._audit(Events.APPROVAL_ANSWERED, {
             "call_id": call_id, "tool": "approval.ask_user", "approved": answered,
-            "by": by, "waited_ms": waited_ms, "choice": choice, "text": text})
+            "by": by, "waited_ms": waited_ms, "choice": choice,
+            "choices": picked, "text": text})
         try:
             await ctx.events.emit(Events.ASK_USER_ANSWERED,
                                   {"call_id": call_id, "answered": answered, "by": by})
         except Exception:                           # noqa: BLE001 —— 遥测失败不阻断主链路
             pass
-        if not answered and not text and choice is None:
+        if not answered and not text and not picked:
             reason = ("用户未应答（超时）" if by == "timeout"
                       else "用户未给出有效答复" if by == "user"
                       else f"问询通道异常（by={by}）")
             return {"answered": False,
                     "reason": f"{reason}；请按最合理假设继续，并在答复中明确说明该假设"}
-        return {"answered": True, "by": by, "choice": choice, "text": text,
-                "hint": "已获得用户指示，请严格按其继续"}
+        out: dict = {"answered": True, "by": by, "choices": picked, "text": text}
+        if choice is not None:
+            out["choice"] = choice                      # 单项答复：额外给单值，便于模型直取
+        if is_multi:
+            out["multi"] = True
+        out["hint"] = ("已获得用户指示，请严格按其继续" if len(picked) <= 1
+                       else "用户同时选了多项，请一并满足；相互冲突时以先列出者为主")
+        return out
 
     # ---------- 待答表（交互式 provider 基座；本期测试覆盖） ----------
 
