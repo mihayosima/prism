@@ -33,6 +33,7 @@ from agent.api import (
     now_iso,
     plugin,
 )
+from agent.core.request_cost import estimate_request_cost
 
 PLAN_SYSTEM = (
     "你是通用 Agent 的任务规划器。根据用户输入只输出一个 JSON（不要解释，不要 markdown 围栏）：\n"
@@ -57,6 +58,12 @@ PLAN_SCHEMA = {
 }
 
 HISTORY_LIMIT = 12   # 短期记忆窗口：最近 N 条消息（≈6 轮）
+
+# G4：治理器 token 配额 → memory.context max_chars 反推（详见 docs/governance/记忆配额反推方案-2026-09-28.md）
+# 反推系数：core/tokens.py 的 CJK 启发式为 0.75 token/字 ⇒ 1 token ≈ 1.33 中文字符；
+# 取 1.5 为宽松经验值（中文主导场景留余量）；严格不超 token 配额可改 1.33（=1/0.75）。
+_MEMORY_TOKEN_TO_CHAR = 1.5
+_MEMORY_MAX_CHARS_MIN = 600   # 保底下限，退化配置仍有可用记忆
 
 
 def _env_facts(environ: dict | None = None) -> str:
@@ -107,6 +114,19 @@ def _fallback_assemble(blocks: list[dict]) -> _Assembled:
         for m in b["payload"]:
             prior.append({k: v for k, v in m.items() if k != "seq"})
     return _Assembled(system_text=system_text, prior=prior)
+
+
+def is_resume_intent(ctx, message: str) -> bool:
+    """P2：续接意图识别（决议暂定轻量关键词匹配；词表配置化，可后升级为 ask_user）。
+
+    模块级纯函数（@plugin 包装类上取不到属性，测试/消费方一律 import 本名）。
+    """
+    cfg = ((getattr(ctx, "config", None) or {}).get("agent") or {}).get("react") or {}
+    kws = cfg.get("resume_keywords") or []
+    text = str(message or "").strip().lower()
+    if not text or not kws:
+        return False
+    return any(str(k).lower() in text for k in kws)
 
 
 @dataclass(slots=True)
@@ -187,7 +207,8 @@ class ChatDriver:
         """
         try:
             res: ReactResultLike = await ctx.react.run(ctx, message, session_id=session_id,
-                                                       prior=prior)
+                                                       prior=prior,
+                                                       resume=is_resume_intent(ctx, message))
         except asyncio.CancelledError:
             # 取消既非成功也非失败：如实落审计后**原样抛出**（不吞，保持取消语义）
             try:
@@ -206,6 +227,9 @@ class ChatDriver:
             try:
                 await ctx.memory.remember(ctx, {
                     "user": message, "reply": text,
+                    # C（方案）：进度快照——收尾摘要前置，确保 LLM 提取（4000 字符截断）
+                    # 时进度信息不被大体积 evidence 挤掉，「继续」可低成本续接。
+                    "progress": str(getattr(res, "summary", "") or "")[:1500],
                     "plan": {"intent": "react"}, "evidence": res.as_evidence(),
                 })
             except Exception as exc:  # noqa: BLE001
@@ -379,12 +403,15 @@ class ChatDriver:
         if gov is not None:
             fn = getattr(gov, "assemble", None)
             if callable(fn):
-                for kwargs in ({"reserve_tokens": reserve}, {}):
+                from agent.api import cost_factor
+                tries = ({"reserve_tokens": reserve, "cost_factor": cost_factor(ctx)},
+                         {"reserve_tokens": reserve}, {})
+                for kwargs in tries:
                     try:
                         asm = fn(blocks, **kwargs)
                         break
                     except TypeError:
-                        continue        # 注入实现不认该参数 → 退回原签名
+                        continue        # 注入实现不认该参数 → 退回更旧签名
                     except Exception as exc:  # noqa: BLE001 —— 装配失败退降级，绝不裸崩
                         logging.getLogger("agent.chat").warning("context assemble failed: %s", exc)
                         break
@@ -419,7 +446,15 @@ class ChatDriver:
         if not ctx.has(Services.MEMORY):
             return ""
         try:
-            return await ctx.memory.context(ctx, query, limit=5)
+            # G4：用治理器反推的记忆配额（token）挂钩窗口预算（默认 1800 token）
+            max_chars = 1200  # 退化默认，与改动前一致
+            gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
+            if gov is not None:
+                max_chars = max(
+                    _MEMORY_MAX_CHARS_MIN,
+                    int(gov.memory_budget() * _MEMORY_TOKEN_TO_CHAR),
+                )
+            return await ctx.memory.context(ctx, query, limit=5, max_chars=max_chars)
         except Exception:  # noqa: BLE001 —— 召回失败不影响对话
             return ""
 
@@ -441,7 +476,11 @@ class ChatDriver:
             {"key": "env", "kind": "text", "present": True, "payload": _env_facts(),
              "rigid": True, "priority": 90},
         ]
-        system = (await self._assemble(ctx, blocks, stage="plan")).system_text
+        # 彻底版·统一账本：plan 调用带 schema（response_format），属请求附加项、不在 messages
+        # 预算内，装配时经 reserve_tokens 先扣其占用，使窗口总占用对齐真实 prompt_tokens。
+        reserve = estimate_request_cost(messages=[], tools=None, schema=PLAN_SCHEMA)
+        system = (await self._assemble(ctx, blocks, stage="plan",
+                                       reserve_tokens=reserve)).system_text
         messages = ([{"role": "system", "content": system}] + list(prior)
                     + [{"role": "user", "content": message}])
         try:
@@ -555,4 +594,4 @@ class Chat:
         ctx.provide(Services.CHAT, ChatDriver())
 
 
-__all__ = ["Chat", "ChatDriver", "ChatReply"]
+__all__ = ["Chat", "ChatDriver", "ChatReply", "is_resume_intent"]

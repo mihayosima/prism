@@ -94,15 +94,19 @@ def _chain_of(n_observe: int, *, pinned_idx: tuple[int, ...] = ()) -> list[dict]
 
 
 def test_prepare_chain_folds_only_old_unpinned_observes():
-    """**只折叠**老观察（``type=="observe"`` 且未 pinned）；think/act 不动；**不丢条目**。"""
+    """**只折叠**老观察（``type=="observe"`` 且未 pinned）；think/act 不动；**不丢条目**。
+
+    D2 后：无工作记忆（wm=None）时 act 折叠自动关闭——本例无 wm，act/think 均不动。
+    """
     loop = ReactLoop(None, None, None, None, ReactConfig())          # type: ignore[arg-type]
     gov = _FakeGov(threshold=10)
     chain = _chain_of(5, pinned_idx=(0,))
     n_before = len(chain)
-    out, newly = loop._prepare_chain(gov, chain, keep_recent=2)      # 最近 2 条原文保留
+    out, newly, act_folds = loop._prepare_chain(gov, chain, keep_recent=2)
 
     assert len(out) == n_before                                     # 绝不丢条目
     assert newly == 2                                               # o1、o2 被折叠（o0 已 pinned）
+    assert act_folds == 0                                           # 无 wm → act 折叠关闭
     assert gov.calls == [] or "L" * 100 in "".join(gov.calls)        # 折叠的是观察正文
     folded = [m for m in out if m.get("id") in ("o1", "o2")]
     assert all("[省略]" in m["content"]["tool_results"][0]["content"] for m in folded)
@@ -218,9 +222,14 @@ def test_prior_is_rigid_and_chain_reserve_is_applied(tmp_path):
         assert reply.ok and reply.plan["intent"] == "react"
         # 会话级装配（chat）：有效预算 = 输入预算 - chain 保底（为循环预留）
         assert priors[-1]["input_budget"] == gov.input_budget() - gov.react_min_chain_tokens()
-        # 循环内装配（react）：用满输入预算（保底已被消费）
+        # 循环内装配（react）：chain 保底已被消费，但仍需为 native tools 目录预留
+        # （S3 彻底版·统一账本：tools 是请求附加项、不在 messages 预算内，先扣其占用）
+        from agent.api import estimate_request_cost
+        from agent.plugins.react.loop import visible_tools
+        expect = gov.input_budget() - estimate_request_cost(
+            messages=[], tools=visible_tools(c.root))
         p = chain_wins[-1]
-        assert p["input_budget"] == gov.input_budget()
+        assert p["input_budget"] == expect
         prior_block = next(b for b in p["blocks"] if b["key"] == "react_prior")
         assert prior_block["reason"] == "ok"                      # 未超预算 → 不被重裁
         assert prior_block["used"] == prior_block["requested"]

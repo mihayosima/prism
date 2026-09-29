@@ -22,8 +22,10 @@ from .errors import ConfigError
 _SCHEMA: dict[str, Any] = {
     "db_path": str,
     "agent": {
-        "llm": {"provider": str, "model": str, "stream": bool},
-        "budget": {"max_tokens_per_run": int, "reset_on_new_session": bool},
+        "llm": {"provider": str, "model": str, "stream": bool, "max_tokens": int},
+        "budget": {"max_tokens_per_run": int, "reset_on_new_session": bool,
+                   "finalize_reserve_tokens": int, "warning_ratio": (int, float),
+                   "cost_calibration": bool},   # 方案A：收尾预留额度
         "permissions": {"default": str, "task_allow": list, "task_deny": list, "llm": str,
                         "risk": dict},   # S5：按风险级裁决 {"read":"allow","danger":"deny",...}
         "loop": {"deadline_s": (int, float)},

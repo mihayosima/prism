@@ -34,6 +34,13 @@ FINAL_SYSTEM = (
     "给用户一段简洁诚实的答复：说明已完成什么、还缺什么、为何停止。不要调用工具，不要编造。"
 )
 
+# D1：预算预警提示（budget 置 BUDGET_WARNING 旗标后，react 每步窗口注入一次；零直连）
+BUDGET_TIGHT_SYSTEM = (
+    "[预算提示] token 预算即将耗尽（已越过预警阈值）。请立即收束：\n"
+    "- 不再发起大参数工具调用（如整段长文写入），改用最小必要操作；\n"
+    "- 尽快基于已有观察输出最终答复；确有未竟事项，如实列出，不要硬撑。"
+)
+
 
 def env_facts(environ: dict | None = None) -> str:
     """运行环境事实块（纯函数，可注入 environ 便于离线快照测试）。"""
@@ -84,4 +91,5 @@ def as_text(value) -> str:
 
 
 __all__ = ["TURN_MARK", "FINAL_MARK", "REACT_SYSTEM", "FINAL_SYSTEM",
+           "BUDGET_TIGHT_SYSTEM",
            "env_facts", "render_tools", "build_system", "as_text"]

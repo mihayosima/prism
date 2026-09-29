@@ -17,8 +17,14 @@ class Events:
     LLM_PRE_CALL = "agent/llm/pre-call"
     LLM_POST_CALL = "agent/llm/post-call"
     LLM_CALL_FAILED = "agent/llm/call-failed"   # S1：provider 失败（durable 审计 + budget 退款）
+    LLM_TRUNCATED = "agent/llm/truncated"       # E：finish_reason=length 生成被截断（durable 审计）
     LLM_TOKEN = "agent/llm/token"          # B5.2 打字机：每片文本 {"text": 片段}
     LLM_THINKING = "agent/llm/thinking"    # B5.2 思考流（D4）：reasoning_content 每片 {"text": 片段}
+
+    # 预算（D1）：跨阈值预警（budget 发；消费方按需读 BUDGET_WARNING 状态键，零直连）
+    BUDGET_WARNING = "agent/budget/warning"
+    # 口径（F3）：估算与真实计费偏差超阈值（budget durable 落盘，可事后回放）
+    LLM_COST_DRIFT = "agent/llm/cost-drift"
 
     # 任务（工具）生命周期
     TASKS_PRE_EXECUTE = "agent/tasks/pre-execute"
@@ -49,6 +55,7 @@ class Events:
     REACT_STEP_END = "agent/react/step/end"
     REACT_FINAL = "agent/react/final"
     REACT_EXHAUSTED = "agent/react/exhausted"
+    REACT_ARCHIVED = "agent/react/archived"  # P1：链存档落工作记忆（审计）
 
     # 记忆插件
     MEMORY_REMEMBERED = "agent/memory/remembered"
@@ -75,8 +82,11 @@ EVENT_MODE: dict[str, str] = {
     Events.LLM_PRE_CALL: "waterfall",
     Events.LLM_POST_CALL: "emit",
     Events.LLM_CALL_FAILED: "emit",        # S1：失败审计/退款（live 通知 budget；durable 由 llm 接缝直写）
+    Events.LLM_TRUNCATED: "emit",          # E：截断审计（durable 由 llm 接缝直写；无 live 监听者）
     Events.LLM_TOKEN: "emit",              # B5.2 流式打字机（遥测性质，不进 required seam）
     Events.LLM_THINKING: "emit",           # B5.2 思考流（D4）：同属遥测性质，不进 required seam
+    Events.BUDGET_WARNING: "emit",         # D1：跨阈值预警（durable 由 budget 直写；live 通知遥测面）
+    Events.LLM_COST_DRIFT: "emit",         # F3：口径漂移审计（durable 由 budget 直写；无 live 监听者）
     Events.TASKS_PRE_EXECUTE: "waterfall",
     Events.TASKS_POST_EXECUTE: "emit",
     Events.CHAT_IN: "emit",
@@ -96,6 +106,7 @@ EVENT_MODE: dict[str, str] = {
     Events.REACT_STEP_END: "emit",
     Events.REACT_FINAL: "emit",
     Events.REACT_EXHAUSTED: "emit",
+    Events.REACT_ARCHIVED: "emit",        # P1：链存档审计（durable 由 react 直写）
     Events.MEMORY_REMEMBERED: "emit",
     Events.MEMORY_RECALL: "emit",
     Events.CONTEXT_GOVERNED: "emit",      # G1：装配元数据遥测（无监听者即 no-op）

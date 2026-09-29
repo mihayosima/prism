@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 
 from agent.api import AgentError, Services, StateKeys
-from agent.profiles import build_agent
+from agent.profiles import BASE_AGENT_CONFIG, build_agent
 from agent.sys.progress import tap_progress
 
 
@@ -106,6 +106,12 @@ _SETTING_SCHEMA = {
     "provider": ("choice", ["auto-deny", "auto-allow", "web", "cli"]),
     "timeout_s": (int, 1, 3600),
     "ask": ("list",),                                      # fnmatch 工具名名单
+    # ---- 成本护栏（agent.budget 内核托管节；经 plugins.budget 覆盖映射，见 _merge_cfg）----
+    "max_tokens_per_run": (int, 1000, 10_000_000),         # 容器生命周期累计 LLM token 上限
+    "finalize_reserve_tokens": (int, 0, 1_000_000),        # 方案A：收尾预留额度（收尾专用）
+    "cost_calibration": ("bool",),                        # F1：口径自校准（EWMA 因子）
+    # ---- 工具懒加载（plugins.react；L1 灰度开关）----
+    "lazy_tools": ("bool",),
 }
 _PLUGIN_OF_KEY = {
     "compact_trigger_tokens": "plugins.short_term",
@@ -122,6 +128,10 @@ _PLUGIN_OF_KEY = {
     "provider": "plugins.approval",
     "timeout_s": "plugins.approval",
     "ask": "plugins.approval",
+    "max_tokens_per_run": "plugins.budget",
+    "finalize_reserve_tokens": "plugins.budget",
+    "cost_calibration": "plugins.budget",
+    "lazy_tools": "plugins.react",
 }
 _SETTING_DEFAULTS = {
     "compact_trigger_tokens": 12000,
@@ -138,6 +148,15 @@ _SETTING_DEFAULTS = {
     "provider": "web",
     "timeout_s": 30,
     "ask": [],
+    # 与 profiles.BASE_AGENT_CONFIG 的 budget 默认同源（避免两处硬编码漂移）
+    "max_tokens_per_run": (((BASE_AGENT_CONFIG.get("agent") or {}).get("budget") or {})
+                           .get("max_tokens_per_run", 200000)),
+    "finalize_reserve_tokens": (((BASE_AGENT_CONFIG.get("agent") or {}).get("budget") or {})
+                                .get("finalize_reserve_tokens", 0)),
+    "cost_calibration": (((BASE_AGENT_CONFIG.get("agent") or {}).get("budget") or {})
+                         .get("cost_calibration", True)),
+    "lazy_tools": (((BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {})
+                   .get("lazy_tools", False)),
 }
 
 
@@ -147,6 +166,10 @@ def _coerce_setting(key: str, raw):
         raise ValueError(f"未知设置项: {key}")
     spec = _SETTING_SCHEMA[key]
     kind = spec[0]
+    if kind == "bool":                                     # 开关：on/true/1/是/开 → True
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in ("1", "true", "on", "yes", "是", "开")
     if kind == "choice":                                   # 枚举：provider 通道名
         val = str(raw or "").strip()
         if val not in spec[1]:
@@ -881,9 +904,25 @@ $('#pluginsBox').addEventListener('click',e=>{
 });
 function renderSettings(j){
   const box=$('#settingsBox');
-  if(j.context_plugin_enabled!==true){
-    box.innerHTML='<h3>上下文管理</h3><div class="card muted">上下文管理插件（plugins.context）未启用 —— 在「插件」页点「启用」后，可在此调整参数。</div>';return;}
   const v=j.values||{};
+  // 预算卡片恒渲染（budget 是 sys 层护栏，不随 context 插件启停）
+  let h='<div class="card"><h3 style="margin-top:0">成本护栏（budget）</h3>'
+    +'<div class="muted" style="margin-bottom:10px">LLM 调用的生命周期累计 token 上限：每次调用前先按估算预借、结束后按服务商真实用量对账；超限即拒绝调用。保存后立即重建容器生效（<b>已用量重计</b>）。覆盖写入 data/agent_plugin_config.json，重启后保持。</div>'
+    +'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px">运行预算上限 max_tokens_per_run (token)</div>'
+    +'<input id="set_max_tokens_per_run" type="number" step="1000" min="1000" value="'+esc(v.max_tokens_per_run)+'" style="width:240px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit">'
+    +'<div class="muted" style="font-size:11px;margin-top:3px">当前默认 200000；网页「新会话」也会把已用量归零重计</div></label>'
+    +'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px">收尾预留额度 finalize_reserve_tokens (token)</div>'
+    +'<input id="set_finalize_reserve_tokens" type="number" step="1000" min="0" value="'+esc(v.finalize_reserve_tokens)+'" style="width:240px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit">'
+    +'<div class="muted" style="font-size:11px;margin-top:3px">预算末段的收尾专用额度：正常调用只能用到「上限 − 预留」，触顶后的总结陈词可动用预留段，保证耗尽时也有体面收尾（0 = 关闭预留）。须不小于收尾窗口体积（建议 ≥ 24000）</div></label>'
+    +'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px"><input id="set_cost_calibration" type="checkbox"'+(v.cost_calibration?' checked':'')+'> 口径自校准 cost_calibration</div>'
+    +'<div class="muted" style="font-size:11px">用服务商真实用量持续修正字符估算的偏差（实测约 30%），使预算判定与窗口装配贴近真实计费；样本不足 5 次时自动退回裸估算。关闭 = 回到纯估算口径。</div></label></div>'
+    +'<div class="card" style="margin-top:16px"><h3 style="margin-top:0">工具懒加载（plugins.react）</h3>'
+    +'<div class="muted" style="margin-bottom:10px">开启后每次请求只携带「工具目录卡」（名称+一行描述+参数名，无完整 JSON Schema），模型经 tool_search / tool_load 元工具按需加载完整定义，可显著降低工具定义的 token 开销。默认关闭（灰度）。</div>'
+    +'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px"><input id="set_lazy_tools" type="checkbox"'+(v.lazy_tools?' checked':'')+'> 启用懒加载 lazy_tools</div>'
+    +'<div class="muted" style="font-size:11px">模型对未加载工具的调用会得到「未加载」错误观察并自行纠正；执行面闸门（审批/只读裁剪）不受影响。</div></label></div>';
+  if(j.context_plugin_enabled!==true){
+    h+='<div class="card muted" style="margin-top:16px">上下文管理插件（plugins.context）未启用 —— 在「插件」页点「启用」后，可在此调整参数。</div>';
+  }else{
   const fields=[
     ['compact_trigger_tokens','压缩触发阈值 (token)','未摘要历史达到此值即压缩（压缩时机由该阈值单独决定）'],
     ['max_context_tokens','上下文窗口上限 (token)','治理器输入窗口总预算上限'],
@@ -898,12 +937,13 @@ function renderSettings(j){
     ['react_min_chain_tokens','循环内 · 链保底额度 (token)','装配会话历史时为多步循环预留的额度，防止循环无空间'],
   ];
   const isFloat=k=>(k==='memory_ratio'||k==='history_ratio');
-  let h='<h3>上下文管理 <span class="tag blue">plugins.context 已启用</span></h3>'
+    h+='<h3 style="margin-top:16px">上下文管理 <span class="tag blue">plugins.context 已启用</span></h3>'
     +'<div class="card"><div class="muted" style="margin-bottom:10px">启用上下文管理插件时可调；保存后立即重建容器生效。覆盖写入 data/agent_plugin_config.json，重启后保持。</div>';
   h+=fields.map(([k,label,hint])=>'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px">'+esc(label)+'</div>'
     +'<input id="set_'+k+'" type="number" step="'+(isFloat(k)?'0.01':'1')+'" value="'+esc(v[k])+'" style="width:240px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit">'
     +'<div class="muted" style="font-size:11px;margin-top:3px">'+esc(hint)+'</div></label>').join('');
   h+='</div>';                                             // 上下文管理卡片收口
+  }                                                        // context 启用分支收口
   if(j.approval_enabled===false){
     h+='<div class="card muted" style="margin-top:16px">审批插件（plugins.approval）未启用 —— 在「插件」页点「启用」后，可在此调整。</div>';
   }else{
@@ -930,9 +970,11 @@ function renderSettings(j){
 }
 async function saveSettings(){
   const isFloat=k=>(k==='memory_ratio'||k==='history_ratio');
-  const keys=['compact_trigger_tokens','max_context_tokens','reserve_output_tokens','memory_ratio','history_ratio','source_clip_tokens','clip_max_tokens','clip_head_tokens','clip_tail_tokens','react_keep_recent','react_min_chain_tokens'];
+  const keys=['max_tokens_per_run','finalize_reserve_tokens','compact_trigger_tokens','max_context_tokens','reserve_output_tokens','memory_ratio','history_ratio','source_clip_tokens','clip_max_tokens','clip_head_tokens','clip_tail_tokens','react_keep_recent','react_min_chain_tokens'];
   const patch={};
   for(const k of keys){const el=$('#set_'+k);if(el&&el.value!==''){patch[k]=isFloat(k)?parseFloat(el.value):parseInt(el.value,10);}}
+  const cc=$('#set_cost_calibration');if(cc)patch.cost_calibration=cc.checked;   // F1 开关
+  const lt=$('#set_lazy_tools');if(lt)patch.lazy_tools=lt.checked;               // L1 开关
   const pv=$('#set_provider');if(pv)patch.provider=pv.value;      // 审批插件三项
   const tv=$('#set_timeout_s');if(tv&&tv.value!=='')patch.timeout_s=parseInt(tv.value,10);
   const av=$('#set_ask');if(av)patch.ask=av.value.split(',').map(s=>s.trim()).filter(Boolean);
@@ -943,7 +985,7 @@ async function saveSettings(){
   catch(e){$('#setMsg').textContent='失败：'+e.message;}
 }
 async function resetSettings(){
-  if(!confirm('恢复默认参数？当前覆盖（上下文管理 / 审批插件）将被清除。'))return;
+  if(!confirm('恢复默认参数？当前覆盖（成本护栏 / 上下文管理 / 审批插件）将被清除。'))return;
   $('#setMsg').textContent='恢复中…';
   try{const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset:true})});
     const j=await r.json();if(!j.ok){$('#setMsg').textContent='失败：'+(j.error||r.status);return;}
@@ -1422,7 +1464,8 @@ async def _serve(args: argparse.Namespace) -> int:
         try:
             if bool(body.get("reset")):
                 ov = _load_overrides()
-                for pid in ("plugins.context", "plugins.short_term", "plugins.approval"):
+                for pid in ("plugins.context", "plugins.short_term", "plugins.approval",
+                            "plugins.budget", "plugins.react"):
                     ov.pop(pid, None)
                 _save_overrides(ov)
                 await _apply_rebuild()

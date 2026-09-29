@@ -15,8 +15,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from agent.api import AgentError, CapabilityNotImplemented, Events, Services, durable, plugin
+from agent.api import (AgentError, CapabilityNotImplemented, Events, Services, durable,
+                       now_iso, plugin)
 from agent.api import estimate_tokens
+from agent.core.request_cost import wire_messages as _wire_messages, wire_tools as _wire_tools
 
 
 class LlmProvider(Protocol):
@@ -72,17 +74,20 @@ class LlmService:
 
     async def complete(self, ctx, messages: list[dict], *,
                        schema: dict | None = None, tools: list[dict] | None = None,
-                       caller: str = "unknown") -> LlmResult:
+                       caller: str = "unknown", finalize: bool = False) -> LlmResult:
         """模型调用（消费方视角，契约见 ``core/contract.LlmProvider``）。
 
         pre-call waterfall（guard→budget 预借）→ provider.complete → post-call 入账；
         失败发 ``agent/llm/call-failed``（budget 同步监听器内联退款）后原样抛出。
         结果与 ``stream`` 配置无关（schema 调用走流式也返回已解析 dict）。
+        ``finalize=True``（方案A）：标记为触顶收尾调用——budget 据此允许动用
+        收尾预留额度（正常调用只能用 ``max_tokens_per_run - finalize_reserve_tokens``）。
         """
         decision = await ctx.events.waterfall(
             Events.LLM_PRE_CALL,
             {"messages": messages, "schema": schema, "caller": caller,
-             "tools": [str(t.get("name", "")) for t in (tools or [])]},
+             "tools": tools, "finalize": bool(finalize)},
+            # 传原始工具目录（native 形态），由 budget 经 core 估算器同源计量
         )
         if isinstance(decision, dict) and decision.get("denied"):
             raise CapabilityNotImplemented(
@@ -97,16 +102,25 @@ class LlmService:
             await durable(ctx, Events.LLM_CALL_FAILED, dict(payload))
             await ctx.events.emit(Events.LLM_CALL_FAILED, dict(payload))
             raise
+        # E 遥测：生成被服务端截断（finish_reason=length）→ durable 落盘，可事后回放。
+        # 这是当晚「漏 mode 参数」事故的真源头，此前此信号被完全丢弃。
+        if isinstance(data, dict) and data.get("truncated"):
+            await durable(ctx, Events.LLM_TRUNCATED,
+                          {"caller": caller, "finish_reason": data.get("finish_reason"),
+                           "at": now_iso()})
         # S6：优先用 provider 返回的真实 usage 入账（诚实口径）；无则回退估算。
         usage = data.pop("usage", None) if isinstance(data, dict) else None
+        cache_hit = None                     # P3：前缀缓存命中（DeepSeek usage 字段，尽力而为）
         if usage and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
             tokens_in = int(usage.get("prompt_tokens") or 0) or estimate_tokens(messages)
             tokens_out = int(usage.get("completion_tokens") or 0) or estimate_tokens(data)
+            if usage.get("prompt_cache_hit_tokens") is not None:
+                cache_hit = int(usage.get("prompt_cache_hit_tokens") or 0)
         else:
             tokens_in, tokens_out = estimate_tokens(messages), estimate_tokens(data)
         await ctx.events.emit(Events.LLM_POST_CALL, {
             "provider": self._model, "tokens_in": tokens_in, "tokens_out": tokens_out,
-            "caller": caller,
+            "caller": caller, "cache_hit": cache_hit,
         })
         return LlmResult(data=data, tokens_in=tokens_in, tokens_out=tokens_out,
                          model=self._model, provider=self.provider_label)
@@ -127,100 +141,26 @@ def _parse_json(text: str) -> dict:
     return data
 
 
-def _wire_messages(messages: list[dict]) -> list[dict]:
-    """内部消息形状 → OpenAI 兼容 wire 形状（无工具时等价恒等）。
-
-    内部：``{"role": "assistant", "content": str, "tool_calls": [{id,name,arguments}]}``
-    与 ``{"role": "user", "content": {"tool_results": [...]}}``（观察回灌）。
-    wire：assistant.tool_calls[].function.arguments 为 JSON 字符串；观察展开为多条 role=tool。
-    """
-    out: list[dict] = []
-    for m in messages or []:
-        role = m.get("role")
-        content = m.get("content")
-        if role == "assistant" and m.get("tool_calls"):
-            calls = []
-            for i, c in enumerate(m.get("tool_calls") or []):
-                calls.append({
-                    "id": str(c.get("id") or f"call_{i}"),
-                    "type": "function",
-                    "function": {"name": str(c.get("name") or ""),
-                                 "arguments": json.dumps(c.get("arguments") or {},
-                                                         ensure_ascii=False)},
-                })
-            out.append({"role": "assistant",
-                        "content": content if isinstance(content, str) and content else None,
-                        "tool_calls": calls})
-            continue
-        if isinstance(content, dict) and content.get("tool_results") is not None:
-            for r in content["tool_results"]:
-                out.append({"role": "tool",
-                            "tool_call_id": str(r.get("tool_call_id") or ""),
-                            "content": str(r.get("content") or "")})
-            continue
-        if isinstance(content, str):
-            out.append({"role": role, "content": content})
-        else:
-            out.append({"role": role, "content": json.dumps(content, ensure_ascii=False)})
-    return out
-
-
-_JSON_TYPES = {"str": "string", "int": "integer", "float": "number",
-               "bool": "boolean", "array": "array", "object": "object"}
-
-# OpenAI / DeepSeek 工具名硬约束：仅允许 ^[a-zA-Z0-9_-]+$。
-# 内部工具名带命名空间（如 mcp.windows.xxx、agent.ping），发往模型前必须净化，
-# 模型回传的净化名再映射回内部原名以驱动 ctx.tasks.invoke。
-_TOOL_NAME_UNSAFE = re.compile(r"[^a-zA-Z0-9_-]")
-
-
-def _safe_tool_name(name: str) -> str:
-    """内部工具名 → 合规 wire 名（非法字符替换成 '_'）。"""
-    safe = _TOOL_NAME_UNSAFE.sub("_", name or "")
-    return safe or "tool"
-
-
-def _wire_tools(tools: list[dict]) -> tuple[list[dict], dict[str, str]]:
-    """工具目录（``TaskRegistry.catalog()`` 形状）→ OpenAI 兼容 tools 数组。
-
-    返回 ``(wired_tools, {safe_name: original_name})``：映射表供回程把模型
-    回传的净化名还原成内部原名，避免命名空间信息在 wire 上丢失。
-    重名冲突（不同原名净化后相同）自动追加 ``_2`` / ``_3`` 后缀消歧。
-    """
-    out: list[dict] = []
-    name_map: dict[str, str] = {}
-    seen: dict[str, str] = {}
-    for t in tools or []:
-        orig = str(t.get("name") or "")
-        base = _safe_tool_name(orig)
-        safe = base
-        i = 2
-        while safe in seen and seen[safe] != orig:
-            safe = f"{base}_{i}"
-            i += 1
-        seen[safe] = orig
-        name_map[safe] = orig
-        props = {k: {"type": _JSON_TYPES.get(str(v.get("type", "object")), "object")}
-                 for k, v in (t.get("params") or {}).items()}
-        out.append({"type": "function", "function": {
-            "name": safe,
-            "description": str(t.get("description") or "")[:200],
-            "parameters": {"type": "object", "properties": props,
-                           "required": [str(k) for k in (t.get("required") or [])]}}})
-    return out, name_map
-
-
 def _wire_call(raw: dict, name_map: dict[str, str] | None = None) -> dict:
     fn = raw.get("function") or {}
     raw_name = str(fn.get("name") or "")
     # 模型回传的是净化名，还原成内部原名（找不到则原样回退，兼容 fixture 路径）
     name = (name_map or {}).get(raw_name, raw_name)
+    raw_args = fn.get("arguments")
+    truncated = False
     try:
-        args = json.loads(fn.get("arguments") or "{}")
+        args = json.loads(raw_args or "{}")
     except (TypeError, ValueError):
-        args = {}
-    return {"id": str(raw.get("id") or ""), "name": name,
-            "arguments": args if isinstance(args, dict) else {}}
+        # E（生成侧截断防护）：残缺/截断的参数 JSON **不再静默吞成 {}**——
+        # 显式打 truncated 标记并保留原始片段，由 Actor 回灌自纠指引
+        # （此前这里的静默吞正是「缺少必填参数 mode」误导表象的来源）。
+        args, truncated = {}, True
+    out: dict = {"id": str(raw.get("id") or ""), "name": name,
+                 "arguments": args if isinstance(args, dict) else {}}
+    if truncated:
+        out["truncated"] = True
+        out["arguments_raw"] = str(raw_args or "")[:2000]
+    return out
 
 
 class DeepSeekLlm:
@@ -267,6 +207,12 @@ class DeepSeekLlm:
             "messages": _wire_messages(messages),
             "temperature": 0.2,
         }
+        # E：显式生成上限——「不设」等于接受服务端默认（deepseek-flash 非思考 8K），
+        # 长参数（如写章节全文进工具 arguments）极易被 finish_reason="length" 腰斩。
+        # 取值来自 config.agent.llm.max_tokens（默认 8192；<=0 视为不设置，交还服务端）。
+        max_tokens = int(cfg.get("max_tokens", 8192) or 0)
+        if max_tokens > 0:
+            payload["max_tokens"] = max_tokens
         name_map: dict[str, str] = {}
         if tools:
             wired_tools, name_map = _wire_tools(tools)
@@ -286,16 +232,31 @@ class DeepSeekLlm:
                 raise AgentError(f"deepseek api 异常 {resp.status_code}: {resp.text[:200]}")
             body = resp.json()
             message = body["choices"][0]["message"]
+            finish = body["choices"][0].get("finish_reason")
             usage = body.get("usage")                  # S6：真实 token 数（若有）
             content = message.get("content") or ""
+            # B-fix：thinking 模式思考链——回传历史时 DeepSeek 要求携带，必须捕获随行
+            reasoning = message.get("reasoning_content") or ""
+            reasoning_kv = {"reasoning_content": reasoning} if reasoning else {}
             raw_calls = message.get("tool_calls") or []
             if raw_calls:                                  # 工具调用优先（可能 content 为空）
-                return {"text": content,
-                        "tool_calls": [_wire_call(c, name_map) for c in raw_calls],
-                        **({"usage": usage} if usage else {})}
+                out = {"text": content,
+                       "tool_calls": [_wire_call(c, name_map) for c in raw_calls],
+                       **reasoning_kv,
+                       **({"usage": usage} if usage else {})}
+                if finish == "length":                     # E：截断显式标记，绝不静默
+                    out["truncated"] = True
+                return out
             if schema is None:
-                return {"text": content, **({"usage": usage} if usage else {})}
+                out = {"text": content, **reasoning_kv, **({"usage": usage} if usage else {})}
+                if finish == "length":
+                    out["truncated"] = True
+                return out
             parsed = _parse_json(content)
+            if reasoning:
+                parsed["reasoning_content"] = reasoning
+            if finish == "length":
+                parsed["truncated"] = True
             if usage:
                 parsed["usage"] = usage
             return parsed
@@ -307,6 +268,7 @@ class DeepSeekLlm:
         reasoning_acc = ""                                # D4 思考链（reasoning_content 每片累积）
         tool_acc: dict[int, dict] = {}                     # index -> 归并槽（D3 完整重组）
         usage: dict | None = None
+        finish: str | None = None                          # E：截断判定依据，捕获而非丢弃
         async with client.stream("POST", self.BASE_URL, json=payload, headers=headers) as resp:
             if resp.status_code != 200:
                 await resp.aread()                      # 流式下不能 resp.json()
@@ -335,10 +297,12 @@ class DeepSeekLlm:
                         await ctx.events.emit(Events.LLM_TOKEN, {"text": piece})
                 # D4 思考链（reasoning_content）照单全流：模型把推理过程放在该字段，
                 # 不并入最终 text（text 仅来自 content），避免思考混入答案。
+                # B-fix：无论 schema 门控与否都要**累积**——回传历史须携带，丢弃即 400。
                 rpiece = delta.get("reasoning_content") or ""
-                if rpiece and schema is None:
+                if rpiece:
                     reasoning_acc += rpiece
-                    await ctx.events.emit(Events.LLM_THINKING, {"text": rpiece})
+                    if schema is None:
+                        await ctx.events.emit(Events.LLM_THINKING, {"text": rpiece})
                 # 工具调用 delta 归并（按 index）
                 for tc in (delta.get("tool_calls") or []):
                     idx = tc.get("index", 0)
@@ -355,16 +319,28 @@ class DeepSeekLlm:
                     if fn.get("arguments"):
                         slot["function"]["arguments"] += fn["arguments"]
                 if choice.get("finish_reason"):
+                    finish = choice.get("finish_reason")   # E：此前仅用于 break，现在留证
                     break
         raw_calls = [slot for _idx, slot in sorted(tool_acc.items())]
         usage_kv = {"usage": usage} if usage else {}
+        reasoning_kv = {"reasoning_content": reasoning_acc} if reasoning_acc else {}
         if raw_calls:                                      # 工具调用优先（可能 content 为空）
-            return {"text": content_acc,
-                    "tool_calls": [_wire_call(c, name_map) for c in raw_calls],
-                    **usage_kv}
+            out = {"text": content_acc,
+                   "tool_calls": [_wire_call(c, name_map) for c in raw_calls],
+                   **reasoning_kv, **usage_kv}
+            if finish == "length":                         # E：截断显式标记，绝不静默
+                out["truncated"] = True
+            return out
         if schema is None:
-            return {"text": content_acc, **usage_kv}
+            out = {"text": content_acc, **reasoning_kv, **usage_kv}
+            if finish == "length":
+                out["truncated"] = True
+            return out
         parsed = _parse_json(content_acc)
+        if reasoning_acc:
+            parsed["reasoning_content"] = reasoning_acc
+        if finish == "length":
+            parsed["truncated"] = True
         if usage:
             parsed["usage"] = usage
         return parsed

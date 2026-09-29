@@ -28,13 +28,17 @@ class ToolCall:
     name: str
     arguments: dict = field(default_factory=dict)
     id: str = ""
+    truncated: bool = False        # E：参数 JSON 被 max_tokens 腰斩（残缺），不可直接执行
+    arguments_raw: str = ""        # E：残缺参数原始片段（供错误回灌自纠）
 
     @classmethod
     def from_dict(cls, d: dict) -> "ToolCall":
         args = d.get("arguments")
         return cls(name=str(d.get("name") or ""),
                    arguments=args if isinstance(args, dict) else {},
-                   id=str(d.get("id") or ""))
+                   id=str(d.get("id") or ""),
+                   truncated=bool(d.get("truncated")),
+                   arguments_raw=str(d.get("arguments_raw") or ""))
 
     def as_dict(self) -> dict:
         return {"id": self.id, "name": self.name, "arguments": self.arguments}
@@ -59,10 +63,15 @@ class ToolResult:
 
 @dataclass(slots=True)
 class ReasonOutput:
-    """一轮 Think 的产出：最终答复文本 或 工具调用列表（二者其一非空）。"""
+    """一轮 Think 的产出：最终答复文本 或 工具调用列表（二者其一非空）。
+
+    ``reasoning_content``（B-fix）：thinking 模式的思考链原样随行——回灌历史时
+    DeepSeek 要求「输出过思考的 assistant 消息回传必须携带」，故须采集→存档→wire 回传。
+    """
 
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    reasoning_content: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
 
@@ -110,6 +119,7 @@ class DefaultReasoner:
         calls = [ToolCall.from_dict(c) for c in (data.get("tool_calls") or [])
                  if isinstance(c, dict)]
         return ReasonOutput(text=str(data.get("text") or ""), tool_calls=calls,
+                            reasoning_content=str(data.get("reasoning_content") or ""),
                             tokens_in=int(lr.tokens_in or 0),
                             tokens_out=int(lr.tokens_out or 0))
 
@@ -134,6 +144,17 @@ class DefaultActor:
         return [await self._one(ctx, c) for c in calls]
 
     async def _one(self, ctx, call: ToolCall) -> ToolResult:
+        if getattr(call, "truncated", False):
+            # E（方案）：生成侧截断的调用**不执行**——半截 JSON 已被 _wire_call 拒析，
+            # 强行 invoke 只会得到「缺少必填参数」的误导报错。此处如实回灌自纠指引。
+            raw = (getattr(call, "arguments_raw", "") or "")[:300]
+            return ToolResult(
+                call.name,
+                "模型输出被截断（finish_reason=length，触及 max_tokens 生成上限），"
+                "工具参数 JSON 不完整，本次调用未执行。请减小单次输出规模："
+                "把大内容分片（如每章拆 2-3 段、多次追加写入）后重试。"
+                f"残缺参数片段：{raw}",
+                is_error=True, tool_call_id=call.id)
         try:
             result = await ctx.tasks.invoke(ctx, call.name, caller=self._caller,
                                             **dict(call.arguments or {}))
@@ -168,9 +189,11 @@ class DefaultFinalizer:
         self._caller = caller
 
     async def finalize(self, ctx, messages, reason: str) -> str:
+        # finalize=True（方案A）：budget 据此允许本调用动用收尾预留额度——
+        # 正常步骤已在 max-reserve 处被拒，收尾不加此标记则同样被拒（死结）。
         probe = list(messages) + [{"role": "system", "content": FINAL_SYSTEM}]
         try:
-            lr = await ctx.llm.complete(ctx, probe, caller=self._caller)
+            lr = await ctx.llm.complete(ctx, probe, caller=self._caller, finalize=True)
             text = str(((lr.data or {}) if isinstance(lr.data, dict) else {}).get("text") or "")
             if text.strip():
                 return text.strip()
@@ -178,8 +201,13 @@ class DefaultFinalizer:
             pass
         rounds = sum(1 for m in messages
                      if m.get("role") == "assistant" and m.get("tool_calls"))
-        return (f"（已达执行上限：{reason}；已执行 {rounds} 轮工具调用，"
+        # C：兜底文本带上收尾摘要（loop 以 [收尾摘要] 系统消息注入 messages）
+        summary = next((str(m.get("content") or "") for m in messages
+                        if isinstance(m, dict) and m.get("role") == "system"
+                        and str(m.get("content", "")).startswith("[收尾摘要]")), "")
+        base = (f"（已达执行上限：{reason}；已执行 {rounds} 轮工具调用，"
                 f"未能形成最终答复）")
+        return f"{base}\n{summary}" if summary else base
 
 
 __all__ = ["ToolCall", "ToolResult", "ReasonOutput",

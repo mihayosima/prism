@@ -68,6 +68,12 @@ class React:
             finalize_on_exceed=bool(cfg.get("finalize_on_exceed", True)),
             # S3 兜底默认（折叠阈值归治理器 clip_*；此处仅最近保留条数）
             react_keep_recent=int(cfg.get("react_keep_recent", 6)),
+            # D2：老 act 条目单参数值折叠阈值（token；<=0 关闭。需工作记忆在位才折叠，
+            # 保证「原文存 checkpoint 可找回」的无损承诺）
+            act_fold_tokens=int(cfg.get("act_fold_tokens", 256)),
+            # L1：懒加载（默认 off 灰度；开关已入设置页）
+            lazy_tools=bool(cfg.get("lazy_tools", False)),
+            lazy_tools_max=int(cfg.get("lazy_tools_max", 12)),
         )
         # 四组件 = 可选注入的接缝服务（与 ctx.llm 的 provider 选择同构）
         reasoner = ctx.get("react.reasoner") or DefaultReasoner()

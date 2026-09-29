@@ -7,6 +7,12 @@
 键目录：
 - ``BUDGET_SPENT``       budget 写、run/chat 状态栏读（容器生命周期累计已花 token）
 - ``BUDGET_PENDING_EST`` budget 写读（预借 est 按 caller 分槽：``dict[caller, est]``）
+- ``BUDGET_WARNING``     D1：budget 写、react 读（预算预警旗标 ``dict[at,spent,limit]``；
+                         与 PERMISSION_MODE 同款「状态键前向契约」——双方零直连）
+- ``LLM_COST_RATIO``     F1：budget 写、api.cost_factor/治理器消费方读（估算↔真实口径
+                         EWMA 校准因子 ``dict[model, dict[ratio, samples]]``）
+- ``REACT_RUN_ID``       F2：react 写、budget 读（当前 run 的归组键，落 agent_budget_log；
+                         尽力而为——并发多会话时以后写者为准）
 - ``REACT_LAST``         react 写、react.status 读（最近一次 run 摘要）
 - ``PERMISSION_MODE``    **前向契约**：approval 插件（未实施）写、react 读；当前无写者
 - ``LOOP_RUNNING``       sys/loop 写读（在跑任务集合）
@@ -21,6 +27,9 @@ class StateKeys:
 
     BUDGET_SPENT = "budget_spent"
     BUDGET_PENDING_EST = "budget_pending_est"
+    BUDGET_WARNING = "budget_warning"        # D1：budget 写 / react 读（预警旗标，非直连）
+    LLM_COST_RATIO = "llm_cost_ratio"        # F1：budget 写 / cost_factor 读（口径校准 EWMA）
+    REACT_RUN_ID = "react_run_id"            # F2：react 写 / budget 读（账单归组键）
     REACT_LAST = "react_last"
     PERMISSION_MODE = "permission_mode"      # 前向契约：approval 写 / react 读（当前无写者）
     LOOP_RUNNING = "loop_running"

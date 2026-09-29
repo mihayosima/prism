@@ -32,8 +32,16 @@ from agent.sys.tasks import TasksPlugin
 BASE_AGENT_CONFIG: dict = {
     "db_path": "data/agent.db",
     "agent": {
-        "llm": {"provider": "fixture", "model": "fixture", "stream": True},
-        "budget": {"max_tokens_per_run": 200000, "reset_on_new_session": True},
+        "llm": {"provider": "fixture", "model": "fixture", "stream": True,
+                "max_tokens": 8192},   # E：显式生成上限（不设则服务端默认 8K 腰斩长参数）
+        "budget": {"max_tokens_per_run": 200000, "reset_on_new_session": True,
+                   # 方案A：收尾预留额度——须 ≥ 收尾调用的窗口估算（治理器封顶 2 万）+ 余量
+                   "finalize_reserve_tokens": 24000,
+                   # F1：口径自校准（EWMA 因子作用于 budget 预借与治理器装配）
+                   "cost_calibration": True},
+        # P2/L：react 续接词表与懒加载默认（react 节 _any 免 schema，但默认值须有单一真相源）
+        "react": {"resume_keywords": ["继续", "接着", "续写", "continue"],
+                  "lazy_tools": False, "lazy_tools_max": 12},
         "permissions": {"default": "open", "task_allow": ["*"], "task_deny": [], "llm": "open"},
         "approval": {"provider": "web", "allow": ["*"], "deny": [], "ask": [],
                       "timeout_s": 30, "default": "deny"},

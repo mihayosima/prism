@@ -71,7 +71,8 @@ _TYPE_CHECKERS = {
 }
 
 
-def validate_kwargs(schema: Mapping[str, dict] | None, kwargs: dict[str, Any]) -> dict[str, Any]:
+def validate_kwargs(schema: Mapping[str, dict] | None, kwargs: dict[str, Any], *,
+                    tool_name: str = "") -> dict[str, Any]:
     from agent.api import AgentError
 
     schema = schema or {}
@@ -87,7 +88,17 @@ def validate_kwargs(schema: Mapping[str, dict] | None, kwargs: dict[str, Any]) -
                 raise AgentError(f"{key}: {msg.format(v=value)}")
             clean[key] = value
         elif spec.get("required", False):
-            raise AgentError(f"缺少必填参数 {key!r}")
+            # B（方案）：报错附必填/可省清单，模型下一轮即可自纠——
+            # 当晚「缺少必填参数 'mode'」孤句让模型无从改起。
+            required = [k for k, sp in schema.items() if sp.get("required")]
+            optional = [k for k in schema if k not in required]
+            hint = ""
+            if tool_name:
+                hint = f"（{tool_name} 必填：{', '.join(required) or '-'}"
+                if optional:
+                    hint += f"；可省：{', '.join(optional)}"
+                hint += "）"
+            raise AgentError(f"缺少必填参数 {key!r}{hint}")
         elif "default" in spec:
             clean[key] = spec["default"]
     return clean
@@ -107,7 +118,7 @@ class Task:
         self.risk = risk
 
     async def invoke(self, kwargs: dict[str, Any]) -> Any:
-        clean = validate_kwargs(self.schema, kwargs)
+        clean = validate_kwargs(self.schema, kwargs, tool_name=self.name)
         result = self.handler(**clean)
         if inspect.isawaitable(result):
             return await result
