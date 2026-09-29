@@ -64,6 +64,22 @@ class Events:
     # 上下文治理插件（G1 分块装配）：装配元数据
     # （各块实占 / 裁剪 / 命中 / 刚性超限 / 回吐；遥测性质，非安全 seam）
     CONTEXT_GOVERNED = "agent/context/governed"
+    # G2.0（P0/F-1）：前缀稳定性体检红灯——**续接**但头部未冻结（旧存档 / 对齐开关关闭）
+    # ⇒ 链之前的头部字节与本轮不同，整条链将在前缀缓存上失效（9-29 成本事故的机制）。
+    # 载荷：stage / reason / chain_entries。durable 直写（审计脊柱），无 live 监听者。
+    CONTEXT_PREFIX_UNSTABLE = "agent/context/prefix-unstable"
+    # G2.0（P1）：**水位体检**（enum 与 EVENT_MODE 两处同时登记，项目硬约束）。
+    # 载荷：scope / phase / used / window / ratio / level / gates。纯观测（水位可回放）。
+    CONTEXT_WATERLINE = "agent/context/waterline"
+    # G2.0（P2）：治理动词三事件（**enum 与 EVENT_MODE 两处同时登记**，项目硬约束）。
+    # 与 P2 代码同批登记——契约守卫（test_every_event_constant_is_used）禁止「登记了却无人用」
+    # 的孤儿常量（这是守卫的正确拦截，不是偏离）。
+    # 载荷：mode / actions / reason / gates / shadow。**shadow 数据的唯一来源**（决策可回放）。
+    CONTEXT_COMPACT_DECIDED = "agent/context/compact-decided"
+    # 载荷：applied / skipped / released / invariants / degraded。执行审计（账实相符）。
+    CONTEXT_COMPACT_APPLIED = "agent/context/compact-applied"
+    # 载荷：invariant / target / detail。结构性错误即时暴露（I-1 / I-2 违反）。
+    CONTEXT_INVARIANT_VIOLATION = "agent/context/invariant-violation"
 
 
 def all_events() -> set[str]:
@@ -110,6 +126,11 @@ EVENT_MODE: dict[str, str] = {
     Events.MEMORY_REMEMBERED: "emit",
     Events.MEMORY_RECALL: "emit",
     Events.CONTEXT_GOVERNED: "emit",      # G1：装配元数据遥测（无监听者即 no-op）
+    Events.CONTEXT_PREFIX_UNSTABLE: "emit",  # P0：前缀稳定性体检（durable 由 react 直写）
+    Events.CONTEXT_WATERLINE: "emit",        # P1：水位体检（遥测；无监听者即 no-op）
+    Events.CONTEXT_COMPACT_DECIDED: "emit",       # P2：压缩决策（shadow 数据来源）
+    Events.CONTEXT_COMPACT_APPLIED: "emit",       # P2：执行审计（账实相符）
+    Events.CONTEXT_INVARIANT_VIOLATION: "emit",   # P2：不变量违反告警
 }
 
 

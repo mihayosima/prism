@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 import uuid
 from pathlib import Path
@@ -102,6 +103,16 @@ _SETTING_SCHEMA = {
     "clip_tail_tokens": (int, 0, 1_000_000),           # 折叠后尾部保留
     "react_keep_recent": (int, 0, 1000),                  # 最近 N 条链原文保留
     "react_min_chain_tokens": (int, 0, 1_000_000),        # 循环内 chain 保底额度
+    # ---- G2.0（P1）：双窗口解耦 + 水位 + 层 cap ----
+    "working_window_tokens": (int, 1, 1_000_000),          # 经济窗口（水位分母）
+    "window_high_ratio": (float, 0.01, 0.99),              # 触发水位
+    "window_low_ratio": (float, 0.01, 0.99),               # 回落目标（记录用）
+    "resident_cap_tokens": (int, 0, 1_000_000),            # 常驻层 cap（0=无）
+    "on_demand_cap_tokens": (int, 0, 1_000_000),           # 按需层 cap（0=无）
+    "prompt_cap_tokens": (int, 0, 1_000_000),              # 输入层 cap（0=无）
+    # ---- G2.0（P2）：治理动词（模式 + clear 最小释放量）----
+    "compact_mode": ("choice", ["off", "shadow", "on"]),   # 默认 shadow（只算不做）
+    "clear_at_least_tokens": (int, 0, 1_000_000),          # 单次清除的最小释放量
     # ---- 审批插件（plugins.approval）：通道 / 超时 / 必问名单 ----
     "provider": ("choice", ["auto-deny", "auto-allow", "web", "cli"]),
     "timeout_s": (int, 1, 3600),
@@ -112,6 +123,8 @@ _SETTING_SCHEMA = {
     "cost_calibration": ("bool",),                        # F1：口径自校准（EWMA 因子）
     # ---- 工具懒加载（plugins.react；L1 灰度开关）----
     "lazy_tools": ("bool",),
+    # ---- P0-2：续接前缀对齐（plugins.react；头部快照冻结，可回退）----
+    "alignment_enabled": ("bool",),
 }
 _PLUGIN_OF_KEY = {
     "compact_trigger_tokens": "plugins.short_term",
@@ -125,6 +138,14 @@ _PLUGIN_OF_KEY = {
     "clip_tail_tokens": "plugins.context",
     "react_keep_recent": "plugins.context",
     "react_min_chain_tokens": "plugins.context",
+    "working_window_tokens": "plugins.context",
+    "window_high_ratio": "plugins.context",
+    "window_low_ratio": "plugins.context",
+    "resident_cap_tokens": "plugins.context",
+    "on_demand_cap_tokens": "plugins.context",
+    "prompt_cap_tokens": "plugins.context",
+    "compact_mode": "plugins.context",
+    "clear_at_least_tokens": "plugins.context",
     "provider": "plugins.approval",
     "timeout_s": "plugins.approval",
     "ask": "plugins.approval",
@@ -132,7 +153,10 @@ _PLUGIN_OF_KEY = {
     "finalize_reserve_tokens": "plugins.budget",
     "cost_calibration": "plugins.budget",
     "lazy_tools": "plugins.react",
+    "alignment_enabled": "plugins.react",
 }
+# G2.0（P1）：context 节默认值单一真相源（与 profiles.BASE_AGENT_CONFIG 同源，避免漂移）
+_CTX_DEFAULTS = ((BASE_AGENT_CONFIG.get("agent") or {}).get("context") or {})
 _SETTING_DEFAULTS = {
     "compact_trigger_tokens": 12000,
     "max_context_tokens": 24000,
@@ -145,6 +169,16 @@ _SETTING_DEFAULTS = {
     "clip_tail_tokens": 500,
     "react_keep_recent": 6,
     "react_min_chain_tokens": 2048,
+    # G2.0（P1）：与 profiles.BASE_AGENT_CONFIG.agent.context 同源
+    "working_window_tokens": _CTX_DEFAULTS.get("working_window_tokens", 96000),
+    "window_high_ratio": _CTX_DEFAULTS.get("window_high_ratio", 0.70),
+    "window_low_ratio": _CTX_DEFAULTS.get("window_low_ratio", 0.40),
+    "resident_cap_tokens": _CTX_DEFAULTS.get("resident_cap_tokens", 8000),
+    "on_demand_cap_tokens": _CTX_DEFAULTS.get("on_demand_cap_tokens", 8000),
+    "prompt_cap_tokens": _CTX_DEFAULTS.get("prompt_cap_tokens", 2000),
+    # G2.0（P2）：与 profiles.BASE_AGENT_CONFIG.agent.context 同源
+    "compact_mode": _CTX_DEFAULTS.get("compact_mode", "shadow"),
+    "clear_at_least_tokens": _CTX_DEFAULTS.get("clear_at_least_tokens", 4000),
     "provider": "web",
     "timeout_s": 30,
     "ask": [],
@@ -157,6 +191,9 @@ _SETTING_DEFAULTS = {
                          .get("cost_calibration", True)),
     "lazy_tools": (((BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {})
                    .get("lazy_tools", False)),
+    # P0-2：与 profiles.BASE_AGENT_CONFIG agent.react 同源；默认开启
+    "alignment_enabled": (((BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {})
+                          .get("alignment_enabled", True)),
 }
 
 
@@ -916,10 +953,12 @@ function renderSettings(j){
     +'<div class="muted" style="font-size:11px;margin-top:3px">预算末段的收尾专用额度：正常调用只能用到「上限 − 预留」，触顶后的总结陈词可动用预留段，保证耗尽时也有体面收尾（0 = 关闭预留）。须不小于收尾窗口体积（建议 ≥ 24000）</div></label>'
     +'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px"><input id="set_cost_calibration" type="checkbox"'+(v.cost_calibration?' checked':'')+'> 口径自校准 cost_calibration</div>'
     +'<div class="muted" style="font-size:11px">用服务商真实用量持续修正字符估算的偏差（实测约 30%），使预算判定与窗口装配贴近真实计费；样本不足 5 次时自动退回裸估算。关闭 = 回到纯估算口径。</div></label></div>'
-    +'<div class="card" style="margin-top:16px"><h3 style="margin-top:0">工具懒加载（plugins.react）</h3>'
+    +'<div class="card" style="margin-top:16px"><h3 style="margin-top:0">循环内上下文治理（plugins.react）</h3>'
     +'<div class="muted" style="margin-bottom:10px">开启后每次请求只携带「工具目录卡」（名称+一行描述+参数名，无完整 JSON Schema），模型经 tool_search / tool_load 元工具按需加载完整定义，可显著降低工具定义的 token 开销。默认关闭（灰度）。</div>'
     +'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px"><input id="set_lazy_tools" type="checkbox"'+(v.lazy_tools?' checked':'')+'> 启用懒加载 lazy_tools</div>'
-    +'<div class="muted" style="font-size:11px">模型对未加载工具的调用会得到「未加载」错误观察并自行纠正；执行面闸门（审批/只读裁剪）不受影响。</div></label></div>';
+    +'<div class="muted" style="font-size:11px">模型对未加载工具的调用会得到「未加载」错误观察并自行纠正；执行面闸门（审批/只读裁剪）不受影响。</div></label>'
+    +'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px"><input id="set_alignment_enabled" type="checkbox"'+(v.alignment_enabled?' checked':'')+'> 续接前缀对齐 alignment_enabled</div>'
+    +'<div class="muted" style="font-size:11px">续接时冻结头部快照（system/前置上下文/首轮提示词）跨 run 逐字节稳定，新消息追加链尾，使请求构成前序请求的严格前缀，命中提示缓存（实测前缀断裂时整链按 miss 计价）。关闭 = 回退旧行为，续接时头部随当前提示词重建（并发出 prefix-unstable 事件）。</div></label></div>';
   if(j.context_plugin_enabled!==true){
     h+='<div class="card muted" style="margin-top:16px">上下文管理插件（plugins.context）未启用 —— 在「插件」页点「启用」后，可在此调整参数。</div>';
   }else{
@@ -935,13 +974,26 @@ function renderSettings(j){
     ['clip_tail_tokens','循环内 · 折叠保留尾部 (token)','折叠后保留结尾部分（错误码通常在尾部）'],
     ['react_keep_recent','循环内 · 最近保留条数','最近 N 条推理链保留原文，更早的才折叠'],
     ['react_min_chain_tokens','循环内 · 链保底额度 (token)','装配会话历史时为多步循环预留的额度，防止循环无空间'],
+    ['working_window_tokens','经济窗口 (token)','水位判定的分母；与能力上限 max_context_tokens 解耦。默认 96k——保证普通任务永不触发压缩（压缩是超长任务兜底）'],
+    ['window_high_ratio','触发水位 (0~1)','load_ratio ≥ 此值即判 high（默认 0.70）'],
+    ['window_low_ratio','回落目标 (0~1)','水位回落参考值（记录用，默认 0.40）'],
+    ['resident_cap_tokens','常驻层 cap (token)','系统提示 / 输出格式等常驻块上限；绝对量级（0 = 无 cap）'],
+    ['on_demand_cap_tokens','按需层 cap (token)','工具 schema / 记忆召回等按需块上限（0 = 无 cap）'],
+    ['prompt_cap_tokens','输入层 cap (token)','用户本轮输入 / 附件上限（0 = 无 cap）'],
+    ['clear_at_least_tokens','清除最小释放量 (token)','单次 clear 动作的最小释放量门槛；低于此值不触发清除（对标 Anthropic clear_at_least）'],
   ];
-  const isFloat=k=>(k==='memory_ratio'||k==='history_ratio');
+  const cm=['off','shadow','on'];
+  const cml={off:'不治理（不做任何动作）',shadow:'只算不做：照常计算决策并写遥测，用于校准阈值（推荐）',on:'实际执行结构性改变（clear/compact 落位）'};
+  const isFloat=k=>(k==='memory_ratio'||k==='history_ratio'||k==='window_high_ratio'||k==='window_low_ratio');
     h+='<h3 style="margin-top:16px">上下文管理 <span class="tag blue">plugins.context 已启用</span></h3>'
     +'<div class="card"><div class="muted" style="margin-bottom:10px">启用上下文管理插件时可调；保存后立即重建容器生效。覆盖写入 data/agent_plugin_config.json，重启后保持。</div>';
   h+=fields.map(([k,label,hint])=>'<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px">'+esc(label)+'</div>'
     +'<input id="set_'+k+'" type="number" step="'+(isFloat(k)?'0.01':'1')+'" value="'+esc(v[k])+'" style="width:240px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit">'
     +'<div class="muted" style="font-size:11px;margin-top:3px">'+esc(hint)+'</div></label>').join('');
+  h+='<label style="display:block;margin:12px 0 0"><div style="font-weight:600;margin-bottom:3px">压缩模式 compact_mode</div>'
+    +'<select id="set_compact_mode" style="width:340px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit;background:#fff">'
+    +cm.map(o=>'<option value="'+o+'"'+(v.compact_mode===o?' selected':'')+'>'+o+'（'+cml[o]+'）</option>').join('')
+    +'</select><div class="muted" style="font-size:11px;margin-top:3px">治理动词（clear/compact）的执行开关；默认 shadow（只观测不改变装配行为）。链压缩仅在 run 收尾存档点、且过回本闸时发生。</div></label>';
   h+='</div>';                                             // 上下文管理卡片收口
   }                                                        // context 启用分支收口
   if(j.approval_enabled===false){
@@ -969,12 +1021,14 @@ function renderSettings(j){
   $('#resetSettings').onclick=resetSettings;
 }
 async function saveSettings(){
-  const isFloat=k=>(k==='memory_ratio'||k==='history_ratio');
-  const keys=['max_tokens_per_run','finalize_reserve_tokens','compact_trigger_tokens','max_context_tokens','reserve_output_tokens','memory_ratio','history_ratio','source_clip_tokens','clip_max_tokens','clip_head_tokens','clip_tail_tokens','react_keep_recent','react_min_chain_tokens'];
+  const isFloat=k=>(k==='memory_ratio'||k==='history_ratio'||k==='window_high_ratio'||k==='window_low_ratio');
+  const keys=['max_tokens_per_run','finalize_reserve_tokens','compact_trigger_tokens','max_context_tokens','reserve_output_tokens','memory_ratio','history_ratio','source_clip_tokens','clip_max_tokens','clip_head_tokens','clip_tail_tokens','react_keep_recent','react_min_chain_tokens','working_window_tokens','window_high_ratio','window_low_ratio','resident_cap_tokens','on_demand_cap_tokens','prompt_cap_tokens','clear_at_least_tokens'];
   const patch={};
   for(const k of keys){const el=$('#set_'+k);if(el&&el.value!==''){patch[k]=isFloat(k)?parseFloat(el.value):parseInt(el.value,10);}}
   const cc=$('#set_cost_calibration');if(cc)patch.cost_calibration=cc.checked;   // F1 开关
   const lt=$('#set_lazy_tools');if(lt)patch.lazy_tools=lt.checked;               // L1 开关
+  const al=$('#set_alignment_enabled');if(al)patch.alignment_enabled=al.checked; // P0-2 续接前缀对齐
+  const cmx=$('#set_compact_mode');if(cmx)patch.compact_mode=cmx.value;  // P2 治理模式（枚举）
   const pv=$('#set_provider');if(pv)patch.provider=pv.value;      // 审批插件三项
   const tv=$('#set_timeout_s');if(tv&&tv.value!=='')patch.timeout_s=parseInt(tv.value,10);
   const av=$('#set_ask');if(av)patch.ask=av.value.split(',').map(s=>s.trim()).filter(Boolean);
@@ -1051,6 +1105,51 @@ document.addEventListener('DOMContentLoaded',()=>{
 });
 </script></body></html>
 """
+
+
+async def _context_view_payload(root, *, limit: int = 60) -> dict:
+    """**Inspector ``/context`` 视图**（G2.0 P3-1；模块级，供端点与测试共用）。
+
+    纯只读旁路：从审计脊柱 ``agent_events`` 读 ``agent/context/governed`` 载荷 → 经治理器
+    **门面软调用**（``gov.ledger``）重建 ``RoundLedger`` → 渲染分类视图 + 逐端点 I-4 对账。
+    消费方**不 import 插件内部**（解耦纪律）。轮次归集（消费方语义）：每个 ``stage`` 取
+    **最近一次**装配，即「这一轮钱花在哪」。无治理器 / 渲染失败 → ``available=False``（绝不崩）。
+    """
+    try:
+        n = max(1, min(200, int(limit)))
+    except (TypeError, ValueError):
+        n = 60
+    rows = await root.db.query(
+        root, "SELECT seq, payload, at FROM agent_events"
+              " WHERE event='agent/context/governed' ORDER BY seq DESC LIMIT ?", (n,))
+    payloads: list[dict] = []
+    for r in rows:                                  # 读入为新 → 旧
+        try:
+            p = json.loads(r.get("payload") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(p, dict):
+            payloads.append(p)
+    payloads.reverse()                              # 回正序
+    gov = root.get(Services.CONTEXT) if root.has(Services.CONTEXT) else None
+    ledger_fn = getattr(gov, "ledger", None)
+    if not callable(ledger_fn):
+        return {"available": False, "reason": "no_governor", "stages": [], "text": ""}
+    latest: dict[str, dict] = {}
+    order: list[str] = []
+    for p in payloads:                              # 每个 stage 取最近一次（保序去重）
+        st = str(p.get("stage", "") or "")
+        if st not in latest:
+            order.append(st)
+        latest[st] = p
+    try:
+        ledger = ledger_fn([latest[s] for s in order])
+        return {"available": True, "stages": ledger.stages(), "totals": ledger.totals(),
+                "reconcile": ledger.reconcile(), "violations": ledger.violations(),
+                "text": ledger.render(), "events_considered": len(payloads)}
+    except Exception as exc:                        # noqa: BLE001 —— 视图失败不阻断
+        logging.getLogger("agent.chat").warning("context view failed: %s", exc)
+        return {"available": False, "reason": "render_failed", "stages": [], "text": ""}
 
 
 async def _serve(args: argparse.Namespace) -> int:
@@ -1276,6 +1375,13 @@ async def _serve(args: argparse.Namespace) -> int:
         rows = await c.root.db.query(
             c.root, "SELECT seq, event, payload, at FROM agent_events ORDER BY seq DESC LIMIT 120")
         return {"rows": rows}
+
+    # ---- G2.0（P3-1）：Inspector ``/context`` 视图（纯只读旁路，不 import 插件内部）----
+
+    @app.get("/api/context")
+    async def _context_view(limit: int = 60) -> dict:
+        """把 governed 遥测合并为**轮次全景账本**并渲染 ``/context`` 分类视图（薄封装）。"""
+        return await _context_view_payload(c.root, limit=limit)
 
     @app.get("/api/perms")
     async def _perms() -> dict:

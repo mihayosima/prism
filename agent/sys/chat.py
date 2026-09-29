@@ -116,6 +116,34 @@ def _fallback_assemble(blocks: list[dict]) -> _Assembled:
     return _Assembled(system_text=system_text, prior=prior)
 
 
+# G2.0（P0）声明式注册：**每个装配端点的「应有块」清单**（配置期常量，声明幂等）。
+# 完整性校验口径＝「连提交都没有」——``present=False`` 仍算已提交，故只有整块从装配
+# 管线里消失才亮红灯（低误报）。prior 两块的缺席是**数据依赖**（空会话合法），故
+# ``required=False``（只登记、不告警）。
+_STAGE_DECLS: dict[str, list[dict]] = {
+    "plan": [{"key": "plan_head", "kind": "text"},
+             {"key": "memory", "kind": "text"},
+             {"key": "tools", "kind": "text"},
+             {"key": "env", "kind": "text"}],
+    "prior": [{"key": "summary", "kind": "messages", "required": False},
+              {"key": "history", "kind": "messages", "required": False}],
+    "narrate": [{"key": "answer_head", "kind": "text"},
+                {"key": "memory", "kind": "text"}],
+}
+
+
+def _declare_stage_blocks(gov, stage: str) -> None:
+    """把本端点的应有块清单注入治理器（幂等；无该接缝 → 静默跳过，不劣化）。"""
+    decls = _STAGE_DECLS.get(stage)
+    fn = getattr(gov, "declare", None)
+    if not decls or not callable(fn):
+        return
+    try:
+        fn(decls, phase=stage)
+    except Exception as exc:      # noqa: BLE001 —— 声明失败不阻断对话
+        logging.getLogger("agent.chat").warning("context declare failed: %s", exc)
+
+
 def is_resume_intent(ctx, message: str) -> bool:
     """P2：续接意图识别（决议暂定轻量关键词匹配；词表配置化，可后升级为 ask_user）。
 
@@ -307,14 +335,14 @@ class ChatDriver:
                     "payload": [{"role": "user",
                                  "content": "[会话前情 · 以下为历史摘要，仅供参考]\n" + summary,
                                  "seq": covers}],
-                    "weight": 0.10, "coverage": (0, covers),
+                    "weight": 0.10, "coverage": (0, covers), "layer": "memory",
                 })
             if post_view:
                 hi = max(int(m["seq"]) for m in post_view)
                 blocks.append({
                     "key": "history", "kind": "messages", "present": True,
                     "payload": [dict(m) for m in post_view],
-                    "weight": 0.60, "coverage": (covers, hi),
+                    "weight": 0.60, "coverage": (covers, hi), "layer": "memory",
                 })
             return (await self._assemble(ctx, blocks, stage="prior",
                                          reserve_tokens=self._react_reserve(ctx))).prior
@@ -401,10 +429,13 @@ class ChatDriver:
         asm = None
         reserve = max(0, int(reserve_tokens or 0))
         if gov is not None:
+            _declare_stage_blocks(gov, stage)      # G2.0（P0）：声明应有块（幂等）
             fn = getattr(gov, "assemble", None)
             if callable(fn):
                 from agent.api import cost_factor
-                tries = ({"reserve_tokens": reserve, "cost_factor": cost_factor(ctx)},
+                tries = ({"reserve_tokens": reserve, "cost_factor": cost_factor(ctx),
+                          "phase": stage},
+                         {"reserve_tokens": reserve, "cost_factor": cost_factor(ctx)},
                          {"reserve_tokens": reserve}, {})
                 for kwargs in tries:
                     try:
@@ -429,18 +460,67 @@ class ChatDriver:
                          "system_tokens": estimate_tokens(out.system_text)}
         if rep is not None:
             payload["input_budget"] = int(getattr(rep, "input_budget", 0))
+            payload["budget_raw"] = int(getattr(rep, "budget_raw", 0))   # P3：I-4 对照基数
             payload["total_used"] = int(getattr(rep, "total_used", 0))
             payload["redistributed"] = int(getattr(rep, "redistributed", 0))
             payload["blocks"] = [
                 {"key": r.key, "present": r.present, "reason": r.reason,
-                 "requested": r.requested, "allocated": r.allocated, "used": r.used}
+                 "requested": r.requested, "allocated": r.allocated, "used": r.used,
+                 "layer": getattr(r, "layer", ""), "cap": getattr(r, "cap", 0)}
                 for r in getattr(rep, "blocks", [])
             ]
             payload["rigid_overflow"] = [r.key for r in getattr(rep, "rigid_overflow", [])]
+            # ---- G2.0（P0）只读观测：记账 + 缓存友好度（旧治理器无这些字段 → 0/空）----
+            payload["unaccounted_tokens"] = int(getattr(rep, "unaccounted_tokens", 0))
+            payload["stable_prefix_tokens"] = int(getattr(rep, "stable_prefix_tokens", 0))
+            payload["volatile_blocks"] = list(getattr(rep, "volatile_blocks", []) or [])
+            payload["missing_blocks"] = list(getattr(rep, "missing_blocks", []) or [])
+            payload["attachments"] = [
+                {"key": a.key, "claimed": int(a.claimed), "used": int(a.used)}
+                for a in getattr(rep, "attachments", []) or []
+            ]
         try:
             await ctx.events.emit(Events.CONTEXT_GOVERNED, payload)
         except Exception as exc:              # noqa: BLE001 —— 遥测失败不阻断
             logging.getLogger("agent.chat").warning("context governed emit failed: %s", exc)
+        # ---- G2.0（P1-3）：同点发**水位体检**（assess 纯函数；治理器缺失即跳过）----
+        gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
+        assess = getattr(gov, "assess", None)
+        if callable(assess) and rep is not None:
+            try:
+                wl = assess(int(getattr(rep, "total_used", 0)), phase=stage)
+                await ctx.events.emit(Events.CONTEXT_WATERLINE, {
+                    "stage": stage, "phase": stage, "at": now_iso(),
+                    "used": wl.used, "window": wl.working_window,
+                    "capability": wl.capability_window, "ratio": wl.load_ratio,
+                    "level": wl.level, "suggested": wl.suggested, "gates": wl.gates})
+            except Exception as exc:          # noqa: BLE001 —— 遥测失败不阻断
+                logging.getLogger("agent.chat").warning(
+                    "context waterline emit failed: %s", exc)
+        # ---- G2.0（P3-2）：装配后**不变量断言**（I-3 前缀可测 / I-4 预算守恒）----
+        # 记录 + 告警（**不阻断**）：违规即发 ``context/invariant-violation`` 并记日志。
+        # 记账面判定经治理器门面软调用（消费方不 import 插件内部）。
+        inv_fn = getattr(gov, "check_invariants", None)
+        if callable(inv_fn) and rep is not None:
+            try:
+                bad = [k for k, ok in inv_fn(payload).items() if not ok]
+            except Exception as exc:          # noqa: BLE001 —— 断言失败不阻断
+                logging.getLogger("agent.chat").warning(
+                    "context invariant check failed: %s", exc)
+                bad = []
+            if bad:
+                logging.getLogger("agent.chat").warning(
+                    "context invariant violation: stage=%s %s", stage, bad)
+                try:
+                    await ctx.events.emit(Events.CONTEXT_INVARIANT_VIOLATION, {
+                        "stage": stage, "scope": None, "invariants": bad,
+                        "detail": {"unaccounted_tokens": payload.get("unaccounted_tokens"),
+                                   "budget_raw": payload.get("budget_raw"),
+                                   "stable_prefix_tokens": payload.get("stable_prefix_tokens"),
+                                   "volatile_blocks": payload.get("volatile_blocks")}})
+                except Exception as exc:      # noqa: BLE001 —— 告警失败不阻断
+                    logging.getLogger("agent.chat").warning(
+                        "context invariant emit failed: %s", exc)
 
     async def _memory_block(self, ctx, query: str) -> str:
         if not ctx.has(Services.MEMORY):
@@ -466,15 +546,16 @@ class ChatDriver:
         tools = self._tools_block(ctx)
         # 头部（标记 + 系统记忆 + 规划器提示）作为**单个刚性块**，保证与降级拼接逐字节一致。
         head = MARK_CHAT_PLAN + ("\n" + sm if sm else "") + "\n" + PLAN_SYSTEM
+        # G2.0（P1-4）：层标注（决定缺省 cap：resident / on_demand / input 有 cap）。
         blocks = [
             {"key": "plan_head", "kind": "text", "present": True, "payload": head,
-             "rigid": True, "priority": 0},
+             "rigid": True, "priority": 0, "layer": "resident"},
             {"key": "memory", "kind": "text", "present": bool(mem), "payload": mem,
-             "weight": 0.0, "priority": 10},
+             "weight": 0.0, "priority": 10, "layer": "memory"},
             {"key": "tools", "kind": "text", "present": bool(tools), "payload": tools,
-             "weight": 0.0, "priority": 20},
+             "weight": 0.0, "priority": 20, "layer": "on_demand"},
             {"key": "env", "kind": "text", "present": True, "payload": _env_facts(),
-             "rigid": True, "priority": 90},
+             "rigid": True, "priority": 90, "layer": "resident"},
         ]
         # 彻底版·统一账本：plan 调用带 schema（response_format），属请求附加项、不在 messages
         # 预算内，装配时经 reserve_tokens 先扣其占用，使窗口总占用对齐真实 prompt_tokens。
@@ -553,9 +634,9 @@ class ChatDriver:
                 + "\n\n证据 JSON:\n" + snippet)
         blocks = [
             {"key": "answer_head", "kind": "text", "present": True, "payload": head,
-             "rigid": True, "priority": 0},
+             "rigid": True, "priority": 0, "layer": "resident"},
             {"key": "memory", "kind": "text", "present": bool(mem), "payload": mem,
-             "weight": 0.0, "priority": 10},
+             "weight": 0.0, "priority": 10, "layer": "memory"},
         ]
         system = (await self._assemble(ctx, blocks, stage="narrate")).system_text
         messages = ([{"role": "system", "content": system}] + list(prior)

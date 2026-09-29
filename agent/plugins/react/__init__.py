@@ -74,6 +74,8 @@ class React:
             # L1：懒加载（默认 off 灰度；开关已入设置页）
             lazy_tools=bool(cfg.get("lazy_tools", False)),
             lazy_tools_max=int(cfg.get("lazy_tools_max", 12)),
+            # G2.0（P0/F-1）：续接前缀对齐（默认 on；关闭即一键回退旧行为）
+            alignment_enabled=bool(cfg.get("alignment_enabled", True)),
         )
         # 四组件 = 可选注入的接缝服务（与 ctx.llm 的 provider 选择同构）
         reasoner = ctx.get("react.reasoner") or DefaultReasoner()

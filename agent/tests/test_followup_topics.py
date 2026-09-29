@@ -279,24 +279,31 @@ def _lazy_tools():
 
 
 def test_lazy_partition_and_cap():
-    """L1：元工具内联处理；loaded 上限诚实拒绝；未加载调用回错误观察。"""
-    loop = ReactLoop(None, None, None, None, _LAZY_CFG)      # type: ignore[arg-type]
-    from agent.plugins.react.loop import TaskContext
-    task = TaskContext(loaded=set())
-    calls = [ToolCall(name="tool_search", arguments={"keyword": "a"}, id="m1"),
-             ToolCall(name="tool_load", arguments={"names": "a,b,c"}, id="m2"),
-             ToolCall(name="d", arguments={}, id="u1")]
-    meta, real = loop._partition_meta(task, calls, _lazy_tools())
-    assert [r.name for r in meta] == ["tool_search", "tool_load", "d"]
-    assert real == [], "未加载的 d 不得进入真实执行"
-    assert task.loaded == {"a", "b"}, "上限 2 → 只装载前两个，c 暂缓"
-    assert "暂缓" in meta[1].content and "c" in meta[1].content
-    assert "未加载" in meta[2].content and "tool_load" in meta[2].content
+    """L1：元工具内联处理；loaded 上限诚实拒绝；未加载调用回错误观察。
 
-    # 已加载后 → 进入真实执行
-    calls2 = [ToolCall(name="a", arguments={"x": 1}, id="r1")]
-    meta2, real2 = loop._partition_meta(task, calls2, _lazy_tools())
-    assert meta2 == [] and [x.name for x in real2] == ["a"]
+    P2-4：``_partition_meta`` 改为 async（``wm_read`` 读回需异步工作记忆接缝），
+    首参为工作记忆接缝（本用例不涉及读回 → 传 ``None``）。
+    """
+    async def s():
+        loop = ReactLoop(None, None, None, None, _LAZY_CFG)      # type: ignore[arg-type]
+        from agent.plugins.react.loop import TaskContext
+        task = TaskContext(loaded=set())
+        calls = [ToolCall(name="tool_search", arguments={"keyword": "a"}, id="m1"),
+                 ToolCall(name="tool_load", arguments={"names": "a,b,c"}, id="m2"),
+                 ToolCall(name="d", arguments={}, id="u1")]
+        meta, real = await loop._partition_meta(None, task, calls, _lazy_tools())
+        assert [r.name for r in meta] == ["tool_search", "tool_load", "d"]
+        assert real == [], "未加载的 d 不得进入真实执行"
+        assert task.loaded == {"a", "b"}, "上限 2 → 只装载前两个，c 暂缓"
+        assert "暂缓" in meta[1].content and "c" in meta[1].content
+        assert "未加载" in meta[2].content and "tool_load" in meta[2].content
+
+        # 已加载后 → 进入真实执行
+        calls2 = [ToolCall(name="a", arguments={"x": 1}, id="r1")]
+        meta2, real2 = await loop._partition_meta(None, task, calls2, _lazy_tools())
+        assert meta2 == [] and [x.name for x in real2] == ["a"]
+
+    asyncio.run(s())
 
 
 def test_lazy_tools_for_step_view():
@@ -336,9 +343,11 @@ def test_lazy_config_wiring(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_new_toggles_registered_in_settings():
-    """cost_calibration / lazy_tools 三处登记；默认与 profiles 同源；bool 钳制。"""
-    k1, k2 = "cost_calibration", "lazy_tools"
-    for k, pid, default in ((k1, "plugins.budget", True), (k2, "plugins.react", False)):
+    """cost_calibration / lazy_tools / alignment_enabled 三处登记；默认与 profiles 同源；bool 钳制。"""
+    k1, k2, k3 = "cost_calibration", "lazy_tools", "alignment_enabled"
+    for k, pid, default in ((k1, "plugins.budget", True),
+                            (k2, "plugins.react", False),
+                            (k3, "plugins.react", True)):
         assert k in srv._SETTING_SCHEMA
         assert srv._PLUGIN_OF_KEY[k] == pid, f"{k} 归属错误"
         assert k in srv._SETTING_DEFAULTS
@@ -347,6 +356,7 @@ def test_new_toggles_registered_in_settings():
     assert srv._coerce_setting(k1, "on") is True
     assert srv._coerce_setting(k1, "off") is False
     assert srv._coerce_setting(k2, True) is True
+    assert srv._coerce_setting(k3, "off") is False and srv._coerce_setting(k3, "on") is True
 
 
 def test_card_is_projection_only():

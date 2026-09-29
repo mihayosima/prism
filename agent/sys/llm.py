@@ -36,6 +36,27 @@ class LlmResult:
     tokens_out: int = 0
     model: str = "fixture"
     provider: str = "fixture"
+    # G2.0（P0）：思考 token 与正文 token 的分离计数（provider 未提供该明细时为 None，
+    # **不猜**——诚实留空，便于事后区分「推理冗长」与「回应冗长」）。单位同 tokens_out。
+    reasoning_tokens: int | None = None
+
+
+def _reasoning_tokens(usage: dict) -> int | None:
+    """从 usage 明细里取思考 token 数（OpenAI/DeepSeek 兼容的 ``completion_tokens_details``）。
+
+    取不到即返回 ``None``（**不估、不猜**）：该字段是「44% 输出成本中推理占多少」
+    这一问题的唯一可信来源；缺它时如实留空，由 X-1 实验在真实 provider 上核验。
+    """
+    det = (usage or {}).get("completion_tokens_details")
+    if not isinstance(det, dict):
+        return None
+    val = det.get("reasoning_tokens")
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
 
 
 class PlaceholderLlm:
@@ -111,19 +132,23 @@ class LlmService:
         # S6：优先用 provider 返回的真实 usage 入账（诚实口径）；无则回退估算。
         usage = data.pop("usage", None) if isinstance(data, dict) else None
         cache_hit = None                     # P3：前缀缓存命中（DeepSeek usage 字段，尽力而为）
+        reasoning_tokens = None              # P0：思考 token 与正文 token 分离遥测（尽力而为）
         if usage and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
             tokens_in = int(usage.get("prompt_tokens") or 0) or estimate_tokens(messages)
             tokens_out = int(usage.get("completion_tokens") or 0) or estimate_tokens(data)
             if usage.get("prompt_cache_hit_tokens") is not None:
                 cache_hit = int(usage.get("prompt_cache_hit_tokens") or 0)
+            reasoning_tokens = _reasoning_tokens(usage)
         else:
             tokens_in, tokens_out = estimate_tokens(messages), estimate_tokens(data)
         await ctx.events.emit(Events.LLM_POST_CALL, {
             "provider": self._model, "tokens_in": tokens_in, "tokens_out": tokens_out,
             "caller": caller, "cache_hit": cache_hit,
+            "reasoning_tokens": reasoning_tokens,
         })
         return LlmResult(data=data, tokens_in=tokens_in, tokens_out=tokens_out,
-                         model=self._model, provider=self.provider_label)
+                         model=self._model, provider=self.provider_label,
+                         reasoning_tokens=reasoning_tokens)
 
 
 def _parse_json(text: str) -> dict:

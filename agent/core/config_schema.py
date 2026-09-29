@@ -29,10 +29,26 @@ _SCHEMA: dict[str, Any] = {
         "permissions": {"default": str, "task_allow": list, "task_deny": list, "llm": str,
                         "risk": dict},   # S5：按风险级裁决 {"read":"allow","danger":"deny",...}
         "loop": {"deadline_s": (int, float)},
+        # G2.0（P1-2）：context 节由 ``_any`` **补成具体键类型**（与 budget 节同纪律）——
+        # 拼错键（如 ``working_windows_tokens``）在装配期即 fail-fast，不再静默落默认值。
+        "context": {
+            # 既有键（G0/G1/S3）
+            "max_context_tokens": int, "reserve_output_tokens": int,
+            "memory_ratio": (int, float), "history_ratio": (int, float),
+            "source_clip_tokens": int,
+            "clip_max_tokens": int, "clip_head_tokens": int, "clip_tail_tokens": int,
+            "react_keep_recent": int, "react_min_chain_tokens": int,
+            # G2.0（P1）：双窗口解耦 + 水位 + 层 cap
+            "working_window_tokens": int,
+            "window_high_ratio": (int, float), "window_low_ratio": (int, float),
+            "resident_cap_tokens": int, "on_demand_cap_tokens": int,
+            "prompt_cap_tokens": int,
+            # G2.0（P2）：治理动词（模式枚举 + clear 最小释放量）
+            "compact_mode": str, "clear_at_least_tokens": int,
+        },
         # 插件自管节
         "memory": "_any",
         "react": "_any",
-        "context": "_any",
         "approval": "_any",
         "system_memory": "_any",
         "work_memory": "_any",

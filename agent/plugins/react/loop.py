@@ -37,6 +37,17 @@ S3（循环内上下文治理）
 - 条目元数据：``type``（``think``/``act``/``observe``）是**本插件私有语义**；
   ``pinned`` 是**通用元数据**，交给治理器识别（块内先占额度）；
 - 治理器缺失 / 无 ``assemble`` 接缝 → 退回旧 ``_trim`` 条数裁剪，行为不变（不劣化）。
+
+G2.0（P2：治理动词 + 收尾执行点）
+---------------------------------
+- **收尾执行点＝``_archive_chain`` 之前**（§4.5 ⑤）：``_govern_at_teardown`` 做
+  ``assess → plan →（``on`` 时）execute``，整单元替换只允许发生在这一时机（run 内
+  append-only 高命中区绝不改写）；``shadow``（缺省）只算不做、决策写遥测；
+- **``on_compact`` 由本插件提供**（``_chain_compactor`` → ``_summarize_units``）：
+  **确定性**过程摘要（不额外调 LLM），覆盖「调用意图 / 参数要点 / 结果要点」三成员信息；
+- **``wm_read`` 读回元工具**（P2-4）：补全渐进披露闭环——D2 折叠把大参数替换为引用标记时
+  逐条给出**精确 checkpoint 键**，模型由此按需读回完整原文。原设计的「工作记忆目录块」
+  **不入线**（会打断 F-1 严格前缀；见 ``_loop_blocks`` 与方案 §6.1 的偏差记录）。
 """
 
 from __future__ import annotations
@@ -79,6 +90,11 @@ class ReactConfig:
     # ---- L1：懒加载（目录卡 + 元工具按需装载完整 schema；默认 off 灰度） ----
     lazy_tools: bool = False
     lazy_tools_max: int = 12
+    # ---- G2.0（P0/F-1）：续接前缀对齐 ----
+    # True = 续接时**复用链存档里的头部快照**（system/prior/prompt 三块逐字节不变，
+    # 用户本次消息追加为链尾），使上一轮请求成为本轮请求的真前缀 → 整链命中；
+    # False = 一键回退旧行为（头部按本轮重建，续接首步整链 miss）。
+    alignment_enabled: bool = True
 
 
 @dataclass(slots=True)
@@ -102,6 +118,47 @@ class TaskContext:
     task_id: str = ""
     step: int = 0
     loaded: set[str] = field(default_factory=set)   # L1：已加载完整定义的工具名
+    # G2.0（P0/F-1）：**冻结的头部快照** ``{system_text, prior, prompt}``。
+    # 一旦冻结，本会话后续每个 run 都复用同一份头部字节——这是「续接请求的前缀
+    # 不被头部变更打断」的前提（否则易变的头部会让整条链在缓存上失效）。
+    # 非进度字段：任务结束即弃；跨 run 只经链存档流通。None = 本 run 未冻结（降级）。
+    head: dict | None = None
+
+
+# G2.0（P0）声明式注册：本端点「应有块」清单（**配置期常量**；声明幂等，以最后一次为准）。
+# ``required=False`` 者表示「无该内容时合法缺席」，不计入漏报红灯。
+_LOOP_DECLS = [
+    {"key": "react_system", "kind": "text"},
+    {"key": "react_prompt", "kind": "messages"},
+    {"key": "react_chain", "kind": "messages"},
+    {"key": "react_prior", "kind": "messages", "required": False},
+]
+
+
+def _declare_loop_blocks(gov) -> None:
+    """把本端点的应有块清单注入治理器（幂等；无该接缝 → 静默跳过，不劣化）。
+
+    完整性校验的口径是「**连提交都没有**」——``present=False`` 的块仍算已提交，
+    因此只有整块从装配管线里消失才会亮红灯（低误报、直指真实的漏报缺陷）。
+    """
+    fn = getattr(gov, "declare", None)
+    if not callable(fn):
+        return
+    try:
+        fn(_LOOP_DECLS, phase="react")
+    except Exception as exc:      # noqa: BLE001 —— 声明失败不阻断循环
+        logger.warning("react declare blocks failed: %s", exc)
+
+
+def _gov_str(gov, name: str, default: str) -> str:
+    """从治理器取字符串配置（缺方法/异常 → 回落默认，不劣化）。"""
+    fn = getattr(gov, name, None)
+    if not callable(fn):
+        return str(default)
+    try:
+        return str(fn())
+    except Exception:      # noqa: BLE001 —— 配置查询异常不阻断循环
+        return str(default)
 
 
 def _gov_int(gov, name: str, default: int) -> int:
@@ -137,6 +194,18 @@ class ReactResult:
                 "tools": list(self.tools), "tokens_in": self.tokens_in,
                 "tokens_out": self.tokens_out, "observations": list(self.observations),
                 "summary": self.summary}
+
+
+def _brief(value: Any, limit: int = 120) -> str:
+    """把任意值压成一行短摘要（过程摘要用；只做投影，不解读语义）。"""
+    if isinstance(value, str):
+        text = " ".join(value.split())
+    elif isinstance(value, dict):
+        text = ", ".join(f"{k}={_brief(v, 40)}" for k, v in list(value.items())[:6])
+    else:
+        text = str(value)
+    text = text.strip()
+    return text[:limit] + ("…" if len(text) > limit else "")
 
 
 def _slim_description(desc: str, limit: int = 120) -> str:
@@ -210,6 +279,11 @@ LAZY_META_TOOLS: list[dict] = [
     {"name": "tool_load", "description": "加载工具的完整参数定义（此后才能调用该工具；逗号分隔可多个）",
      "params": {"names": {"type": "str"}}, "required": ["names"],
      "risk": "read", "owner": "plugins.react"},
+    # G2.0（P2-4）：检查点**读回**工具——补全渐进披露闭环：目录块给出「有哪些存档」，
+    # 本工具按需取回完整原文（早前 act 大参数被折叠为引用标记时，模型由此自取回）。
+    {"name": "wm_read", "description": "按检查点名读回工作记忆中的完整原文（本任务内）",
+     "params": {"key": {"type": "str"}}, "required": ["key"],
+     "risk": "read", "owner": "plugins.react"},
 ]
 
 
@@ -259,6 +333,9 @@ class ReactLoop:
         task = TaskContext(prior=[dict(m) for m in (prior or [])], task_id=task_id)
         # P2：「继续」续接——取回上轮链存档作初始 chain（再走 _prepare_chain 治理；
         # 无存档如实回退现状，不伪造）
+        # G2.0（P0/F-1）：同时取回**头部快照**并整体冻结 —— 使续接请求的首个差异点
+        # 落在链尾（追加）而非头部（改写），上一轮请求由此成为本轮请求的真前缀。
+        resumed = False
         if resume and wm is not None:
             try:
                 arc = await wm.get(f"react_chain:{session_id}")
@@ -269,16 +346,53 @@ class ReactLoop:
                             if isinstance(m, dict)]
                 if archived:
                     task.chain.extend(archived)
+                    resumed = True
                     await durable(ctx, Events.REACT_ARCHIVED, {
                         "session_id": session_id, "resumed": True,
                         "entries": len(archived), "at": now_iso()})
+                snap = data.get("head") if cfg.alignment_enabled else None
+                if isinstance(snap, dict) and isinstance(snap.get("prompt"), str):
+                    task.head = {
+                        "system_text": str(snap.get("system_text") or ""),
+                        "prior": [dict(m) for m in (snap.get("prior") or [])
+                                  if isinstance(m, dict)],
+                        "prompt": snap["prompt"],
+                    }
             except Exception as exc:                 # noqa: BLE001 —— 续接失败退全新 run
                 logger.warning("react chain resume load failed: %s", exc)
+
+        inherited = task.head is not None          # 头部是否来自存档快照（而非本轮新建）
+        if inherited:
+            # 冻结命中：头部三块取**存档字节**（不用本轮重建值：prior 会随会话推进而变，
+            # prompt 会变成「继续」）；用户本次消息**追加为链尾 user 轮**——
+            # 信息零丢失：上轮结论是链的最后一条，本次指令是新追加的那条。
+            system_prompt = task.head["system_text"] or system_prompt
+            task.prior = list(task.head["prior"])
+            head_prompt = task.head["prompt"]
+            task.chain.append({"role": "user", "content": prompt, "type": "resume"})
+        else:
+            # 未冻结（首轮 / 旧存档 / 开关关闭）：以本轮构造值冻结，供后续 run 复用
+            head_prompt = prompt
+            task.head = {"system_text": system_prompt,
+                         "prior": [dict(m) for m in task.prior], "prompt": prompt}
+        if resumed and not inherited:
+            # F-1 体检红灯：续接了但头部**未**冻结 → 链之前的头部字节与本轮不同，
+            # 整条链将在缓存上失效（本次事故的机制）。如实记账，不阻断。
+            await durable(ctx, Events.CONTEXT_PREFIX_UNSTABLE, {
+                "session_id": session_id, "stage": "react",
+                "reason": "alignment_disabled" if not cfg.alignment_enabled else "no_snapshot",
+                "chain_entries": len(task.chain), "at": now_iso()})
+
         # 消息全集：供 finalize 与「无治理器」降级裁剪使用；**绝不写入 agent_messages**。
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
         messages.extend(task.prior)
-        messages.append({"role": "user", "content": prompt})
+        messages.append({"role": "user", "content": head_prompt})
+        if resumed:
+            # 续接：链上内容（存档链 + 本次消息）一并镜像，使 messages 与 wire 同序——
+            # 「无治理器」降级路径因此同样看得到既有链与本次指令（不劣化）。
+            messages.extend(dict(m) for m in task.chain)
         window: list[dict] = messages          # 最近一次喂给模型的窗口（治理后）
+        win: dict = {}                         # 最近一次装配统计（P1：run 收尾水位体检取用）
 
         steps = 0
         tokens_in = tokens_out = 0
@@ -304,8 +418,8 @@ class ReactLoop:
             # ---- 窗口构造（S3：块内准备 → 治理器装配；无治理器退降级） ----
             # L1：懒加载时本步 native tools = 元工具 + 已加载完整定义 + 其余目录卡
             tools_step = (self._tools_for_step(tools, task) if cfg.lazy_tools else tools)
-            window, win = self._window(ctx, task, system_prompt, prompt, messages, steps,
-                                      tools=tools_step)
+            window, win = self._window(ctx, task, system_prompt, head_prompt, messages,
+                                      steps, tools=tools_step)
             if win:
                 rt = win.get("react", {})
                 chain_clips += int(rt.get("clips", 0))
@@ -347,8 +461,15 @@ class ReactLoop:
                     "steps": steps, "tokens_in": tokens_in, "tokens_out": tokens_out,
                     "at": now_iso()})
                 self._record(ctx, steps, tool_trace, exhausted=False)
+                # G2.0（P2-3）：**收尾存档点**治理——assess → plan →（on 时）execute →
+                # 整单元替换回写链。必须在 ``_archive_chain`` 之前（存档即「下一次请求的
+                # 链副本」，在此替换不引入额外重建）。
+                await self._govern_at_teardown(
+                    ctx, task, int(win.get("total_used", 0)),
+                    system_prompt=system_prompt, head_prompt=head_prompt, steps=steps)
                 await self._archive_chain(ctx, wm, session_id, task, steps,
                                           tokens_in, tokens_out)
+                await self._emit_waterline(ctx, int(win.get("total_used", 0)))
                 if wm is not None:
                     await wm.finish(task_id)
                 ctx.state[StateKeys.REACT_RUN_ID] = ""
@@ -361,7 +482,8 @@ class ReactLoop:
             meta_results: list[ToolResult] = []
             real_calls = out.tool_calls
             if cfg.lazy_tools:
-                meta_results, real_calls = self._partition_meta(task, out.tool_calls, tools)
+                meta_results, real_calls = await self._partition_meta(
+                    wm, task, out.tool_calls, tools)
             results = list(meta_results)
             if real_calls:
                 results.extend(await self._actor.act(ctx, real_calls))
@@ -429,7 +551,12 @@ class ReactLoop:
         else:
             text = f"（已达执行上限：{reason}）\n{summary}"
         self._record(ctx, steps, tool_trace, exhausted=True, reason=reason)
+        # G2.0（P2-3）：触顶收尾同样走**收尾存档点**治理（与收敛路径同一时机闸）。
+        await self._govern_at_teardown(
+            ctx, task, int(win.get("total_used", 0)),
+            system_prompt=system_prompt, head_prompt=head_prompt, steps=steps)
         await self._archive_chain(ctx, wm, session_id, task, steps, tokens_in, tokens_out)
+        await self._emit_waterline(ctx, int(win.get("total_used", 0)))
         if wm is not None:
             await wm.finish(task_id)
         ctx.state[StateKeys.REACT_RUN_ID] = ""
@@ -535,6 +662,73 @@ class ReactLoop:
                     return {**content, "tool_results": new}, True
         return content, False
 
+    def _loop_blocks(self, task: TaskContext, system_prompt: str, head_prompt: str,
+                     prepared: list[dict]) -> list[dict]:
+        """本端点的块清单（**装配与收尾共用**——两处口径天然一致，杜绝双份真相）。
+
+        G2.0（P1-4）层标注（层决定缺省 cap，§4.4）：
+
+        ====================  =========  =====================================
+        块                     layer      说明
+        ====================  =========  =====================================
+        ``react_system``      resident   系统提示（cap 8000）
+        ``react_prior``       memory     会话前置上下文（无 cap）
+        ``react_prompt``      input      本轮用户输入（cap 2000；volatile）
+        ``react_chain``       runtime    ReAct 轨迹（无 cap；唯一可裁块）
+        ====================  =========  =====================================
+
+        G2.0（P2）：``react_chain`` 挂 ``on_compact``（过程摘要生成器）——``plan`` 的
+        compact 候选。
+
+        **P2-4 偏差（见方案 §6.1）**：原设计的「工作记忆目录块」（内存层 cap 300）**不入线**——
+        目录按 run 变化（检查点属任务级），任何窗口内位置都会打断 F-1「上一轮请求为本轮请求
+        严格前缀」这一旗舰不变量；改由「``wm_read`` 读回工具 + D2 折叠引用逐条给出精确
+        checkpoint 键」承担等价可发现性，**零前缀代价**。
+        """
+        blocks: list[dict] = [
+            {"key": "react_system", "kind": "text", "present": True,
+             "payload": system_prompt, "rigid": True, "priority": -10,
+             "layer": "resident"},
+            {"key": "react_prior", "kind": "messages", "present": bool(task.prior),
+             "payload": task.prior, "rigid": True, "priority": 0, "coverage": (0, 1),
+             "layer": "memory"},
+            {"key": "react_prompt", "kind": "messages", "present": True,
+             "payload": [{"role": "user", "content": head_prompt}], "rigid": True,
+             "priority": 5, "coverage": (1, 2), "volatile": True, "layer": "input"},
+            {"key": "react_chain", "kind": "messages", "present": bool(prepared),
+             "payload": prepared, "weight": 1.0, "priority": 10, "coverage": (2, 3),
+             "layer": "runtime", "volatile": False,
+             "on_compact": self._chain_compactor()},
+        ]
+        return blocks
+
+    def _chain_compactor(self):
+        """``on_compact`` 回调（消费方注入）：把被丢弃的一段链**压成过程摘要**。
+
+        纪律：治理器只调用、不理解其内部（纯度）；本回调为**确定性**生成（不额外调 LLM，
+        故收尾零成本、零 400 风险）。语义上满足 U-2「整单元替换为过程摘要」，且对带 tools
+        的形态覆盖三成员信息（调用意图 / 参数要点 / 结果要点）——即 X-2 的合法性判据。
+        """
+        def _on_compact(messages, target_tokens):        # noqa: ARG001 —— 目标量由治理器掌控
+            return self._summarize_units(messages)
+        return _on_compact
+
+    @staticmethod
+    def _summarize_units(messages: list[dict]) -> str:
+        """把若干条链消息压成一段**过程摘要**（保留结论与关键产物，丢弃原始字节）。"""
+        lines: list[str] = []
+        for m in messages:
+            content = m.get("content")
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                for tc in m.get("tool_calls") or []:
+                    lines.append(f"调用 {tc.get('name')}（参数要点：{_brief(tc.get('arguments'))}）")
+            elif isinstance(content, dict) and content.get("tool_results") is not None:
+                for r in content.get("tool_results") or []:
+                    flag = "失败 " if r.get("is_error") else ""
+                    lines.append(f"{flag}结果（{r.get('name')}）：{_brief(r.get('content'))}")
+        body = "；".join(lines) if lines else "（无工具调用）"
+        return f"[过程摘要] 早前 {len(messages)} 条链路已压缩：{body}"
+
     def _window(self, ctx, task: TaskContext, system_prompt: str, prompt: str,
                 messages: list[dict], step: int,
                 tools: list[dict] | None = None) -> tuple[list[dict], dict]:
@@ -543,41 +737,54 @@ class ReactLoop:
         块列表（注册制）：system / prior（rigid）/ 本轮 prompt（rigid）/ chain（可裁）。
         prior 与 prompt 为**刚性块**——循环内不参与常规裁剪（自身超预算时治理器仍会
         按刚性降级规则诚实标注，不静默）。
+
+        G2.0（P0）：
+        - ``prompt`` 入参为**头部快照里的那一份**（续接时是任务原文，不是「继续」）；
+          它标 ``volatile=True``（跨 run 内容会变），供治理器算稳定前缀体检指标；
+        - native tools 数组作为**请求附加项**显式登记（此前「扣预算但不入账」的黑洞）；
+        - 装配前注入**声明**（本阶段应有块清单），使漏报可被结构性发现。
         """
         gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
         fn = getattr(gov, "assemble", None) if gov is not None else None
         if not callable(fn):
             return _trim(messages, self._cfg.history_keep), {}
+        _declare_loop_blocks(gov)
         # D2：工作记忆接缝（act 原文存档的找回面；缺失则 act 折叠自动关闭——无损承诺）
         wm = ctx.get(Services.WORK_MEMORY) if ctx.has(Services.WORK_MEMORY) else None
         keep_recent = _gov_int(gov, "react_keep_recent", self._cfg.react_keep_recent)
         prepared, newly, act_folds = self._prepare_chain(
             gov, task.chain, keep_recent, wm=wm, task_id=task.task_id,
             act_fold=self._cfg.act_fold_tokens)
-        blocks = [
-            {"key": "react_system", "kind": "text", "present": True,
-             "payload": system_prompt, "rigid": True, "priority": -10},
-            {"key": "react_prior", "kind": "messages", "present": bool(task.prior),
-             "payload": task.prior, "rigid": True, "priority": 0, "coverage": (0, 1)},
-            {"key": "react_prompt", "kind": "messages", "present": True,
-             "payload": [{"role": "user", "content": prompt}], "rigid": True,
-             "priority": 5, "coverage": (1, 2)},
-            {"key": "react_chain", "kind": "messages", "present": bool(prepared),
-             "payload": prepared, "weight": 1.0, "priority": 10, "coverage": (2, 3)},
-        ]
+        # G2.0（P1-4/P2）：块清单（含层标注 + on_compact）由 ``_loop_blocks`` 统一产出——
+        # 装配与收尾共用同一口径，杜绝双份真相。
+        blocks = self._loop_blocks(task, system_prompt, prompt, prepared)
         try:
             # S3（彻底版·统一账本）：native tools 数组是请求附加项、不在 messages 预算内，
             # 经 assemble(reserve_tokens=) 先扣其占用，使窗口总占用（messages + native tools）
             # 对齐真实 prompt_tokens，根治「窗口预算不认 tools」的结构性隐患。
             # F1（彻底作用）：预算整体除以校准因子——真实计费高于估算时窗口装得更少，
             # 使真实请求体积贴近窗口预算（因子读 api.cost_factor 状态键，治理器自身无 ctx）。
+            # G2.0（P0）：同一占用再以 attachments 显式**登记**（只记账：有效预留取较大值，
+            # 故预算裁决与此前逐字节一致；登记使 unaccounted 归因成为可能）。
             from agent.api import cost_factor as _cf
             factor = _cf(ctx)
-            try:
-                asm = fn(blocks, reserve_tokens=estimate_request_cost(messages=[], tools=tools),
-                         cost_factor=factor)
-            except TypeError:                # 注入实现不认 cost_factor → 退回原签名（不劣化）
-                asm = fn(blocks, reserve_tokens=estimate_request_cost(messages=[], tools=tools))
+            tools_tokens = estimate_request_cost(messages=[], tools=tools)
+            attach = ([{"key": "native_tools", "claimed_tokens": int(tools_tokens)}]
+                      if tools_tokens else [])
+            tries = ({"reserve_tokens": tools_tokens, "cost_factor": factor,
+                      "attachments": attach, "phase": "react"},
+                     {"reserve_tokens": tools_tokens, "cost_factor": factor},
+                     {"reserve_tokens": tools_tokens},
+                     {})
+            asm = None
+            for kwargs in tries:
+                try:
+                    asm = fn(blocks, **kwargs)
+                    break
+                except TypeError:            # 注入实现不认新参数 → 退回更旧签名（不劣化）
+                    continue
+            if asm is None:
+                raise TypeError("assemble 不接受任一已知签名")
         except Exception as exc:                     # noqa: BLE001 —— 装配失败退降级，绝不裸崩
             logger.warning("react 窗口装配失败，退回条数裁剪：%s", exc)
             return _trim(messages, self._cfg.history_keep), {}
@@ -594,7 +801,8 @@ class ReactLoop:
         chain_tokens = chain_alloc = downgraded = 0
         for r in getattr(rep, "blocks", []):
             blocks.append({"key": r.key, "present": r.present, "reason": r.reason,
-                           "requested": r.requested, "allocated": r.allocated, "used": r.used})
+                           "requested": r.requested, "allocated": r.allocated, "used": r.used,
+                           "layer": getattr(r, "layer", ""), "cap": getattr(r, "cap", 0)})
             if r.key == "react_chain":
                 chain_tokens = int(r.used)
                 chain_alloc = int(r.allocated)
@@ -602,9 +810,19 @@ class ReactLoop:
         return {
             "step": step,
             "input_budget": int(getattr(rep, "input_budget", 0)),
+            "budget_raw": int(getattr(rep, "budget_raw", 0)),      # P3：I-4 对照基数
             "total_used": int(getattr(rep, "total_used", 0)),
             "blocks": blocks,
             "rigid_overflow": [r.key for r in getattr(rep, "rigid_overflow", [])],
+            # ---- G2.0（P0）只读观测：记账与缓存友好度（旧治理器无这些字段 → 恒 0/空）----
+            "unaccounted_tokens": int(getattr(rep, "unaccounted_tokens", 0)),
+            "stable_prefix_tokens": int(getattr(rep, "stable_prefix_tokens", 0)),
+            "volatile_blocks": list(getattr(rep, "volatile_blocks", []) or []),
+            "missing_blocks": list(getattr(rep, "missing_blocks", []) or []),
+            "attachments": [
+                {"key": a.key, "claimed": int(a.claimed), "used": int(a.used)}
+                for a in getattr(rep, "attachments", []) or []
+            ],
             "react": {
                 "chain_tokens": chain_tokens,
                 "chain_peak_tokens": chain_tokens,       # 由 run() 累计为任务内峰值
@@ -635,6 +853,115 @@ class ReactLoop:
                 "stage": "react", "at": now_iso(), **stats})
         except Exception as exc:                     # noqa: BLE001 —— 遥测失败不阻断
             logger.warning("react context governed emit failed: %s", exc)
+        # ---- G2.0（P3-2）：装配后**不变量断言**（I-3 前缀可测 / I-4 预算守恒）----
+        # 记录 + 告警（不阻断）；记账面判定经治理器门面**软调用**（不 import 插件内部）。
+        gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
+        inv_fn = getattr(gov, "check_invariants", None)
+        if callable(inv_fn):
+            payload = {"stage": "react", **stats}
+            try:
+                res = inv_fn(payload)
+            except Exception as exc:                 # noqa: BLE001 —— 断言失败不阻断
+                logger.warning("react invariant check failed: %s", exc)
+                return
+            bad = [k for k, ok in (res or {}).items() if not ok]
+            if bad:
+                logger.warning("react invariant violation: %s", bad)
+                try:
+                    await ctx.events.emit(Events.CONTEXT_INVARIANT_VIOLATION, {
+                        "stage": "react", "invariants": bad,
+                        "detail": {"unaccounted_tokens": stats.get("unaccounted_tokens"),
+                                   "budget_raw": stats.get("budget_raw"),
+                                   "stable_prefix_tokens": stats.get("stable_prefix_tokens"),
+                                   "volatile_blocks": stats.get("volatile_blocks")}})
+                except Exception as exc:             # noqa: BLE001 —— 告警失败不阻断
+                    logger.warning("react invariant emit failed: %s", exc)
+
+    async def _emit_waterline(self, ctx, used: int, *,
+                              phase: str = "run_teardown",
+                              remaining_steps: int | None = None) -> None:
+        """发 ``agent/context/waterline``（P1-3：run 收尾存档点的**水位体检**）。
+
+        纪律（纯观测 + 零状态）：`assess` 是纯函数（同样入参恒得同样结果），本方法只做
+        「取治理器 → 判水位 → 发遥测」，**不写入任何状态**；治理器缺失即静默跳过（软依赖）。
+        执行点＝run 收尾存档点（§4.5 ②；与链压缩⑤同一时机闸：一 run 一次）。
+        """
+        gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
+        assess = getattr(gov, "assess", None)
+        if not callable(assess):
+            return
+        try:
+            rep = assess(int(used), phase=phase, remaining_steps=remaining_steps)
+        except Exception as exc:                     # noqa: BLE001 —— 体检失败不阻断
+            logger.warning("react waterline assess failed: %s", exc)
+            return
+        payload = {"stage": "react", "phase": phase, "at": now_iso(),
+                   "used": rep.used, "window": rep.working_window,
+                   "capability": rep.capability_window, "ratio": rep.load_ratio,
+                   "level": rep.level, "suggested": rep.suggested, "gates": rep.gates}
+        try:
+            await durable(ctx, Events.CONTEXT_WATERLINE, payload)
+        except Exception as exc:                     # noqa: BLE001 —— 遥测失败不阻断
+            logger.warning("react waterline durable failed: %s", exc)
+        try:
+            await ctx.events.emit(Events.CONTEXT_WATERLINE, payload)
+        except Exception as exc:                     # noqa: BLE001 —— 遥测失败不阻断
+            logger.warning("react waterline emit failed: %s", exc)
+
+    async def _govern_at_teardown(self, ctx, task: TaskContext, used: int, *,
+                                  system_prompt: str, head_prompt: str,
+                                  steps: int) -> None:
+        """**run 收尾存档点**：assess → plan →（``on`` 时）execute → 回写链。
+
+        - 执行点＝**收尾存档点**（§4.5 ⑤；与 ``_emit_waterline`` 同一时机闸：一 run 一次）。
+          时机属消费方语义——治理器只提供 ``plan``/``execute`` 原语与不变量校验；
+        - ``shadow``（缺省）：``plan`` 照常计算，``execute`` 不执行；决策与理由写
+          ``CONTEXT_COMPACT_DECIDED``（**shadow 数据的唯一来源**，供阈值校准）；
+        - ``on``：执行并写 ``CONTEXT_COMPACT_APPLIED``；不变量被违反时补发
+          ``CONTEXT_INVARIANT_VIOLATION``；链被替换才回写 ``task.chain``；
+        - 全程**不阻断收尾**（任何异常吞掉并记日志）——治理失败不得影响用户的答复交付。
+        """
+        gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
+        plan_fn = getattr(gov, "plan", None)
+        if not callable(plan_fn):
+            return
+        try:
+            mode = _gov_str(gov, "compact_mode", "shadow")
+            report = gov.assess(int(used), phase="run_teardown", remaining_steps=steps)
+            blocks = self._loop_blocks(task, system_prompt, head_prompt, list(task.chain))
+            actions = plan_fn(report, blocks=blocks, mode=mode)
+            await durable(ctx, Events.CONTEXT_COMPACT_DECIDED, {
+                "stage": "react", "mode": mode, "shadow": mode != "on",
+                "level": report.level, "used": report.used,
+                "window": report.working_window, "gates": report.gates,
+                "actions": [{"kind": a.kind, "target": a.target,
+                             "expected_release": a.expected_release,
+                             "reason": a.reason} for a in actions],
+                "at": now_iso()})
+            if mode != "on":
+                return
+            exec_fn = getattr(gov, "execute", None)
+            if not callable(exec_fn):
+                return
+            new_blocks, res = exec_fn(actions, blocks, mode=mode)
+            await durable(ctx, Events.CONTEXT_COMPACT_APPLIED, {
+                "stage": "react", "applied": list(res.applied),
+                "skipped": [list(x) for x in res.skipped], "released": res.released,
+                "invariants": dict(res.invariants), "degraded": res.degraded,
+                "at": now_iso()})
+            for key, ok in (res.invariants or {}).items():
+                if ok:
+                    continue
+                await durable(ctx, Events.CONTEXT_INVARIANT_VIOLATION, {
+                    "stage": "react", "invariant": key, "target": "react_chain",
+                    "detail": {"skipped": [list(x) for x in res.skipped],
+                               "degraded": res.degraded}, "at": now_iso()})
+            new_chain = next((b.payload for b in new_blocks
+                              if b.key == "react_chain"), None)
+            if isinstance(new_chain, list) and new_chain != list(task.chain):
+                task.chain[:] = list(new_chain)          # 仅「已替换」才回写（身份判定）
+        except Exception as exc:                         # noqa: BLE001 —— 治理失败不阻断收尾
+            logger.warning("react teardown governance failed: %s", exc)
 
     @staticmethod
     def _closing_summary(steps: int, tool_trace: list[str], observed: list[dict],
@@ -661,9 +988,13 @@ class ReactLoop:
             out.append(t if t.get("name") in task.loaded else _card(t))
         return out
 
-    def _partition_meta(self, task: TaskContext, calls, tools: list[dict]
-                        ) -> tuple[list[ToolResult], list]:
-        """拆分本轮调用：元工具（内联处理）+ 未加载（错误观察可自纠）+ 真实调用。"""
+    async def _partition_meta(self, wm, task: TaskContext, calls, tools: list[dict]
+                              ) -> tuple[list[ToolResult], list]:
+        """拆分本轮调用：元工具（内联处理）+ 未加载（错误观察可自纠）+ 真实调用。
+
+        ``wm_read``（P2-4）需要 ``wm`` 接缝做异步读回，故本方法为 async；``tool_search`` /
+        ``tool_load`` 仍是纯内联（不进 ``ctx.tasks`` 注册表，``TaskContext.loaded`` 是唯一真相）。
+        """
         meta: list[ToolResult] = []
         real = []
         catalog = {t.get("name"): t for t in tools}
@@ -672,6 +1003,8 @@ class ReactLoop:
                 meta.append(self._tool_search(c, tools))
             elif c.name == "tool_load":
                 meta.append(self._tool_load(task, c, catalog))
+            elif c.name == "wm_read" and wm is not None:
+                meta.append(await self._wm_read(wm, task, c))
             elif c.name not in task.loaded:
                 meta.append(ToolResult(
                     c.name,
@@ -717,6 +1050,29 @@ class ReactLoop:
             parts.append(f"未知工具名忽略：{', '.join(unknown)}")
         return ToolResult("tool_load", "；".join(parts), tool_call_id=c.id)
 
+    @staticmethod
+    async def _wm_read(wm, task: TaskContext, c) -> ToolResult:
+        """``wm_read``：按检查点名读回本任务工作记忆里的**完整原文**（渐进披露读回闭环）。
+
+        找不到 → 错误观察并列出可用检查点（模型据此自纠，与 ``tool_load`` 同款诚实拒绝）；
+        超大内容做**源头护栏式**上限（超限如实标注，不静默截断语义）。
+        """
+        key = str((c.arguments or {}).get("key") or "").strip()
+        try:
+            data = await wm.get(task.task_id)
+            cps = json.loads((data or {}).get("checkpoints") or "[]")
+        except Exception as exc:                         # noqa: BLE001 —— 读回失败诚实返回
+            return ToolResult("wm_read", f"读取工作记忆失败：{type(exc).__name__}",
+                              is_error=True, tool_call_id=c.id)
+        hit = next((x for x in reversed(cps)
+                    if isinstance(x, dict) and str(x.get("name")) == key), None)
+        if hit is None:
+            names = "、".join(str(x.get("name")) for x in cps if isinstance(x, dict)) or "（无）"
+            return ToolResult("wm_read", f"未找到检查点 {key!r}；当前可用：{names}",
+                              is_error=True, tool_call_id=c.id)
+        text = json.dumps(hit.get("data"), ensure_ascii=False)
+        return ToolResult("wm_read", text[:20000], tool_call_id=c.id)
+
     # ---------- P1：链存档（「继续」低成本续接的依据） ----------
 
     @staticmethod
@@ -726,6 +1082,9 @@ class ReactLoop:
 
         与一期 progress 摘要互补：摘要是给长期记忆的**结论**，链存档是给工作记忆的
         **过程**。存档本身已过 `_prepare_chain` 折叠治理（天然有界）。
+
+        G2.0（P0/F-1）：连同**头部快照** ``task.head`` 一起存档——下次「继续」原样复用
+        这三块字节，续接请求的第一个差异点因此落在链尾（追加）而非头部（改写）。
         """
         if wm is None or not task.chain:
             return
@@ -735,6 +1094,7 @@ class ReactLoop:
                                      "max_steps": 0})
             await wm.checkpoint(arch_id, "chain", {
                 "chain": [dict(m) for m in task.chain], "steps": steps,
+                "head": dict(task.head) if task.head else None,
                 "tokens_in": tokens_in, "tokens_out": tokens_out, "at": now_iso()})
             await durable(ctx, Events.REACT_ARCHIVED, {
                 "session_id": session_id, "entries": len(task.chain), "steps": steps,

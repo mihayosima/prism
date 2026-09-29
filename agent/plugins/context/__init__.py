@@ -31,6 +31,7 @@ from __future__ import annotations
 from agent.api import Services, plugin
 
 from .governor import ContextGovernor
+from .inspector import LedgerEntry, RoundLedger
 from .protocols import Assembly, AssemblyReport, BlockReport, BlockSpec, GovernorLike
 
 
@@ -61,4 +62,6 @@ __all__ = [
     "BlockReport",
     "AssemblyReport",
     "Assembly",
+    "LedgerEntry",
+    "RoundLedger",
 ]

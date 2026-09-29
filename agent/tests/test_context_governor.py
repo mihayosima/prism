@@ -7,7 +7,9 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from agent.api import Services
+import pytest
+
+from agent.api import ConfigError, Services
 from agent.core.tokens import clip_json, clip_text, estimate_tokens
 from agent.plugins.context import ContextGovernor
 from agent.profiles import build_agent
@@ -221,15 +223,29 @@ def test_governor_seam_injection(tmp_path):
 
 
 def test_context_config_node_passes_validation(tmp_path):
-    """agent.context 节经 config_schema 宽松放行（"_any"），不触发 ConfigError。"""
+    """agent.context 节**具体键类型**校验（G2.0 P1-2：由 "_any" 收紧，与 budget 节同纪律）。
+
+    合法键通过；拼错键（如 ``compact_trigger`` 少了 ``_tokens``）在装配期即 fail-fast——
+    这正是「不再静默落默认值」的落点。
+    """
+    from agent.core.config_schema import validate_config
+
     c = _build(tmp_path, patch={"agent": {"context": {"max_context_tokens": 20000,
-                                                      "compact_trigger": 8}}})
+                                                      "working_window_tokens": 96000,
+                                                      "window_high_ratio": 0.7}}})
 
     async def s():
-        await c.assemble()                          # 不抛 ConfigError 即通过
+        await c.assemble()                          # 合法 context 节点不抛 ConfigError
         assert c.root.has(Services.CONTEXT)
 
     _run(s())
+
+    # 未知键（拼错）→ fail-fast
+    with pytest.raises(ConfigError):
+        validate_config({"agent": {"context": {"compact_trigger": 8}}})
+    # 类型不符（int 期望却给 str）→ fail-fast
+    with pytest.raises(ConfigError):
+        validate_config({"agent": {"context": {"working_window_tokens": "96000"}}})
 
 
 # ---- G1 分块装配（assemble） ----

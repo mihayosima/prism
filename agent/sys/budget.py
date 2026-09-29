@@ -64,6 +64,12 @@ class Budget:
                 ctx, "ALTER TABLE agent_budget_log ADD COLUMN cache_hit INTEGER", ())
         except Exception:                        # noqa: BLE001 —— 同上
             pass
+        # G2.0（P0）：思考 token 与正文 token 分离落账（provider 未给明细 → NULL，不猜）
+        try:
+            await ctx.db.execute(
+                ctx, "ALTER TABLE agent_budget_log ADD COLUMN reasoning_tokens INTEGER", ())
+        except Exception:                        # noqa: BLE001 —— 同上
+            pass
 
         async def _pre(payload: dict, next) -> dict:
             # est 覆盖 messages + tools 目录（native 形态）+ schema；
@@ -119,13 +125,17 @@ class Budget:
             run_id = str(entry.get("run_id") or "")
             cache_hit = payload.get("cache_hit")
             cache_hit = int(cache_hit) if cache_hit is not None else None
+            # G2.0（P0）：思考 token 明细（provider 未提供 → NULL；口径与 tokens_out 同源）
+            _rt = payload.get("reasoning_tokens")
+            reasoning_tokens = int(_rt) if _rt is not None else None
             spent = ctx.state.get(StateKeys.BUDGET_SPENT, 0)
             ctx.state[StateKeys.BUDGET_SPENT] = max(0, spent - est + (ti + to))
             await ctx.db.execute(
                 ctx,
                 "INSERT INTO agent_budget_log(model, tokens_in, tokens_out, est_cost,"
-                " run_id, cache_hit, at) VALUES (?,?,?,?,?,?,?)",
-                (model, ti, to, est or None, run_id or None, cache_hit, now_iso()),
+                " run_id, cache_hit, reasoning_tokens, at) VALUES (?,?,?,?,?,?,?,?)",
+                (model, ti, to, est or None, run_id or None, cache_hit,
+                 reasoning_tokens, now_iso()),
             )
             # F3：口径漂移审计（与校准开关无关——漂移本身永远值得留证）
             if raw > 0 and abs(ti - raw) / raw > 0.25:

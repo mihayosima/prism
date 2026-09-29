@@ -40,8 +40,26 @@ BASE_AGENT_CONFIG: dict = {
                    # F1：口径自校准（EWMA 因子作用于 budget 预借与治理器装配）
                    "cost_calibration": True},
         # P2/L：react 续接词表与懒加载默认（react 节 _any 免 schema，但默认值须有单一真相源）
+        # P0-2：alignment_enabled＝续接前缀对齐（头部快照冻结）；默认开启，可就地回退
         "react": {"resume_keywords": ["继续", "接着", "续写", "continue"],
-                  "lazy_tools": False, "lazy_tools_max": 12},
+                  "lazy_tools": False, "lazy_tools_max": 12,
+                  "alignment_enabled": True},
+        # G2.0（P1）：context 节默认值**唯一真相源**（governor.from_config / 设置页同源引用）。
+        # 双窗口解耦：max_context_tokens 是**能力上限**（1M），working_window_tokens 是
+        # **经济基数**（水位分母）——两者量纲不同，绝不可互相顶替（本次事故根因）。
+        "context": {
+            "max_context_tokens": 24000, "reserve_output_tokens": 4000,
+            "memory_ratio": 0.10, "history_ratio": 0.60, "source_clip_tokens": 8192,
+            "clip_max_tokens": 1000, "clip_head_tokens": 500, "clip_tail_tokens": 500,
+            "react_keep_recent": 6, "react_min_chain_tokens": 2048,
+            "working_window_tokens": 96000,
+            "window_high_ratio": 0.70, "window_low_ratio": 0.40,
+            "resident_cap_tokens": 8000, "on_demand_cap_tokens": 8000,
+            "prompt_cap_tokens": 2000,
+            # G2.0（P2）：治理动词——默认 ``shadow``（照常计算决策但不执行，只写遥测；
+            # 这是让压缩阈值用真实数据校准的唯一安全方式）；``clear`` 最小释放量 4000。
+            "compact_mode": "shadow", "clear_at_least_tokens": 4000,
+        },
         "permissions": {"default": "open", "task_allow": ["*"], "task_deny": [], "llm": "open"},
         "approval": {"provider": "web", "allow": ["*"], "deny": [], "ask": [],
                       "timeout_s": 30, "default": "deny"},
