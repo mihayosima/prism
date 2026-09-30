@@ -13,6 +13,15 @@ local_secrets.json
 
 # runtime log
 agent_chat_server.log
+# 本地起服务时的重定向日志（后端 8720 / 前端 5174）
+.backend-*.log
+.frontend-*.log
+
+# 诊断件的**生成物**（脚本本身入库，产物不入库）
+_diag_final2/
+_diag_mcp/*.json
+_diag_mcp/*.log
+_diag_mcp/*.txt
 
 # temp patch scripts
 patch_remove_windowing.py
