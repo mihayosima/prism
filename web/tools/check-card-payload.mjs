@@ -8,17 +8,27 @@
  *   cards.showApproval(p)            // ❌ p.call_id === undefined
  * showApproval 首行 `if (!d.call_id) return` 于是恒真 ⇒ 卡片静默不弹、且不报错。
  *
+ * 【第二次故障 · 2026-10-01】上条修复把它做成了「统一解包 d = p.data」。这对
+ * approval/ask_user 是对的，但 **progress 帧的 addStep 需要外层 source**（→ 步骤名）
+ * 与 data（→ 载荷）——统一解包后：
+ *   ① 步骤名取不到 p.source ⇒ 退化为常量 'progress'；
+ *   ② 载荷取不到 p.data    ⇒ 恒为 {}（用户可见症状：「推理过程的载荷是空的」）。
+ * 为何潜伏：当时的回归脚本**只驱动了出故障的那两帧**（approval/ask_user），
+ * 从未驱动 progress ⇒ 同类问题在其它分支复发时无人守卫。故本次把 progress 帧
+ * 一并纳入驱动，并加静态断言钉住 progress 分支的实参形态。
+ *
  * 本脚本在 node 中执行**真实 vite 产物**（配 DOM 桩），用真实帧结构
  *   { event:'approval', payload:{ source, data:{ call_id, tool, ... } } }
  * 驱动，断言：
  *   1. 审批卡真的插入了 DOM（.hitcard / .hityes 等）；
  *   2. 澄清卡真的插入了 DOM（.hitopt 等）；
- *   3. 反向验证能力：把 handleFrame 的取层改回 p（外层）⇒ 本脚本必须红灯。
+ *   3. progress 帧的步骤卡标题取自 payload.source、载荷取自 payload.data（非 {}）；
+ *   4. 反向验证能力：改回旧写法（卡片传外层 p / progress 传解包后的 d）⇒ 必须红灯。
  *
  * 用法：node --max-old-space-size=2048 tools/check-card-payload.mjs
  *       npm run check:cards
  * 退出码：0 全通过 / 1 有失败。
- * 时间：2026-09-30 12:42 (GMT+8)
+ * 时间：2026-10-01 00:20 (GMT+8)
  */
 
 import { readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs'
@@ -58,6 +68,14 @@ ok('卡片调用未直接传外层 payload', badCardCall.length === 0, badCardCa
 
 // 必须存在统一的取层语句
 ok('存在 payload.data 取层（d = p.data）', /\bconst\s+d\s*=\s*\(?\s*p\??\.data/.test(chatCode))
+
+// ★ 例外：progress 帧的 addStep 要读**外层** source（作步骤名）与 data（作载荷），
+//   故必须传完整 payload。若误传统一解包后的 d ⇒ 步骤名退化为 'progress'、载荷恒为 {}。
+//   （这正是统一解包修复 B2.6 时引入的副作用，见脚本头部注释。）
+ok('progress 帧的 addStep 不得传解包后的 d', !/\.addStep\(\s*d\b/.test(chatCode),
+  (chatCode.match(/\.addStep\(([^)]*)\)/) || [])[1] || '')
+ok('progress 帧的 addStep 传完整 payload（p）', /\.addStep\(\s*p\b/.test(chatCode),
+  (chatCode.match(/\.addStep\(([^)]*)\)/) || [])[1] || '')
 
 // ============================================================
 // 第二部分：运行检查 · 真实产物 + DOM 桩，用真实帧结构驱动
@@ -479,6 +497,18 @@ function frame(event, biz) {
   return { event, payload: { source: 'agent/' + event, data: biz } }
 }
 
+// ★ progress 帧（REACT_STEP_* / TASKS_POST_EXECUTE 等走它）：
+//   source 是**真实内核事件名**（不是帧名），data 是业务对象。
+//   注意：progress 帧的 source 不可用 frame() 的 'agent/'+event 拼法——那样会造出
+//   'agent/progress' 这种不存在的内核事件名，掩盖「步骤名取自 source」的断言强度。
+const progressFrame = {
+  event: 'progress',
+  payload: {
+    source: 'agent/react/step_end',
+    data: { step: 2, tool: 'fs.write', ok: true, ms: 12 },
+  },
+}
+
 const approvalFrame = frame('approval', {
   call_id: 'call-abc-1',
   tool: 'fs.write',
@@ -528,7 +558,7 @@ globalThis.fetch = async (url, opts = {}) => {
   fetchCalls.push(u)
   const json = (o) => ({ ok: true, status: 200, json: async () => o, text: async () => JSON.stringify(o) })
   // ★ 线格式：每帧一行 `data: <JSON>`，JSON 自带 event/payload；不是标准双行 SSE
-  if (u.includes('/chat/stream')) return sseBody([approvalFrame, askFrame])
+  if (u.includes('/chat/stream')) return sseBody([progressFrame, approvalFrame, askFrame])
   if (u.includes('/api/status')) return json({ provider_label: 'p', model: 'm', session_id: 's1', version: 'v', budget: null })
   if (u.includes('/api/session')) return json({ history: [] })
   if (u.includes('/api/approval/pending')) return json({ items: [], enabled: true, mode: 'default' })
@@ -547,6 +577,21 @@ if (txtEl && sendEl) {
   sendEl.dispatchEvent({ type: 'click', target: sendEl })
   await new Promise((r) => setTimeout(r, 400))
 }
+
+// ---------- progress 帧：步骤卡的「来源名 + 载荷」 ----------
+// 这是 B2.6 统一解包引入的副作用：addStep 被传了解包后的 d ⇒
+//   ① 标题取不到 p.source，退化为常量 'progress'；
+//   ② 载荷取不到 p.data，恒为 {}（用户可见的「载荷是空的」）。
+const stepEls = document.body.querySelectorAll('.step')
+ok('progress 帧渲染出步骤卡（.step）', stepEls.length >= 1, `实得 ${stepEls.length}`)
+const step0 = stepEls[0] || null
+const nmEl = step0 && step0.querySelector('.name')
+ok('步骤卡标题取自 payload.source（去 agent/ 前缀 + ·step 后缀）',
+  !!nmEl && nmEl.textContent === 'react/step_end · step 2', `实得「${nmEl && nmEl.textContent}」`)
+const preEl = step0 && step0.querySelector('pre')
+const preTxt = preEl ? preEl.textContent : ''
+ok('步骤卡载荷取自 payload.data（非空且含业务字段）',
+  preTxt.trim() !== '{}' && /fs\.write/.test(preTxt), `实得「${preTxt}」`)
 
 const cardsInDom = (sel) => document.body.querySelectorAll(sel)
 

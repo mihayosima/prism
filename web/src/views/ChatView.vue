@@ -135,8 +135,12 @@ function handleFrame(ev: string, p: Record<string, unknown>): void {
   const k = kernel!
   // 统一从 payload.data 取业务对象（legacy 的 p.data 语义）
   const d = (p?.data ?? {}) as Record<string, never>
-  if (ev === sseFrameName('PROGRESS')) k.useSeg().addStep(d)
-  else if (ev === sseFrameName('THINKING')) k.useSeg().appendThinking((d as { text?: string }).text || '')
+  // ★ progress 帧是**唯一例外**：addStep 要读外层 `source`（→ 步骤名）与 `data`（→ 载荷），
+  //   故必须传**完整 payload**，不能传上面统一解包出的 d —— 否则步骤名退化为 'progress'、
+  //   载荷恒为 {}。（legacy app.js:175 `useSeg().addStep(p)` 即完整 payload 语义。）
+  if (ev === sseFrameName('PROGRESS')) {
+    k.useSeg().addStep(p as { source?: string; data?: Record<string, unknown> })
+  } else if (ev === sseFrameName('THINKING')) k.useSeg().appendThinking((d as { text?: string }).text || '')
   else if (ev === sseFrameName('TOKEN')) k.useSeg().appendToken((d as { text?: string }).text || '')
   else if (ev === sseFrameName('FINAL')) k.useSeg().finish((p.text as string) || '', (p.evidence as never) || null)
   else if (ev === sseFrameName('CANCELLED')) {
