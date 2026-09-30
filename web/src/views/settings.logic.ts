@@ -7,7 +7,7 @@
  */
 
 import { esc } from '../components/markdown'
-import type { SettingsResponse } from '../api/types'
+import type { SettingsResponse, SettingsDomainOption } from '../api/types'
 
 /** 浮点型字段（legacy app.js:514、551 两处硬编码，此处收敛为一处） */
 export const FLOAT_KEYS = new Set([
@@ -87,10 +87,48 @@ const INP = 'width:240px;padding:7px 9px;border:1px solid var(--line);border-rad
 const SEL = 'width:340px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit;background:#fff'
 const HINT = 'font-size:11px;margin-top:3px'
 const LABEL = 'display:block;margin:12px 0 0'
+/** G 放行域下拉 · 触发器：外观与其它 select 一致（同宽 340px），右侧带展开指示 */
+const DD_BTN =
+  'display:flex;align-items:center;justify-content:space-between;gap:8px;width:340px;padding:7px 9px;' +
+  'border:1px solid var(--line);border-radius:8px;font:inherit;background:#fff;color:inherit;cursor:pointer;text-align:left'
+/** G 放行域下拉 · 浮层面板：默认 hidden 收起，点触发器才展开 */
+const DD_PANEL =
+  'position:absolute;z-index:30;margin-top:4px;width:340px;max-height:220px;overflow:auto;' +
+  'border:1px solid var(--line);border-radius:8px;background:#fff;box-shadow:0 10px 28px rgba(15,23,42,.12);padding:6px'
 
 /** legacy app.js:469-549 — 设置页 HTML（纯函数，逐字符对拍） */
 export function renderSettingsHtml(j: SettingsResponse): string {
   const v = (j.values || {}) as Record<string, unknown>
+  // G 域级裁剪：白名单以「可勾选」呈现，候选项由后端给（= 已注册域 ∪ 已选但当前未注册域）。
+  // 不手填 —— 域名是 owner（插件 id），手填既要记拼写、又会因拼错触发后端安全阀静默回退。
+  const domainOpts = (j.domains || []) as SettingsDomainOption[]
+  const pickedDomains = new Set(((v.tool_domains || []) as string[]).map((s) => String(s).trim()))
+  const domainRows = domainOpts.length
+    ? domainOpts
+        .map(
+          (d) =>
+            '<label style="display:flex;align-items:center;gap:8px;padding:4px 0;font-weight:400;cursor:pointer">' +
+            '<input type="checkbox" class="set_tool_domain_cb" value="' +
+            esc(d.name) +
+            '"' +
+            (pickedDomains.has(d.name) ? ' checked' : '') +
+            '>' +
+            '<span style="font-family:var(--font-mono);font-size:12px">' +
+            esc(d.name) +
+            '</span>' +
+            '<span class="muted" style="font-size:11px">' +
+            (d.available === false ? '当前未注册' : esc(d.count) + ' 个工具') +
+            '</span></label>',
+        )
+        .join('')
+    : '<div class="muted" style="font-size:12px">（当前没有已注册的工具域）</div>'
+  // 下拉触发条文案：≤2 个直接列名，更多折成计数；一个都没选 ⇒ 明示「不裁剪」
+  const pickedNames = domainOpts.filter((d) => pickedDomains.has(d.name)).map((d) => d.name)
+  const ddLabel = pickedNames.length
+    ? pickedNames.length <= 2
+      ? pickedNames.join('、')
+      : '已选 ' + pickedNames.length + ' 个域'
+    : '未选择（不裁剪）'
   let h =
     '<div class="card"><h3 style="margin-top:0">成本护栏（budget）</h3>' +
     '<div class="muted" style="margin-bottom:10px">LLM 调用的生命周期累计 token 上限：每次调用前先按估算预借、结束后按服务商真实用量对账；超限即拒绝调用。保存后立即重建容器生效（<b>已用量重计</b>）。覆盖写入 data/agent_plugin_config.json，重启后保持。</div>' +
@@ -135,7 +173,30 @@ export function renderSettingsHtml(j: SettingsResponse): string {
     '"><div style="font-weight:600;margin-bottom:3px"><input id="set_alignment_enabled" type="checkbox"' +
     (v.alignment_enabled ? ' checked' : '') +
     '> 续接前缀对齐 alignment_enabled</div>' +
-    '<div class="muted" style="font-size:11px">续接时冻结头部快照（system/前置上下文/首轮提示词）跨 run 逐字节稳定，新消息追加链尾，使请求构成前序请求的严格前缀，命中提示缓存（实测前缀断裂时整链按 miss 计价）。关闭 = 回退旧行为，续接时头部随当前提示词重建（并发出 prefix-unstable 事件）。</div></label></div>'
+    '<div class="muted" style="font-size:11px">续接时冻结头部快照（system/前置上下文/首轮提示词）跨 run 逐字节稳定，新消息追加链尾，使请求构成前序请求的严格前缀，命中提示缓存（实测前缀断裂时整链按 miss 计价）。关闭 = 回退旧行为，续接时头部随当前提示词重建（并发出 prefix-unstable 事件）。</div></label>' +
+    '<label style="' +
+    LABEL +
+    '"><div style="font-weight:600;margin-bottom:3px"><input id="set_tool_domains_enabled" type="checkbox"' +
+    (v.tool_domains_enabled ? ' checked' : '') +
+    '> 启用域级裁剪 tool_domains_enabled</div>' +
+    '<div class="muted" style="font-size:11px">按工具「域」(注册来源 owner = 插件 id) 裁剪暴露面：未列名的域对模型不可见，但仍可经 tool_search / tool_load 检索加载（<b>隐藏但可检索</b>）。<b>仅在懒加载开启时生效</b> —— 非懒加载没有检索通道，裁剪会让被隐藏工具彻底失联。默认关闭。</div></label>' +
+    '<div style="' +
+    LABEL +
+    '"><div style="font-weight:600;margin-bottom:3px">放行域白名单 tool_domains</div>' +
+    '<div style="position:relative;width:340px">' +
+    '<button type="button" id="set_tool_domains_btn" aria-haspopup="true" aria-expanded="false" style="' +
+    DD_BTN +
+    '"><span id="set_tool_domains_label" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+    esc(ddLabel) +
+    '</span><span class="muted" style="flex:none;font-size:10px">▾</span></button>' +
+    '<div id="set_tool_domains" class="set_tool_domain_panel" hidden style="' +
+    DD_PANEL +
+    '">' +
+    domainRows +
+    '</div></div>' +
+    '<div class="muted" style="' +
+    HINT +
+    '">放行制：勾选的域对模型可见，其余域被隐藏（仍可经 tool_search 检索加载）；<b>一个都不勾 = 不裁剪</b>（不做「全隐藏」）。域 = 工具注册来源 owner（插件 id），新增 MCP 插件会自动成为一个新域，在此自动出现。</div></div></div>'
 
   if (j.context_plugin_enabled !== true) {
     h +=

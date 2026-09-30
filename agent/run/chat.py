@@ -136,6 +136,11 @@ _SETTING_SCHEMA = {
     "cost_calibration": ("bool",),                        # F1：口径自校准（EWMA 因子）
     # ---- 工具懒加载（plugins.react；L1 灰度开关）----
     "lazy_tools": ("bool",),
+    # ---- 域级裁剪（plugins.react；路线 2：投影层按域裁剪工具暴露面）----
+    # 硬前提：仅 lazy_tools=True 时生效（非懒加载无 tool_search/tool_load，
+    # 裁剪即硬隐藏＝不可回溯）。空白名单视同未配置（不做全隐藏）。
+    "tool_domains_enabled": ("bool",),
+    "tool_domains": ("list",),                             # 放行域白名单（owner，如 plugins.windows_mcp）
     # ---- P0-2：续接前缀对齐（plugins.react；头部快照冻结，可回退）----
     "alignment_enabled": ("bool",),
 }
@@ -166,6 +171,8 @@ _PLUGIN_OF_KEY = {
     "finalize_reserve_tokens": "plugins.budget",
     "cost_calibration": "plugins.budget",
     "lazy_tools": "plugins.react",
+    "tool_domains_enabled": "plugins.react",
+    "tool_domains": "plugins.react",
     "alignment_enabled": "plugins.react",
 }
 # G2.0（P1）：context 节默认值单一真相源（与 profiles.BASE_AGENT_CONFIG 同源，避免漂移）
@@ -204,6 +211,13 @@ _SETTING_DEFAULTS = {
                          .get("cost_calibration", True)),
     "lazy_tools": (((BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {})
                    .get("lazy_tools", False)),
+    # 域级裁剪：与 profiles.BASE_AGENT_CONFIG agent.react 同源。
+    # 陷阱：tool_domains 的默认值**必须是 []，不能是 None** —— _coerce_setting 的
+    # "list" 分支对非 str/list 走 ``parts=[raw]``，None 会被收成字符串 "None"。
+    "tool_domains_enabled": (((BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {})
+                             .get("tool_domains_enabled", False)),
+    "tool_domains": (((BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {})
+                     .get("tool_domains", [])),
     # P0-2：与 profiles.BASE_AGENT_CONFIG agent.react 同源；默认开启
     "alignment_enabled": (((BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {})
                           .get("alignment_enabled", True)),
@@ -238,6 +252,41 @@ def _coerce_setting(key: str, raw):
     if val < lo or val > hi:
         raise ValueError(f"{key} 须落在 [{lo}, {hi}]")
     return val
+
+
+def _domain_options(tools: list[dict], selected: object) -> list[dict]:
+    """可用工具域清单（供设置页以「可勾选」方式渲染 ``tool_domains``）。
+
+    = 当前已注册域（附工具数） ∪ 配置里已选但当前未注册的域（``available=False``）。
+
+    后半段是**必要**的而非补充：域随插件启用/停用而增减，若只渲染已注册域，
+    「配置里已勾选、但该插件当前停用」的域会因控件不存在而在保存时被静默丢弃
+    —— 用户会看到自己的选择无声消失。
+
+    域 ≡ 工具注册来源 ``owner``（见 ``plugins/react/loop.py::_domain_of``）；
+    ``owner`` 为空串的工具不计入清单（异常数据，不引导用户去勾选）。
+    """
+    counts: dict[str, int] = {}
+    for t in tools:
+        d = str(t.get("owner") or "").strip()
+        if d:
+            counts[d] = counts.get(d, 0) + 1
+    opts = [{"name": d, "count": n, "available": True} for d, n in counts.items()]
+    # 与 plugins/react/loop.py::allowed_domains 同款容忍：裸字符串包成单元素，
+    # 否则会被逐字符迭代成一堆单字候选项；None/空串 ⇒ 无选中。
+    if isinstance(selected, (list, tuple)):
+        picked = list(selected)
+    elif selected:
+        picked = [selected]
+    else:
+        picked = []
+    for raw in picked:
+        d = str(raw).strip()
+        if d and d not in counts:
+            counts[d] = 0                      # 记账，防重复追加
+            opts.append({"name": d, "count": 0, "available": False})
+    opts.sort(key=lambda o: o["name"])
+    return opts
 
 
 async def _boot(args: argparse.Namespace):
@@ -789,7 +838,10 @@ async def _serve(args: argparse.Namespace) -> int:
                 values[k] = _SETTING_DEFAULTS[k]
         ap_enabled = "plugins.approval" in set(pm.enabled())
         return {"context_plugin_enabled": ctx_enabled,
-                "approval_enabled": ap_enabled, "values": values}
+                "approval_enabled": ap_enabled, "values": values,
+                # 域清单：设置页据此把 tool_domains 渲染为「可勾选」而非手填
+                "domains": _domain_options(c.root.tasks.catalog(),
+                                           values.get("tool_domains"))}
 
     @app.post("/api/settings")
     async def _settings_update(body: dict):

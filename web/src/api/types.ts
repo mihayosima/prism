@@ -244,7 +244,21 @@ export interface PluginActionResponse {
 
 // ---------- 设置 ----------
 
+/** 可用工具域选项（设置页以此渲染 tool_domains 的可勾选清单） */
+export interface SettingsDomainOption {
+  /** 域 = 工具注册来源 owner（插件 id），如 plugins.windows_mcp */
+  name: string
+  /** 该域当前的工具数；available=false 时为 0 */
+  count: number
+  /** 是否当前已注册（false = 配置里已选但该插件当前停用，保留以便不改动用户选择） */
+  available: boolean
+}
+
 export interface SettingsResponse {
+  values?: Record<string, unknown>
+  domains?: SettingsDomainOption[]
+  context_plugin_enabled?: boolean
+  approval_enabled?: boolean
   [k: string]: unknown
 }
 

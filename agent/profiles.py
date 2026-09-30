@@ -43,6 +43,13 @@ BASE_AGENT_CONFIG: dict = {
         # P0-2：alignment_enabled＝续接前缀对齐（头部快照冻结）；默认开启，可就地回退
         "react": {"resume_keywords": ["继续", "接着", "续写", "continue"],
                   "lazy_tools": False, "lazy_tools_max": 12,
+                  # G 域级裁剪（路线 2）：投影层按「域」(owner) 裁剪工具暴露面。
+                  # enabled 默认 **关**（与 lazy_tools 同款灰度纪律，未启用逐字节等价现状）；
+                  # 白名单为空视同未配置（**不做全隐藏**，避免一处笔误把工具全关掉）。
+                  # 硬前提：仅 lazy_tools=True 时生效——非懒加载无检索通道，裁剪＝死锁。
+                  # 详见 docs/governance/工具税域级裁剪实施方案-2026-09-30.md
+                  "tool_domains_enabled": False,
+                  "tool_domains": [],
                   "alignment_enabled": True},
         # G2.0（P1）：context 节默认值**唯一真相源**（governor.from_config / 设置页同源引用）。
         # 双窗口解耦：max_context_tokens 是**能力上限**（1M），working_window_tokens 是

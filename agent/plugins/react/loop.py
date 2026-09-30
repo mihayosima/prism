@@ -66,7 +66,7 @@ from agent.api import (CapabilityNotImplemented, Events, Services, StateKeys,
 logger = logging.getLogger("agent.react")
 
 from .components import Actor, Finalizer, Observer, Reasoner, ToolResult
-from .prompt import BUDGET_TIGHT_SYSTEM, build_system
+from .prompt import BUDGET_TIGHT_SYSTEM, build_system, render_params
 
 
 @dataclass(slots=True)
@@ -270,6 +270,84 @@ def _card(t: dict) -> dict:
             "owner": t.get("owner", "")}
 
 
+# ---------- G（路线 2）：投影层「域级裁剪」纯函数 ----------
+# 域 ≡ 注册来源 owner（``sys/tasks.py`` 注册时写入，未显式传则取当前插件 id）。
+# ⇒ 新 MCP 插件**自动成为一个新域**，本机制零额外工作量（详见实施方案 §3.7）。
+
+
+def _domain_of(t: dict) -> str:
+    """工具所属域（= 注册来源 ``owner``）；缺失归一为空串（渲染域清单时标注为「未归属」）。"""
+    return str(t.get("owner") or "")
+
+
+def clip_by_domain(tools: list[dict],
+                   allowed: set[str] | None) -> tuple[list[dict], dict[str, int]]:
+    """按域裁剪工具列表（**纯函数、幂等、不改入参**）。
+
+    ``allowed is None`` ⇒ 不裁剪，**原样返回同一列表对象**（默认态零行为变化）。
+    否则返回 ``(放行工具, 被隐藏域计数)``；计数供提示层渲染「域清单」（可发现性线索）。
+
+    注意本函数只作用于**投影**：``tools`` 变量在调用点仍保持全量并交给
+    ``tool_search`` / ``tool_load``，故隐藏域「对模型不可见、对检索可见」——
+    这是本方案与「注册层裁剪」的根本区别（后者会让隐藏工具永远搜不回来）。
+    """
+    if allowed is None:
+        return tools, {}
+    kept: list[dict] = []
+    hidden: dict[str, int] = {}
+    for t in tools:
+        d = _domain_of(t)
+        if d in allowed:
+            kept.append(t)
+        else:
+            hidden[d] = hidden.get(d, 0) + 1
+    return kept, hidden
+
+
+def allowed_domains(ctx) -> set[str] | None:
+    """放行域集合（来源 = 配置 ``agent.react``；返回 ``None`` 表示**不裁剪**）。
+
+    - ``tool_domains_enabled`` 为假 ⇒ ``None``（灰度默认，逐字节等价现状）；
+    - 白名单为空/全空白 ⇒ ``None``（**不做「全隐藏」**，避免一处笔误把工具全关掉；
+      确需全隐藏可在调用点以 ``allowed=set()`` 直接表达，不经配置）；
+    - 其余 ⇒ 去空白后的域名集合。
+
+    前向契约：将来若真有 per-session 通道，可在**此处**优先读取（注意 ``ctx.state``
+    实为**容器级**而非会话级，直接写它会串扰所有会话——详见实施方案 §3.3）。
+    """
+    node = ((ctx.config or {}).get("agent") or {}).get("react") or {}
+    if not node.get("tool_domains_enabled"):
+        return None
+    doms = node.get("tool_domains") or []
+    if isinstance(doms, str):        # 容忍手写配置写成裸字符串（否则会被拆成单字符集合）
+        doms = [doms]
+    return {str(x).strip() for x in doms if str(x).strip()} or None
+
+
+def _clip_with_fallback(tools: list[dict], allowed: set[str] | None
+                        ) -> tuple[set[str] | None, list[dict], dict[str, int]]:
+    """``clip_by_domain`` + 一道**安全阀**，返回 ``(生效 allowed, 放行工具, 隐藏域计数)``。
+
+    安全阀：白名单与**任何**已注册域都不相交时（典型成因＝域名拼错，如把
+    ``plugins.windows_mcp`` 写成 ``windows``），裁剪结果会退化成「全隐藏」。
+    这与配置语义「空白名单 = 不裁剪」相悖，也会让「勾了开关却没省下一个 token」
+    变成一个静默谜题。故此处**回退为不裁剪**并响亮告警。
+
+    正常路径（白名单命中至少一个域）行为与 ``clip_by_domain`` 完全一致；
+    ``allowed is None`` 或 ``tools`` 为空时零额外判断。
+    """
+    if allowed is None:
+        return None, tools, {}
+    tools_vis, hidden = clip_by_domain(tools, allowed)
+    if tools and not tools_vis:
+        logger.warning(
+            "tool_domains 白名单 %s 未匹配任何已注册域（现有域：%s）⇒ 本轮不裁剪；"
+            "请检查配置里的域名拼写", sorted(allowed),
+            sorted({_domain_of(t) for t in tools}))
+        return None, tools, {}
+    return allowed, tools_vis, hidden
+
+
 # L1：元工具完整定义（恒对模型可见；loop 内联处理，不进 ctx.tasks 注册表——
 # 避免注册表污染与跨 run 状态，TaskContext.loaded 是唯一真相）
 LAZY_META_TOOLS: list[dict] = [
@@ -314,9 +392,16 @@ class ReactLoop:
             "max_steps": cfg.max_steps, "at": now_iso()})
 
         tools = visible_tools(ctx)
-        # L1：懒加载时系统提示只挂目录卡（完整定义按需经 native tools 分步装载）
-        prompt_catalog = ([_card(t) for t in tools] if cfg.lazy_tools else tools)
-        system_prompt = build_system(prompt_catalog, ctx.get(Services.SYSTEM_MEMORY) or "")
+        # G（路线 2）：投影层域裁剪——隐藏域「对模型不可见、对检索可见」。
+        # 硬前提：只在懒加载时启用（非懒加载无 tool_search/tool_load 检索通道，
+        # 裁剪即硬隐藏＝不可回溯）；故 allowed 在此处被 lazy_tools 一票否决。
+        allowed = allowed_domains(ctx) if cfg.lazy_tools else None
+        allowed, tools_vis, hidden = _clip_with_fallback(tools, allowed)
+        # L1：懒加载时系统提示只挂目录卡（完整定义按需经 native tools 分步装载）；
+        # 目录同样按域裁剪（只裁 native 不裁目录 ⇒ 模型仍从名册看见隐藏域，「隐藏」不成立）。
+        prompt_catalog = ([_card(t) for t in tools_vis] if cfg.lazy_tools else tools_vis)
+        system_prompt = build_system(prompt_catalog, ctx.get(Services.SYSTEM_MEMORY) or "",
+                                     hidden_domains=hidden)
 
         # 工作记忆（第 3 层）：任务级进度缓存。接缝获取，缺失则跳过（不破解耦）。
         wm = ctx.get(Services.WORK_MEMORY)
@@ -416,8 +501,9 @@ class ReactLoop:
                                   {"step": steps, "session_id": session_id})
 
             # ---- 窗口构造（S3：块内准备 → 治理器装配；无治理器退降级） ----
-            # L1：懒加载时本步 native tools = 元工具 + 已加载完整定义 + 其余目录卡
-            tools_step = (self._tools_for_step(tools, task) if cfg.lazy_tools else tools)
+            # L1：懒加载时本步 native tools = 元工具 + 已加载完整定义 + 放行域目录卡
+            tools_step = (self._tools_for_step(tools, task, allowed)
+                          if cfg.lazy_tools else tools_vis)
             window, win = self._window(ctx, task, system_prompt, head_prompt, messages,
                                       steps, tools=tools_step)
             if win:
@@ -427,6 +513,14 @@ class ReactLoop:
                 chain_peak = max(chain_peak, int(rt.get("chain_tokens", 0)))
                 rt["clips"], rt["chain_peak_tokens"] = chain_clips, chain_peak
                 rt["act_folds"] = chain_act_folds
+
+            # ---- 记账（遥测）：本步窗口装配完成即发 governed（发射点＝窗口准备处） ----
+            # 位置沿革：S3 原实现挂在本步「Act + Observe 之后」（见下方 step 落库处）。
+            # 前移动机：模型首步直接回答（``not out.tool_calls``）会提前 return，
+            # 原位置**永不执行** ⇒ 纯聊天轮在 agent_events 里无账本，``/api/context``
+            # 组织不出该轮构成。前移后「装配即成账」：多步 run 仍每步一条（条数不变），
+            # 仅补齐零工具轮。无治理器时 ``win == {}``，``_emit_window`` 内守卫静默跳过。
+            await self._emit_window(ctx, win)
 
             # D1：预算预警旗标在位 → 本步窗口注入「尽快收束」提示（每步追加，幂等；
             # 只读状态键，对 budget 零直连——与 PERMISSION_MODE 同款前向契约）
@@ -516,7 +610,8 @@ class ReactLoop:
             await ctx.events.emit(Events.REACT_STEP_END, {
                 "step": steps, "tools": [r.name for r in results],
                 "is_error": any(r.is_error for r in results)})
-            await self._emit_window(ctx, win)
+            # 注：governed 遥测已在**本步窗口准备处**发出（见循环顶部的 ``_emit_window``）——
+            # 不再挂在此处，否则每步会重复记账，且零工具轮依旧漏报。
             # 工作记忆：每步进度更新 + 里程碑检查点（tool_trace 仅工具名、已限 10，体积小）
             if wm is not None:
                 last = tool_trace[-1] if tool_trace else ""
@@ -981,11 +1076,24 @@ class ReactLoop:
     # ---------- L1：懒加载（目录卡 / 元工具拦截 / 按需装载） ----------
 
     @staticmethod
-    def _tools_for_step(tools: list[dict], task: TaskContext) -> list[dict]:
-        """本步 native tools：元工具 + 已加载完整定义 + 其余目录卡（体积随 loaded 增长）。"""
+    def _tools_for_step(tools: list[dict], task: TaskContext,
+                        allowed: set[str] | None = None) -> list[dict]:
+        """本步 native tools：元工具 + 已加载完整定义 + **放行域**的目录卡。
+
+        放行条件（《治理方案》§3.3）：``name in task.loaded``（已加载 ⇒ 完整定义，
+        **跨域放行**——``tool_load`` 成功即自动解禁，无需另写「域解禁」逻辑）
+        **或** ``域 ∈ allowed``（放行域 ⇒ 目录卡）。二者之外的工具**不出现**。
+
+        ``allowed is None`` ⇒ 全放行（与改造前**逐字节等价**）。
+        隐藏域的工具虽然不在此处出现，但 ``_partition_meta`` 仍用**全量** ``tools``
+        做 ``tool_search`` / ``tool_load`` ⇒ 「对模型不可见、对检索可见」（G3）。
+        """
         out: list[dict] = [dict(m) for m in LAZY_META_TOOLS]
         for t in tools:
-            out.append(t if t.get("name") in task.loaded else _card(t))
+            if t.get("name") in task.loaded:
+                out.append(t)
+            elif allowed is None or _domain_of(t) in allowed:
+                out.append(_card(t))
         return out
 
     async def _partition_meta(self, wm, task: TaskContext, calls, tools: list[dict]
@@ -1025,7 +1133,7 @@ class ReactLoop:
                 or kw in str(t.get("description") or "").lower()]
         lines = [f"- {t.get('name')}（{t.get('risk', 'write')}）："
                  f"{_slim_description(t.get('description'))}；参数 "
-                 f"{','.join((t.get('params') or {}).keys()) or '-'}" for t in hits[:20]]
+                 f"{render_params(t.get('params'))}" for t in hits[:20]]
         body = "\n".join(lines) if lines else "（无匹配工具）"
         return ToolResult("tool_search", f"可用工具 {len(hits)} 个：\n{body}",
                           tool_call_id=c.id)

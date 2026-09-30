@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Mapping
 
 from agent.api import MARK_REACT_FINAL, MARK_REACT_TURN
 
@@ -55,6 +56,35 @@ def env_facts(environ: dict | None = None) -> str:
     )
 
 
+def render_params(params: Mapping[str, dict] | None, *, max_enum: int = 8) -> str:
+    """参数摘要：``名:类型``；枚举展开成 ``{a|b|…}``（``tool_search`` 目录卡用）。
+
+    S6/P2 的检索侧配套：域裁剪下 ``tool_search`` 是隐藏域**唯一**的入口，只给参数名
+    会让模型对着 ``mode`` 这类枚举瞎猜（实测猜成 ``action``，实际要 ``mode`` 且取值
+    只能是 ``read|write|copy|move|delete|list|search|info``）。此处把类型与取值一并
+    给出，仅在**按需检索**时付出少量 token，基础提示词不受影响。
+    """
+    if not params:
+        return "-"
+    out: list[str] = []
+    for name, spec in params.items():
+        spec = spec or {}
+        anyof = spec.get("anyOf")
+        if isinstance(anyof, list) and anyof:
+            type_txt = "|".join(str(x) for x in anyof)
+        else:
+            type_txt = str(spec.get("type") or "object")
+        seg = f"{name}:{type_txt}"
+        enum = spec.get("enum")
+        if isinstance(enum, list) and enum:
+            vals = [str(v) for v in enum[:max_enum]]
+            if len(enum) > max_enum:
+                vals.append("…")
+            seg += "{" + "|".join(vals) + "}"
+        out.append(seg)
+    return ",".join(out)
+
+
 def render_tools(catalog: list[dict]) -> str:
     """工具目录 → 提示词文本（截断描述，控制提示词体积）。"""
     if not catalog:
@@ -69,10 +99,34 @@ def render_tools(catalog: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_system(catalog: list[dict], system_memory: str = "") -> str:
+def render_domains(hidden: dict[str, int] | None) -> str:
+    """被隐藏域的「存在性线索」（纯函数，无隐藏域返回空串）。
+
+    域级裁剪（路线 2）的**强制配套项**：域对模型不可见时，若提示层连「外面还有
+    哪些域、各有多少工具」都不提，模型就不会去 ``tool_search`` 检索——「隐藏」
+    会退化成「不可得」。此处只给「域 + 数量」，**不给关键词**（关键词仍是模型的
+    检索自由，命中率由灰度期观察）。
+
+    无隐藏域 ⇒ 返回 ``""``，调用方据此跳过整块 ⇒ **默认态系统提示逐字节不变**。
+    """
+    if not hidden:
+        return ""
+    lines = ["其它工具域（当前未展开，可用 tool_search 检索）:"]
+    for d, n in sorted(hidden.items()):
+        lines.append(f"- {d or '（未归属）'}（{n} 个）")
+    return "\n".join(lines)
+
+
+def build_system(catalog: list[dict], system_memory: str = "",
+                 hidden_domains: dict[str, int] | None = None) -> str:
     # 系统记忆：静态底座（声明层），前置注入；动态块（工具/环境）按原模式裁剪追加
     base = (system_memory + "\n\n" + REACT_SYSTEM) if system_memory else REACT_SYSTEM
-    return f"{base}\n\n{render_tools(catalog)}\n\n{env_facts()}"
+    parts = [base, render_tools(catalog)]
+    domains = render_domains(hidden_domains)
+    if domains:
+        parts.append(domains)          # 无隐藏域 ⇒ 不插入（默认输出逐字节不变）
+    parts.append(env_facts())
+    return "\n\n".join(parts)
 
 
 def as_text(value) -> str:
@@ -92,4 +146,4 @@ def as_text(value) -> str:
 
 __all__ = ["TURN_MARK", "FINAL_MARK", "REACT_SYSTEM", "FINAL_SYSTEM",
            "BUDGET_TIGHT_SYSTEM",
-           "env_facts", "render_tools", "build_system", "as_text"]
+           "env_facts", "render_tools", "render_domains", "build_system", "as_text"]

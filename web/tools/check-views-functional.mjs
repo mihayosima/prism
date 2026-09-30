@@ -586,6 +586,53 @@ await go('settings')
   } else {
     ok('settings cost_calibration 勾选态', true, '后端无此项，跳过')
   }
+
+  // ★ 放行域白名单：必须是「下拉可选」而非手填（候选项由后端 domains 给）
+  const domBox = s.querySelector('#set_tool_domains')
+  const domBtn = s.querySelector('#set_tool_domains_btn')
+  const backendDomains = d.domains || []
+  ok('settings 存在域下拉触发条 #set_tool_domains_btn', !!domBtn)
+  if (!domBox) {
+    ok('settings 存在 #set_tool_domains', false)
+  } else if (backendDomains.length === 0) {
+    ok('settings 域白名单候选项（后端无已注册域，跳过）', true)
+  } else {
+    // 下拉形态：面板默认收起（hidden），不占常驻版面
+    ok('settings 域下拉面板默认收起（hidden）', domBox.hasAttribute('hidden'),
+      '未收起 ⇒ 仍是常驻展开列表，不呈下拉形态')
+    const cbs = findAll(domBox, (e) => e.classList && e.classList.contains('set_tool_domain_cb'))
+    ok(`settings 域白名单渲染为复选项（后端 ${backendDomains.length} 个域）`,
+      cbs.length === backendDomains.length, `实得 ${cbs.length}`)
+    ok('settings 域白名单无手填文本框', findAll(domBox, (e) => e.tagName === 'INPUT' && e.type === 'text').length === 0)
+    // 候选项名 == 后端域名单（防「前端自己硬编码域列表」而漂移）
+    const rendered = cbs.map((el) => el.value).sort()
+    const names = backendDomains.map((x) => x.name).sort()
+    ok('settings 域候选项 == 后端 domains', JSON.stringify(rendered) === JSON.stringify(names), `渲染 ${rendered}`)
+    // 勾选态 == 后端 values.tool_domains
+    const picked = cbs.filter((el) => el.checked).map((el) => el.value).sort()
+    const expected = (values.tool_domains || []).map(String).sort()
+    ok('settings 域勾选态 == 后端 tool_domains',
+      JSON.stringify(picked) === JSON.stringify(expected), `渲染 ${picked} / 后端 ${expected}`)
+    // 触发条文案 == 已选态（DOM 顺序：≤2 个列名，更多折计数，空为「不裁剪」）
+    const pickedInOrder = cbs.filter((el) => el.checked).map((el) => el.value)
+    const want = pickedInOrder.length === 0
+      ? '未选择（不裁剪）'
+      : pickedInOrder.length <= 2
+        ? pickedInOrder.join('、')
+        : `已选 ${pickedInOrder.length} 个域`
+    const lab = s.querySelector('#set_tool_domains_label')
+    ok('settings 域下拉触发条文案 == 已选态',
+      !!lab && lab.textContent === want, `渲染「${lab && lab.textContent}」/ 期望「${want}」`)
+    // 下拉真的能拉下来：点触发条 ⇒ 面板 hidden 移除；再点 ⇒ 收回（点击面板外亦收回）
+    if (domBtn) {
+      domBtn.dispatch({ type: 'click', target: domBtn })
+      await settle(60)
+      ok('settings 点域下拉触发条后展开', !domBox.hasAttribute('hidden'))
+      domBtn.dispatch({ type: 'click', target: domBtn })
+      await settle(60)
+      ok('settings 再点域下拉触发条后收起', domBox.hasAttribute('hidden'))
+    }
+  }
 }
 
 // ---------- nav ----------

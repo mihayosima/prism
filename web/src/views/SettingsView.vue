@@ -1,5 +1,5 @@
 <template>
-  <div class="panel" ref="host" v-html="html" @click="onClick"></div>
+  <div class="panel" ref="host" v-html="html" @click="onClick" @change="onChange"></div>
 </template>
 
 <script setup lang="ts">
@@ -34,6 +34,16 @@ function collectPatch(): Record<string, unknown> {
   if (lt) patch.lazy_tools = lt.checked // L1 开关
   const al = host.value?.querySelector<HTMLInputElement>('#set_alignment_enabled')
   if (al) patch.alignment_enabled = al.checked // P0-2 续接前缀对齐
+  const tde = host.value?.querySelector<HTMLInputElement>('#set_tool_domains_enabled')
+  if (tde) patch.tool_domains_enabled = tde.checked // G 域级裁剪总开关
+  // G 放行域白名单：多选勾选态。仅在控件确实渲染时提交 —— 域清单为空
+  // （后端未返回 domains）时若提交 []，会把用户已有配置静默清空。
+  const tdcs = host.value?.querySelectorAll<HTMLInputElement>('.set_tool_domain_cb')
+  if (tdcs && tdcs.length > 0) {
+    patch.tool_domains = Array.from(tdcs)
+      .filter((el) => el.checked)
+      .map((el) => el.value)
+  }
   const cmx = host.value?.querySelector<HTMLSelectElement>('#set_compact_mode')
   if (cmx) patch.compact_mode = cmx.value // P2 治理模式（枚举）
   const pv = host.value?.querySelector<HTMLSelectElement>('#set_provider')
@@ -90,10 +100,49 @@ async function doReset(): Promise<void> {
   }
 }
 
+/** G 放行域下拉：把已选项同步到触发条文案（点选即刻反馈，不必等保存） */
+function syncDomainLabel(): void {
+  const box = host.value?.querySelector<HTMLElement>('#set_tool_domains')
+  const lab = host.value?.querySelector<HTMLElement>('#set_tool_domains_label')
+  if (!box || !lab) return
+  const picked = Array.from(box.querySelectorAll<HTMLInputElement>('.set_tool_domain_cb'))
+    .filter((el) => el.checked)
+    .map((el) => el.value)
+  lab.textContent = picked.length
+    ? picked.length <= 2
+      ? picked.join('、')
+      : `已选 ${picked.length} 个域`
+    : '未选择（不裁剪）'
+}
+
+/** G 放行域下拉：展开/收起浮层（不传 force 即取反） */
+function toggleDomainPanel(force?: boolean): void {
+  const box = host.value?.querySelector<HTMLElement>('#set_tool_domains')
+  const btn = host.value?.querySelector<HTMLElement>('#set_tool_domains_btn')
+  if (!box || !btn) return
+  const open = force === undefined ? box.hasAttribute('hidden') : force
+  if (open) {
+    syncDomainLabel()
+    box.removeAttribute('hidden')
+  } else {
+    box.setAttribute('hidden', '')
+  }
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false')
+}
+
+/** 下拉面板内的勾选变化 ⇒ 同步触发条文案 */
+function onChange(e: Event): void {
+  const t = e.target as HTMLElement
+  if (t && typeof t.closest === 'function' && t.closest('#set_tool_domains')) syncDomainLabel()
+}
+
 function onClick(e: MouseEvent): void {
   const t = e.target as HTMLElement
+  if (!t || typeof t.closest !== 'function') return
   if (t.closest('#saveSettings')) doSave()
   else if (t.closest('#resetSettings')) doReset()
+  else if (t.closest('#set_tool_domains_btn')) toggleDomainPanel()
+  else if (!t.closest('#set_tool_domains')) toggleDomainPanel(false) // 点击面板外 ⇒ 收起
 }
 
 onMounted(reload)

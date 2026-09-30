@@ -15,13 +15,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from agent.api import Services, StateKeys
 from agent.plugins.react.components import ToolCall
-from agent.plugins.react.loop import ReactConfig, ReactLoop, _card, _slim_description
+from agent.plugins.react.loop import (LAZY_META_TOOLS, ReactConfig, ReactLoop, TaskContext,
+                                      _card, _clip_with_fallback, _domain_of,
+                                      _slim_description, allowed_domains, clip_by_domain)
+from agent.plugins.react.prompt import build_system, render_domains
 from agent.profiles import BASE_AGENT_CONFIG, build_agent
 from agent.run import chat as srv
 from agent.sys.llm import LlmService
@@ -370,3 +374,193 @@ def test_card_is_projection_only():
     assert card["params"] == {} and card["required"] == []
     assert t["params"] == {"p": {"type": "str"}} and t["required"] == ["p"], \
         "原目录不得被投影改动"
+
+
+# ---------------------------------------------------------------------------
+# G（路线 2）：投影层「域级裁剪」——纯函数层与接线层
+# 依据 docs/governance/工具税域级裁剪实施方案-2026-09-30.md
+# ---------------------------------------------------------------------------
+
+def _dom_tools():
+    """两域样本：d1 两个工具、d2 一个工具、一个无 owner 工具（归一为空域）。"""
+    return [{"name": "a1", "description": "A1", "params": {"x": {}}, "required": ["x"],
+             "risk": "read", "owner": "d1"},
+            {"name": "a2", "description": "A2", "params": {"y": {}}, "required": [],
+             "risk": "write", "owner": "d1"},
+            {"name": "b1", "description": "B1", "params": {"z": {}}, "required": ["z"],
+             "risk": "write", "owner": "d2"},
+            {"name": "n1", "description": "N1", "params": {}, "required": [],
+             "risk": "write"}]
+
+
+class _CfgStub:
+    """仅承载 ``ctx.config`` 的最小桩（allowed_domains 只读这一个接缝）。"""
+
+    def __init__(self, react: dict | None):
+        self.config = {"agent": {"react": react or {}}}
+
+
+def test_clip_by_domain_is_pure_projection():
+    """G1：``allowed is None`` 原样返回同一对象；白名单裁剪且不改入参。"""
+    tools = _dom_tools()
+    assert _domain_of({"owner": "d1"}) == "d1"
+    assert _domain_of({"name": "x"}) == "" and _domain_of({"owner": None}) == "", \
+        "缺失/空 owner 归一为空串（渲染域清单时标注为「未归属」）"
+    same, hidden = clip_by_domain(tools, None)
+    assert same is tools and hidden == {}, "None ⇒ 不裁剪且保持同一列表对象"
+
+    kept, hidden = clip_by_domain(tools, {"d1"})
+    assert [t["name"] for t in kept] == ["a1", "a2"]
+    assert hidden == {"d2": 1, "": 1}, "隐藏域计数含「未归属」空域"
+    assert len(tools) == 4, "纯投影：入参列表不被改动"
+
+    kept, hidden = clip_by_domain(tools, set())
+    assert kept == [] and hidden == {"d1": 2, "d2": 1, "": 1}
+
+
+def test_allowed_domains_config_branches():
+    """G1/G6：开关关 / 空白名单 ⇒ None（不裁剪）；白名单 ⇒ 去空白后的集合。"""
+    assert allowed_domains(_CfgStub(None)) is None
+    assert allowed_domains(_CfgStub({"tool_domains_enabled": False,
+                                     "tool_domains": ["d1"]})) is None, "总开关关 ⇒ 不裁剪"
+    assert allowed_domains(_CfgStub({"tool_domains_enabled": True,
+                                     "tool_domains": []})) is None, "空白名单 ⇒ 不做全隐藏"
+    assert allowed_domains(_CfgStub({"tool_domains_enabled": True,
+                                     "tool_domains": ["  ", ""]})) is None, "全空白 ⇒ 不裁剪"
+    got = allowed_domains(_CfgStub({"tool_domains_enabled": True,
+                                    "tool_domains": [" d1 ", "d2"]}))
+    assert got == {"d1", "d2"}, "域名去空白"
+    assert allowed_domains(_CfgStub({"tool_domains_enabled": True,
+                                     "tool_domains": "d1"})) == {"d1"}, "容忍非列表（字符串按单域）"
+
+
+def test_clip_with_fallback_typo_guard():
+    """安全阀：白名单与任何已注册域都不相交（拼错）⇒ 回退为不裁剪，不静默全隐藏。"""
+    tools = _dom_tools()
+    allowed, vis, hidden = _clip_with_fallback(tools, {"d9"})
+    assert allowed is None and vis is tools and hidden == {}, "拼错域名 ⇒ 回退不裁剪"
+    allowed, vis, hidden = _clip_with_fallback(tools, {"d1"})
+    assert allowed == {"d1"} and [t["name"] for t in vis] == ["a1", "a2"]
+    allowed, vis, hidden = _clip_with_fallback([], {"d9"})
+    assert allowed == {"d9"} and vis == [], "无工具时不做无谓回退"
+
+
+def test_tools_for_step_domain_view():
+    """G1/G3：域过滤后 native view —— 隐藏域不出现；已加载者跨域仍出现完整定义。"""
+    tools = _dom_tools()
+    task = TaskContext(loaded={"b1"})            # b1 属隐藏域 d2，但已加载
+    view = ReactLoop._tools_for_step(tools, task, allowed={"d1"})
+    names = [t["name"] for t in view]
+    assert names[:3] == ["tool_search", "tool_load", "wm_read"], "元工具恒在"
+    assert "a1" in names and "a2" in names, "放行域 ⇒ 目录卡"
+    assert "b1" in names, "已加载 ⇒ 跨域放行（tool_load 成功即自动解禁）"
+    assert "n1" not in names, "隐藏域且未加载 ⇒ 不出现在 native tools"
+    by = {t["name"]: t for t in view}
+    assert by["b1"].get("params") == {"z": {}}, "已加载 ⇒ 完整定义（跨域放行）"
+    assert by["a1"].get("params") == {} and by["a1"].get("required") == [], "a1 为目录卡"
+
+
+def test_tools_for_step_default_is_bytewise_legacy():
+    """G1 对称断言：``allowed=None`` 时新实现与改造前逐字节相等。"""
+    tools = _dom_tools()
+    for loaded in (set(), {"a1"}, {"a1", "b1"}):
+        task = TaskContext(loaded=set(loaded))
+        legacy = [dict(m) for m in LAZY_META_TOOLS]
+        for t in tools:
+            legacy.append(t if t.get("name") in task.loaded else _card(t))
+        assert ReactLoop._tools_for_step(tools, task, None) == legacy
+        assert ReactLoop._tools_for_step(tools, task) == legacy, "缺省参必须与显式 None 等价"
+
+
+def test_render_domains_and_build_system_default():
+    """G1/G4：无隐藏域时系统提示逐字节不变；有隐藏域时出现「域清单」。"""
+    cat = [_card(t) for t in _dom_tools()]
+    sm = "身份：测试"
+    assert render_domains(None) == "" and render_domains({}) == ""
+    assert build_system(cat, sm, hidden_domains=None) == build_system(cat, sm)
+    assert build_system(cat, "", hidden_domains={}) == build_system(cat, "")
+
+    out = build_system(cat, sm, hidden_domains={"d2": 1})
+    assert "其它工具域（当前未展开，可用 tool_search 检索）" in out
+    assert "- d2（1 个）" in out
+    assert out.index("可用工具") < out.index("其它工具域") < out.index("运行环境")
+
+
+def test_tool_domains_registered_in_settings():
+    """C5：两个新键三处同步登记 + 前端字面量在场 + 钳制语义（含 None 陷阱）。"""
+    from agent.tests._web_sources import frontend_settings_source
+
+    src = frontend_settings_source()
+    react = (BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {}
+    for k in ("tool_domains_enabled", "tool_domains"):
+        assert k in srv._SETTING_SCHEMA, f"{k} 未登记 schema"
+        assert srv._PLUGIN_OF_KEY[k] == "plugins.react", f"{k} 归属错误"
+        assert k in srv._SETTING_DEFAULTS
+        assert srv._SETTING_DEFAULTS[k] == react[k], f"{k} 与 profiles 默认漂移"
+        assert f'id="set_{k}"' in src, f"{k} 未同步到前端（须为独立控件 id）"
+
+    # 白名单是「下拉可选」而非手填：下拉触发条 + 默认收起的面板（面板内是复选项）
+    assert 'id="set_tool_domains_btn"' in src, "放行域缺少下拉触发条（未改成下拉框形态）"
+    assert 'class="set_tool_domain_cb"' in src, "放行域未渲染为可多选的候选项"
+    panel = re.search(r'id="set_tool_domains"([^>]*)>', src)
+    assert panel is not None, "放行域未渲染下拉面板容器"
+    assert "hidden" in panel.group(1), \
+        "放行域面板未默认收起（应呈下拉形态，而非常驻展开的列表）"
+    assert 'id="set_tool_domains" type="text"' not in src, \
+        "放行域仍是手填文本框（应改为可勾选）"
+    assert 'placeholder="如 plugins.windows_mcp' not in src, "仍残留手填提示文案"
+
+    # 钳制：布尔照 lazy_tools；列表照 ask（支持中英文逗号/顿号，过滤空段）
+    assert srv._coerce_setting("tool_domains_enabled", "on") is True
+    assert srv._coerce_setting("tool_domains_enabled", False) is False
+    assert srv._coerce_setting("tool_domains", "a, b，c、d") == ["a", "b", "c", "d"]
+    assert srv._coerce_setting("tool_domains", []) == []
+    assert srv._coerce_setting("tool_domains", "plugins.windows_mcp") == ["plugins.windows_mcp"]
+
+    # 陷阱回归：默认值若写成 None，_coerce_setting 会把 None 收成字符串 "None"
+    assert srv._coerce_setting("tool_domains", None) == ["None"], \
+        "此断言记录该陷阱本身；故 _SETTING_DEFAULTS 必须是 [] 而非 None"
+    assert srv._coerce_setting("tool_domains", srv._SETTING_DEFAULTS["tool_domains"]) == []
+
+
+def test_domain_options_listing():
+    """C6：设置页「可勾选」候选项的生成规则（已注册域 ∪ 已选但未注册域）。"""
+    from agent.run.chat import _domain_options
+
+    tools = [
+        {"name": "mcp.windows.App", "owner": "plugins.windows_mcp"},
+        {"name": "mcp.windows.Click", "owner": "plugins.windows_mcp"},
+        {"name": "agent.ping", "owner": "agent.tasks"},
+        {"name": "no.owner", "owner": ""},                      # 异常数据：不计入候选项
+        {"name": "none.owner"},                                 # 缺失 owner：同上
+    ]
+
+    # 已注册域按名字排序；owner 为空的不出现（不引导用户去勾选异常数据）
+    assert _domain_options(tools, []) == [
+        {"name": "agent.tasks", "count": 1, "available": True},
+        {"name": "plugins.windows_mcp", "count": 2, "available": True},
+    ]
+
+    # ★ 关键：已选但当前未注册的域必须保留（available=False），否则保存时会被静默丢弃
+    opts = _domain_options(tools, ["plugins.windows_mcp", "plugins.gone"])
+    assert opts == [
+        {"name": "agent.tasks", "count": 1, "available": True},
+        {"name": "plugins.gone", "count": 0, "available": False},
+        {"name": "plugins.windows_mcp", "count": 2, "available": True},
+    ]
+
+    # 已注册且已选的域只出现一次（不被「配置回填」重复追加）
+    once = _domain_options(tools, ["agent.tasks", "agent.tasks"])
+    assert len([o for o in once if o["name"] == "agent.tasks"]) == 1
+
+    # 容错：selected 为 None / 裸字符串 / 含空白，均不抛错且语义正确
+    assert _domain_options(tools, None) == _domain_options(tools, [])
+    assert _domain_options(tools, "") == _domain_options(tools, [])
+    # 裸字符串包成单元素（不得逐字符拆成一堆单字候选项）
+    assert [o["name"] for o in _domain_options(tools, "plugins.gone")] == [
+        "agent.tasks", "plugins.gone", "plugins.windows_mcp"]
+    # 空白串被规整后不与已注册域重复
+    assert [o["name"] for o in _domain_options(tools, ["  agent.tasks  "])].count("agent.tasks") == 1
+
+    # 空目录 ⇒ 空清单（前端据此渲染「暂无已注册工具域」空态，且不提交 patch）
+    assert _domain_options([], []) == []
