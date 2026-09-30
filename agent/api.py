@@ -24,7 +24,7 @@ from agent.core.errors import (
 )
 from agent.core.events import EventBus
 from agent.core.events_catalog import Events, all_events, EVENT_MODE, REQUIRED_SUBSCRIBER_EVENTS
-from agent.core.mcp_client import McpStdioClient
+from agent.core.mcp_client import McpStdioClient, build_task_schema
 from agent.core.request_cost import estimate_request_cost
 from agent.core.services_catalog import ALL as SERVICE_KEYS, Services
 from agent.core.state_keys import StateKeys
@@ -89,6 +89,8 @@ __all__ = [
     "cost_factor",
     # MCP stdio 客户端（实现位于 core/mcp_client；业务插件一律经本出口）
     "McpStdioClient",
+    # MCP inputSchema → 内核 task schema 的保真转换（S6/P2：enum/anyOf/default 不丢）
+    "build_task_schema",
     # token 原语（实现位于 core/tokens；插件/系统层一律经本出口，不得直连 core）
     "estimate_tokens",
     "estimate_request_cost",

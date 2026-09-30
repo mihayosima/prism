@@ -25,6 +25,33 @@ from .tokens import estimate_tokens
 _JSON_TYPES = {"str": "string", "int": "integer", "float": "number",
                "bool": "boolean", "array": "array", "object": "object"}
 
+
+def _wire_prop(spec: dict) -> dict:
+    """内核参数 spec → JSON Schema 片段（S6/P2：保真还原 MCP 侧的类型信息）。
+
+    优先发 ``anyOf``：内核为便于校验会把联合类型归一化成单一 ``type``，
+    若两者同时发会互相矛盾（``{"type":"object","anyOf":[…]}``）⇒ 只发 ``anyOf``。
+    ``anyOf`` 分支里存的本就是**JSON 原生类型名**（``build_task_schema`` 直取原文），
+    故**原样透传**，不可再过一次 ``_JSON_TYPES``（那是内部名→JSON 名的映射，
+    用在这里会把 ``boolean`` 误判成未知而退化成 ``object``）。
+    ``enum`` / ``default`` / ``description`` 有则原样带上 —— 这正是模型此前看不到
+    ``mode = read|write|copy|move|delete|list|search|info`` 的原因。
+    """
+    anyof = spec.get("anyOf")
+    if isinstance(anyof, list) and anyof:
+        out: dict[str, Any] = {"anyOf": [{"type": str(x)} for x in anyof if isinstance(x, str)]
+                              or [{"type": "object"}]}
+    else:
+        out = {"type": _JSON_TYPES.get(str(spec.get("type", "object")), "object")}
+    if isinstance(spec.get("enum"), list) and spec["enum"]:
+        out["enum"] = list(spec["enum"])
+    if "default" in spec:
+        out["default"] = spec["default"]
+    if spec.get("description"):
+        out["description"] = str(spec["description"])
+    return out
+
+
 # OpenAI / DeepSeek 工具名硬约束：仅允许 ^[a-zA-Z0-9_-]+$。
 # 内部工具名带命名空间（如 mcp.windows.xxx、agent.ping），发往模型前必须净化，
 # 模型回传的净化名再映射回内部原名以驱动 ctx.tasks.invoke。
@@ -99,8 +126,7 @@ def wire_tools(tools: list[dict]) -> tuple[list[dict], dict[str, str]]:
             i += 1
         seen[safe] = orig
         name_map[safe] = orig
-        props = {k: {"type": _JSON_TYPES.get(str(v.get("type", "object")), "object")}
-                 for k, v in (t.get("params") or {}).items()}
+        props = {k: _wire_prop(v or {}) for k, v in (t.get("params") or {}).items()}
         out.append({"type": "function", "function": {
             "name": safe,
             "description": str(t.get("description") or "")[:200],
