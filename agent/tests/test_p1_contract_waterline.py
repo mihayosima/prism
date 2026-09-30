@@ -203,6 +203,9 @@ def test_scope_opaque_passthrough():
 
 def test_window_settings_registered_three_places():
     """P1 新配置键在设置页三处同步登记，默认与 profiles 同源（缺一即失败）。"""
+    from agent.tests._web_sources import frontend_settings_source
+
+    src = frontend_settings_source()      # B4：`_PAGE` 已删除 → 读前端源码
     cases = (("working_window_tokens", 96000), ("window_high_ratio", 0.70),
              ("window_low_ratio", 0.40), ("resident_cap_tokens", 8000),
              ("on_demand_cap_tokens", 8000), ("prompt_cap_tokens", 2000))
@@ -212,8 +215,9 @@ def test_window_settings_registered_three_places():
         assert k in srv._SETTING_DEFAULTS, f"{k} 缺默认值"
         assert srv._SETTING_DEFAULTS[k] == default, f"{k} 默认值与 profiles 漂移"
         # 数值卡按 fields 数组动态生成 id（'set_'+k）→ 前端同步的证据是键名字面量出现两次
-        #（fields 标签表一次、saveSettings 的 keys 数组一次）。
-        assert srv._PAGE.count(f"'{k}'") >= 2, f"{k} 未同步到前端卡片（字段表/保存列表）"
+        #（CONTEXT_FIELDS 字段表一次、SETTINGS_NUMERIC_KEYS 保存列表一次）。
+        # B4：数据源由内联 `_PAGE` 换成 web/src/views/settings.logic.ts，语义不变。
+        assert src.count(f"'{k}'") >= 2, f"{k} 未同步到前端卡片（字段表/保存列表）"
     # 比率项按 float 钳制（不是 int 截断）
     assert srv._coerce_setting("window_high_ratio", "0.7") == 0.7
     # 工作窗口须 >=1

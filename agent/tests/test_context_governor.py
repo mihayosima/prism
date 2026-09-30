@@ -606,12 +606,14 @@ def test_s3_settings_registered_in_all_three_places():
     """S3 新参数必须**三处同步登记**（schema / owner / 默认值 / 前端 keys），
     否则前端不可见或后端拒收（G1 教训的制度化）。"""
     from agent.run import chat as srv
+    from agent.tests._web_sources import frontend_settings_source
 
+    src = frontend_settings_source()      # B4：`_PAGE` 已删除 → 读前端源码
     for k in ("clip_max_tokens", "clip_head_tokens", "clip_tail_tokens",
               "react_keep_recent", "react_min_chain_tokens"):
         assert k in srv._SETTING_SCHEMA, f"{k} 未登记 schema"
         assert srv._PLUGIN_OF_KEY[k] == "plugins.context", f"{k} 归属错误"
         assert k in srv._SETTING_DEFAULTS, f"{k} 缺默认值"
         assert srv._coerce_setting(k, srv._SETTING_DEFAULTS[k]) == srv._SETTING_DEFAULTS[k]
-        assert f"'{k}'" in srv._PAGE, f"{k} 未同步到前端 keys/字段表"
+        assert f"'{k}'" in src, f"{k} 未同步到前端 keys/字段表"
 

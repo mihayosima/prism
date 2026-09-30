@@ -318,11 +318,14 @@ def test_single_unit_chain_is_never_compacted():
 
 def test_p2_settings_registered_three_places():
     """``compact_mode`` / ``clear_at_least_tokens`` 三处登记 + 枚举钳制。"""
+    from agent.tests._web_sources import frontend_settings_source
+
+    src = frontend_settings_source()      # B4：`_PAGE` 已删除 → 读前端源码
     for key, default in (("compact_mode", "shadow"), ("clear_at_least_tokens", 4000)):
         assert key in srv._SETTING_SCHEMA, f"{key} 缺 schema"
         assert srv._PLUGIN_OF_KEY[key] == "plugins.context", f"{key} 归属错误"
         assert srv._SETTING_DEFAULTS[key] == default, f"{key} 默认值与决议漂移"
-        assert key in srv._PAGE, f"{key} 未同步到前端"
+        assert key in src, f"{key} 未同步到前端"
     assert srv._coerce_setting("compact_mode", "on") == "on"
     assert srv._coerce_setting("compact_mode", "shadow") == "shadow"
     with pytest.raises(ValueError):

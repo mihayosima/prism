@@ -49,6 +49,7 @@ def test_budget_setting_registered_in_settings_schema():
     沿用 S3 制度化范式；默认值须与 profiles.BASE_AGENT_CONFIG 同源。"""
     from agent.profiles import BASE_AGENT_CONFIG
     from agent.run import chat as srv
+    from agent.tests._web_sources import frontend_settings_source
 
     k = "max_tokens_per_run"
     assert k in srv._SETTING_SCHEMA
@@ -61,7 +62,8 @@ def test_budget_setting_registered_in_settings_schema():
         srv._coerce_setting(k, 999)                            # 低于下限 1000
     with pytest.raises(ValueError):
         srv._coerce_setting(k, 99_999_999)                     # 高于上限 1000 万
-    assert "'max_tokens_per_run'" in srv._PAGE, "未同步到前端 keys/字段表"
+    # B4：前端独立成 web/ 工程后，`_PAGE` 已删除 → 契约守卫改读前端源码
+    assert "'max_tokens_per_run'" in frontend_settings_source(), "未同步到前端 keys/字段表"
 
 
 def test_budget_setting_override_takes_effect(tmp_path, monkeypatch):

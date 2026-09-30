@@ -344,6 +344,9 @@ def test_lazy_config_wiring(tmp_path):
 
 def test_new_toggles_registered_in_settings():
     """cost_calibration / lazy_tools / alignment_enabled 三处登记；默认与 profiles 同源；bool 钳制。"""
+    from agent.tests._web_sources import frontend_settings_source
+
+    src = frontend_settings_source()      # B4：`_PAGE` 已删除 → 读前端源码
     k1, k2, k3 = "cost_calibration", "lazy_tools", "alignment_enabled"
     for k, pid, default in ((k1, "plugins.budget", True),
                             (k2, "plugins.react", False),
@@ -352,7 +355,7 @@ def test_new_toggles_registered_in_settings():
         assert srv._PLUGIN_OF_KEY[k] == pid, f"{k} 归属错误"
         assert k in srv._SETTING_DEFAULTS
         assert srv._SETTING_DEFAULTS[k] == default, f"{k} 默认值与决议漂移"
-        assert f"set_{k}" in srv._PAGE, f"{k} 未同步到前端"
+        assert f"set_{k}" in src, f"{k} 未同步到前端"
     assert srv._coerce_setting(k1, "on") is True
     assert srv._coerce_setting(k1, "off") is False
     assert srv._coerce_setting(k2, True) is True

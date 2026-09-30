@@ -363,6 +363,7 @@ def test_finalize_reserve_registered_in_settings_schema():
     """finalize_reserve_tokens 进设置页须三处同步登记；默认值与 profiles 同源。"""
     from agent.profiles import BASE_AGENT_CONFIG
     from agent.run import chat as srv
+    from agent.tests._web_sources import frontend_settings_source
 
     k = "finalize_reserve_tokens"
     assert k in srv._SETTING_SCHEMA
@@ -372,7 +373,8 @@ def test_finalize_reserve_registered_in_settings_schema():
         "finalize_reserve_tokens")
     assert srv._SETTING_DEFAULTS[k] == base, "设置默认值与 profiles 默认漂移"
     assert srv._coerce_setting(k, "16000") == 16000
-    assert "'finalize_reserve_tokens'" in srv._PAGE, "未同步到前端 keys/字段"
+    # B4：`_PAGE` 已删除 → 契约守卫改读前端源码
+    assert "'finalize_reserve_tokens'" in frontend_settings_source(), "未同步到前端 keys/字段"
 
 
 def test_finalize_reserve_override_maps_to_agent_budget(tmp_path, monkeypatch):
