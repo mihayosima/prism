@@ -17,3 +17,16 @@ agent_chat_server.log
 # temp patch scripts
 patch_remove_windowing.py
 patch_remove_windowing2.py
+
+# 前端工程（方案 B）
+web/node_modules/
+web/dist/
+web/.vite/
+# 本地环境变量（含 token / 直连地址，绝不入库；样例见 web/.env.example）
+web/.env.local
+web/.env.*.local
+# 迁移期原稿留档（仅本地对拍用，不入版本库）
+web/_backup_legacy/
+# 改造前本地备份（仅本地留档，不入版本库）
+*.bak-b4
+agent/run/chat.py.bak*
