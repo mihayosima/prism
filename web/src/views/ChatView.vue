@@ -229,7 +229,8 @@ async function loadStatus(): Promise<void> {
     if (modelEl) modelEl.textContent = j.provider_label + ' · ' + j.model
     if (sessEl) sessEl.textContent = 'session ' + j.session_id
     if (machEl)
-      machEl.textContent = 'v' + j.version + '\n预算 ' + (j.budget ? j.budget.spent + '/' + j.budget.max : '-')
+      machEl.textContent =
+        'v' + j.version + '\n本会话预算 ' + (j.budget ? j.budget.spent + '/' + j.budget.max : '-')
   } catch {
     /* 忽略 */
   }

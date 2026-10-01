@@ -257,14 +257,30 @@ export interface SettingsDomainOption {
 }
 
 export interface SettingsResponse {
+  /** 生效值（容器 ∪ 本会话，缺项回落默认）——旧字段名，保持兼容 */
   values?: Record<string, unknown>
   domains?: SettingsDomainOption[]
   context_plugin_enabled?: boolean
   approval_enabled?: boolean
+  /** 当前请求落在哪个会话键（`{user}:{session}`） */
+  session_id?: string
+  /** 允许写到「本会话」层的设置键白名单（G2 会话级化） */
+  scopable?: string[]
+  /** 容器级生效值（本会话未覆盖时的基线） */
+  container?: Record<string, unknown>
+  /** 本会话**显式**覆盖（仅用户确实写过的键，用于区分「继承 / 覆盖」） */
+  session?: Record<string, unknown>
+  /** 同 values：容器 ∪ 本会话的生效值 */
+  effective?: Record<string, unknown>
   [k: string]: unknown
 }
 
 export interface SettingsPatchRequest {
   patch?: Record<string, unknown>
   reset?: boolean
+  /** 写入作用域：container（默认，全局）| session（仅本会话） */
+  scope?: SettingsScope
 }
+
+/** 设置写入作用域（G2 会话级化） */
+export type SettingsScope = 'container' | 'session'

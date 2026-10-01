@@ -18,7 +18,7 @@ import logging
 from typing import Any
 
 
-from agent.api import estimate_tokens, Services
+from agent.api import SESSION_CFG_VIEW, estimate_tokens, Services
 
 from .backoff import BackoffState
 from .truncate import compress_summary_to_budget, truncate_messages
@@ -48,14 +48,30 @@ class HistoryCompactor:
 
     # ---- 配置 ----
 
-    def _threshold(self) -> int:
+    def _threshold(self, ctx: Any = None, session_id: str | None = None) -> int:
         """压缩触发门槛（token）：未摘要历史（本地截短后）达到此值即压缩。
 
         收窗机制已移除，压缩时机完全由本阈值决定。对用户开放可调：
         ``agent.short_term.compact_trigger_tokens``（默认 12000，与旧收窗预算同量级，
         远小于模型上下文窗口，确保未摘要历史一增长即压缩，上下文紧致、成本低）。
+
+        G2（会话级）：可经 ``session.cfg_view`` 接缝按**会话**取值（不同会话可有不同
+        阈值）。接缝缺失/无会话/取用失败 ⇒ **回落容器值**（不劣化，与改造前逐值等价）。
         """
-        return int(self._cfg.get("compact_trigger_tokens", 12000))
+        base = int(self._cfg.get("compact_trigger_tokens", 12000))
+        if ctx is None or not session_id:
+            return base
+        try:
+            view = ctx.get(SESSION_CFG_VIEW)
+        except Exception:                        # noqa: BLE001 —— 接缝不可用即容器级
+            return base
+        if view is None:
+            return base
+        try:
+            cfg = view("short_term", session_id) or {}
+        except Exception:                        # noqa: BLE001 —— 视图异常不拖垮压缩
+            return base
+        return int(cfg.get("compact_trigger_tokens", base))
 
     def _budgets(self) -> dict[str, int]:
         return {
@@ -109,7 +125,7 @@ class HistoryCompactor:
             file_threshold=int(self._cfg.get("file_content_max_tokens", 12000)),
         )
         view_tokens = sum(estimate_tokens(m["content"]) for m in to_sum_view)
-        if view_tokens < self._threshold():
+        if view_tokens < self._threshold(ctx, session_id):
             return                                     # 本地截短后很小：无需 LLM，不算失败
 
         # 第二层：LLM 摘要（受退避保护；暂停期先轻量探测）

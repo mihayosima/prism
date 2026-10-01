@@ -551,7 +551,16 @@ class ReactLoop:
 
             # D1：预算预警旗标在位 → 本步窗口注入「尽快收束」提示（每步追加，幂等；
             # 只读状态键，对 budget 零直连——与 PERMISSION_MODE 同款前向契约）
-            if ctx.state.get(StateKeys.BUDGET_WARNING):
+            # G2：旗标已按**会话分桶**（budget 侧），此处按本轮会话键取。
+            # 形状判定：**记录**（含 ``limit`` 字段）＝改造前单值形状，直接用它；
+            # **分桶**（``{会话键: 记录}``）＝G2 新形状，按本轮会话取。两类都是 dict，
+            # 故不能只看类型——以「是否含记录字段」区分，旧形状同样不劣化。
+            _warn = ctx.state.get(StateKeys.BUDGET_WARNING)
+            if isinstance(_warn, dict) and "limit" not in _warn:
+                _warn_hit = _warn.get(session_key)
+            else:
+                _warn_hit = _warn
+            if _warn_hit:
                 window.append({"role": "system", "content": BUDGET_TIGHT_SYSTEM})
 
             # ---- Think ----

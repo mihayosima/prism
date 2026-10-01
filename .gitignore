@@ -9,6 +9,8 @@ data/
 # 统一规则：agent/tests/.pytest-* 全部忽略（ms/dbg/full 等各批次临时目录）
 agent/tests/.pt/
 agent/tests/.pytest-*/
+# 仓库根下同样可能生成（--basetemp=.pytest-xxx 从项目根跑时）
+/.pytest-*/
 agent_runtime.egg-info/
 .playwright-mcp/
 

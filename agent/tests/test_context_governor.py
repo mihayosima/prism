@@ -162,7 +162,10 @@ def test_assemble_provides_governor_from_config(tmp_path):
         g = c.root.get(Services.CONTEXT)
         # 插件管理器按文件路径加载（模块名 agent_plugins.*），跨导入路径不做 isinstance，
         # 以类名 + 行为断言。
-        assert type(g).__name__ == "ContextGovernor"
+        # G2（会话级）：``Services.CONTEXT`` 现在是**会话感知门面**（``GovernorRouter``）——
+        # 无会话覆盖时恒转发到「按容器配置构造」的那一个实例，故配置贯通与行为断言不变；
+        # 类名断言改为门面名（这是本批**有意**的接口变化，见实施方案 §4 路线 B）。
+        assert type(g).__name__ == "GovernorRouter"
         assert g.max_context_tokens == 12345       # 配置节贯通
         assert g.history_budget() == int((12345 - 4000) * 0.6)
 

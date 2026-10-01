@@ -227,7 +227,11 @@ def test_budget_reserve_gates_normal_but_allows_finalize(tmp_path):
         with pytest.raises(CapabilityNotImplemented):
             await c.root.llm.complete(c.root, big, caller="t")     # 正常：超 max-reserve
         r = await c.root.llm.complete(c.root, big, caller="t", finalize=True)
-        assert c.root.state.get("budget_spent", 0) > 100, "收尾调用应可动用预留段"
+        # G2：``budget_spent`` 为 ``dict[会话键, int]``（本用例无 SESSION_KEY ⇒ 落容器桶 ""）
+        spent_map = c.root.state.get("budget_spent") or {}
+        total = (sum(int(v or 0) for v in spent_map.values())
+                 if isinstance(spent_map, dict) else int(spent_map))
+        assert total > 100, "收尾调用应可动用预留段"
         assert r.tokens_in > 0
         await c.teardown()
 
@@ -422,8 +426,11 @@ def test_budget_warning_fires_once_at_threshold(tmp_path):
         await c.assemble()
         msg = [{"role": "user", "content": "x" * 400}]     # est ≈ 100 = 0.5*200 → 跨阈值
         await c.root.llm.complete(c.root, msg, caller="t")
-        warn = c.root.state.get(StateKeys.BUDGET_WARNING)
-        assert warn and warn.get("limit") == 200, "跨阈值必须置预警旗标"
+        warn_map = c.root.state.get(StateKeys.BUDGET_WARNING)
+        # G2：旗标已按会话分桶（``{会话键: 记录}``）；本用例无 SESSION_KEY ⇒ 容器桶 ""
+        assert isinstance(warn_map, dict) and warn_map, "跨阈值必须置预警旗标"
+        rec = next(iter(warn_map.values()))
+        assert rec.get("limit") == 200, "预警记录须带上限（阈值判定线）"
         rows = await c.root.db.query(
             c.root, "SELECT event FROM agent_events WHERE event='agent/budget/warning'")
         assert len(rows) == 1, "预警事件 durable 落盘且只发一次"

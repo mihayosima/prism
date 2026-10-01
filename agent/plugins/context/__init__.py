@@ -33,6 +33,7 @@ from agent.api import Services, plugin
 from .governor import ContextGovernor
 from .inspector import LedgerEntry, RoundLedger
 from .protocols import Assembly, AssemblyReport, BlockReport, BlockSpec, GovernorLike
+from .router import GovernorRouter
 
 
 @plugin
@@ -49,14 +50,23 @@ class Context:
 
     async def apply(self, ctx) -> None:
         cfg = ((ctx.config or {}).get("agent") or {}).get("context") or {}
-        # 接缝（与 memory 三组件同构）：ctx.get("context.governor") 存在即用注入实现。
-        governor = ctx.get("context.governor") or ContextGovernor.from_config(cfg)
-        ctx.provide(Services.CONTEXT, governor)
+        # 接缝（与 memory 三组件同构）：ctx.get("context.governor") 存在即用注入实现
+        # ——注入形态保持「原样提供」，不套门面（注入方自担语义）。
+        injected = ctx.get("context.governor")
+        if injected is not None:
+            ctx.provide(Services.CONTEXT, injected)
+            return
+        # G2（会话级）：提供**门面**——按当前会话选实例；无会话覆盖时恒返回容器实例，
+        # 与改造前逐值等价。消费方（loop/sys-chat/tasks）仍 ctx.get(Services.CONTEXT) 现取，
+        # 故**零改动**。详见 router.py 与实施方案 §4 路线 B。
+        ctx.provide(Services.CONTEXT,
+                    GovernorRouter(ctx, ContextGovernor.from_config, cfg))
 
 
 __all__ = [
     "Context",
     "ContextGovernor",
+    "GovernorRouter",
     "GovernorLike",
     "BlockSpec",
     "BlockReport",

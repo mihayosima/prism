@@ -37,6 +37,7 @@ import type {
   PluginActionResponse,
   SettingsPatchRequest,
   SettingsResponse,
+  SettingsScope,
 } from './types'
 
 // ---------- 状态 / 会话 ----------
@@ -93,15 +94,24 @@ export function pluginAction(payload: PluginActionRequest): Promise<PluginAction
 
 // ---------- 设置 ----------
 
-/** legacy app.js:563 — 保存配置补丁 */
-export function saveSettings(patch: Record<string, unknown>): Promise<SettingsResponse> {
-  const body: SettingsPatchRequest = { patch }
+/** legacy app.js:563 — 保存配置补丁（G2：可指定写入作用域，默认容器级） */
+export function saveSettings(
+  patch: Record<string, unknown>,
+  scope: SettingsScope = 'container',
+): Promise<SettingsResponse> {
+  const body: SettingsPatchRequest = { patch, scope }
   return post<SettingsResponse>('/settings', body)
 }
 
-/** legacy app.js:571 — 恢复默认配置 */
+/** legacy app.js:571 — 恢复默认配置（容器级：清除容器覆盖） */
 export function resetSettings(): Promise<SettingsResponse> {
   const body: SettingsPatchRequest = { reset: true }
+  return post<SettingsResponse>('/settings', body)
+}
+
+/** G2 — 「重置为继承」：只清**本会话**的覆盖，逐键回落到容器/默认（不重建容器） */
+export function resetSessionSettings(): Promise<SettingsResponse> {
+  const body: SettingsPatchRequest = { reset: true, scope: 'session' }
   return post<SettingsResponse>('/settings', body)
 }
 

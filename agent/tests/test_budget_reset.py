@@ -6,12 +6,18 @@ import asyncio
 
 import pytest
 
-from agent.api import CapabilityNotImplemented
+from agent.api import CapabilityNotImplemented, StateKeys
 from agent.profiles import build_agent
 
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def _spent_total(ctx) -> int:
+    """G2：``budget_spent`` 为 ``dict[会话键, int]``；合计口径（旧 int 形状兼容）。"""
+    m = ctx.state.get("budget_spent")
+    return sum(int(v or 0) for v in m.values()) if isinstance(m, dict) else int(m or 0)
 
 
 def test_budget_cumulative_and_reset_on_new_session(tmp_path):
@@ -20,6 +26,9 @@ def test_budget_cumulative_and_reset_on_new_session(tmp_path):
 
     async def s():
         await c.assemble()
+        # G2：预算按**会话**分桶——先声明本会话键，累计才会落进该桶
+        # （真实链路里由 ``chat.send`` 写 ``SESSION_KEY``；此处单测直连 LLM，故手工声明）。
+        c.root.state[StateKeys.SESSION_KEY] = "s"
         denied = False
         for _ in range(30):
             try:
@@ -29,10 +38,11 @@ def test_budget_cumulative_and_reset_on_new_session(tmp_path):
                 denied = True
                 break
         assert denied, "累计超限应触发预算拒绝"
-        assert c.root.state.get("budget_spent", 0) > 0        # 拒绝发生在"将要超"时，故 < 上限
-        # 新会话 → 清空累计
+        assert _spent_total(c.root) > 0                      # 拒绝发生在"将要超"时，故 < 上限
+        assert c.root.state.get("budget_spent").get("s", 0) > 0, "累计未落到本会话桶"
+        # 新会话 → **只清本会话**累计（G2；此前是清整个容器，多会话下会串账）
         await c.root.chat.reset(c.root, "s")
-        assert c.root.state.get("budget_spent", 0) == 0
+        assert _spent_total(c.root) == 0
         # 重置后可再调用
         await c.root.llm.complete(c.root, [{"role": "user", "content": "hi"}],
                                   schema={}, caller="t")

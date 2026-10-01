@@ -29,6 +29,8 @@ from agent.core.mcp_client import McpStdioClient, build_task_schema
 from agent.core.config_schema import coerce_config, validate_config
 from agent.core.request_cost import (estimate_request_cost, wire_messages,
                                      wire_tools)
+from agent.core.scope_config import (DEFAULT_SESSION_LIMIT, evict_lru,
+                                     merge_overrides, section_of, touch)
 from agent.core.services_catalog import ALL as SERVICE_KEYS, Services
 from agent.core.session import (DEFAULT_SESSION, DEFAULT_TENANT, DEFAULT_USER,
                                 SessionIdError, SessionIdentity, build_task_id,
@@ -46,6 +48,12 @@ MARK_MEMORY_EXTRACT = "<!--memory:extract-->"
 MARK_REACT_TURN = "<!--react:turn-->"
 MARK_REACT_FINAL = "<!--react:final-->"
 
+
+# ---- G2（会话级）：配置视图接缝名 ------------------------------------------
+# 适配层（run/*）把 ``view(section, session_key) -> dict`` 挂到该键上；插件侧
+# ``ctx.get(SESSION_CFG_VIEW)`` **软取**，缺失即退化为容器级配置（行为等价、不裸崩）。
+# 之所以放内核：插件不得 import 适配层，接缝名必须双方可见且不产生反向依赖。
+SESSION_CFG_VIEW = "session.cfg_view"
 
 # ---- F1：口径校准因子（budget 写 LLM_COST_RATIO，消费方经本助手只读）----------
 
@@ -98,6 +106,15 @@ __all__ = [
     "DEFAULT_TENANT",
     "DEFAULT_USER",
     "DEFAULT_SESSION",
+    # G2（会话级）：配置视图接缝名（适配层注入 / 插件软取）
+    "SESSION_CFG_VIEW",
+    # G2（会话级）：作用域配置**纯规则**（实现位于 core/scope_config；适配层经本出口取用，
+    # 不得直连 core——分层守卫 test_layered_import_direction 对此有硬断言）
+    "DEFAULT_SESSION_LIMIT",
+    "merge_overrides",
+    "section_of",
+    "touch",
+    "evict_lru",
     # 审计公共面（D4 转正；实现位于 core/audit）
     "durable",
     "now_iso",

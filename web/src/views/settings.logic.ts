@@ -7,7 +7,7 @@
  */
 
 import { esc } from '../components/markdown'
-import type { SettingsResponse, SettingsDomainOption } from '../api/types'
+import type { SettingsResponse, SettingsDomainOption, SettingsScope } from '../api/types'
 
 /** 浮点型字段（legacy app.js:514、551 两处硬编码，此处收敛为一处） */
 export const FLOAT_KEYS = new Set([
@@ -96,9 +96,30 @@ const DD_PANEL =
   'position:absolute;z-index:30;margin-top:4px;width:340px;max-height:220px;overflow:auto;' +
   'border:1px solid var(--line);border-radius:8px;background:#fff;box-shadow:0 10px 28px rgba(15,23,42,.12);padding:6px'
 
-/** legacy app.js:469-549 — 设置页 HTML（纯函数，逐字符对拍） */
-export function renderSettingsHtml(j: SettingsResponse): string {
-  const v = (j.values || {}) as Record<string, unknown>
+/** legacy app.js:469-549 — 设置页 HTML（纯函数，逐字符对拍）
+ *
+ * G2（会话级化）扩展：新增 ``scope`` 参数（默认 ``container``，保持旧行为），
+ * 菜单顶部给出「容器级 / 本会话」切换；会话作用域下：
+ *  - 值显示为**生效值**（容器 ∪ 本会话）；
+ *  - 被本会话显式覆盖的键加「本会话」徽标；
+ *  - **仅容器级**的键（``j.scopable`` 之外）置灰禁用，避免误提交被后端 400。
+ */
+export function renderSettingsHtml(j: SettingsResponse, scope: SettingsScope = 'container'): string {
+  const isSession = scope === 'session'
+  // 容器作用域看「容器级生效值」，会话作用域看「容器 ∪ 本会话的生效值」
+  const containerVals = (j.container || j.values || {}) as Record<string, unknown>
+  const effVals = (j.effective || j.values || {}) as Record<string, unknown>
+  const v = isSession ? effVals : containerVals
+  const scopable = new Set(((j.scopable || []) as string[]).map(String))
+  const sessionKeys = new Set(Object.keys((j.session || {}) as Record<string, unknown>))
+  /** 本会话是否显式覆盖了该键（会话作用域下才显示，避免误导） */
+  const sessTag = (k: string): string =>
+    isSession && sessionKeys.has(k)
+      ? ' <span class="tag blue" style="font-size:10px">本会话</span>'
+      : ''
+  /** 会话作用域下，容器级键禁用（提交也不会被接受） */
+  const dis = (k: string): string => (isSession && !scopable.has(k) ? ' disabled' : '')
+  const onlyContainer = (k: string): boolean => isSession && !scopable.has(k)
   // G 域级裁剪：白名单以「可勾选」呈现，候选项由后端给（= 已注册域 ∪ 已选但当前未注册域）。
   // 不手填 —— 域名是 owner（插件 id），手填既要记拼写、又会因拼错触发后端安全阀静默回退。
   const domainOpts = (j.domains || []) as SettingsDomainOption[]
@@ -130,27 +151,66 @@ export function renderSettingsHtml(j: SettingsResponse): string {
       : '已选 ' + pickedNames.length + ' 个域'
     : '未选择（不裁剪）'
   let h =
-    '<div class="card"><h3 style="margin-top:0">成本护栏（budget）</h3>' +
-    '<div class="muted" style="margin-bottom:10px">LLM 调用的生命周期累计 token 上限：每次调用前先按估算预借、结束后按服务商真实用量对账；超限即拒绝调用。保存后立即重建容器生效（<b>已用量重计</b>）。覆盖写入 data/agent_plugin_config.json，重启后保持。</div>' +
+    '<div class="card"><h3 style="margin-top:0">作用域（scope）</h3>' +
+    '<div class="muted" style="margin-bottom:10px">' +
+    '参数分两层：<b>容器级</b>（全局，保存后重建容器生效）与<b>本会话级</b>（只影响当前会话，保存后立即生效、<b>不重建容器</b>）。' +
+    '会话级覆盖逐键优先于容器级，未覆盖的键沿用容器值（继承而非替换）。</div>' +
     '<label style="' +
     LABEL +
-    '"><div style="font-weight:600;margin-bottom:3px">运行预算上限 max_tokens_per_run (token)</div>' +
+    '"><div style="font-weight:600;margin-bottom:3px">写入作用域 scope</div>' +
+    '<select id="set_scope" style="' +
+    SEL +
+    '">' +
+    '<option value="container"' +
+    (isSession ? '' : ' selected') +
+    '>容器级 container（全局；保存后重建容器生效）</option>' +
+    '<option value="session"' +
+    (isSession ? ' selected' : '') +
+    '>本会话 session（当前：' +
+    esc(j.session_id || 'default') +
+    '；立即生效，不重建容器）</option>' +
+    '</select>' +
+    '<div class="muted" style="' +
+    HINT +
+    '">会话 = 请求头 X-Session-Id / 地址栏 ?sid=（网页「新会话」会切换）；会话级覆盖文件里按会话留存，'
+    + '超上限时按最久未用淘汰（只删覆盖，不动转写/记忆/快照）。</div></label>' +
+    (isSession
+      ? '<div class="muted" style="font-size:11px">当前为<b>本会话</b>作用域：带「本会话」徽标的项已被覆盖，其余继承容器值；' +
+        '置灰项<b>仅支持容器级</b>（如审批通道、懒加载/域裁剪等装配开关）。</div>'
+      : '<div class="muted" style="font-size:11px">当前为<b>容器级</b>作用域：修改会影响所有会话；' +
+        '只想调本会话，切到「本会话」。</div>') +
+    '<div style="margin-top:10px"><button class="btn ghost" id="resetSessionSettings">重置为继承（清除本会话覆盖）</button></div>' +
+    '</div>' +
+    '<div class="card" style="margin-top:16px"><h3 style="margin-top:0">成本护栏（budget）</h3>' +
+    '<div class="muted" style="margin-bottom:10px">LLM 调用的 token 上限：每次调用前先按估算预借、结束后按服务商真实用量对账；超限即拒绝调用。容器级保存后立即重建容器生效（<b>已用量重计</b>）；'
+    + '会话级保存后下个请求即生效（<b>不重建、不清账</b>）。覆盖写入 data/agent_plugin_config.json，重启后保持。</div>' +
+    '<label style="' +
+    LABEL +
+    '"><div style="font-weight:600;margin-bottom:3px">运行预算上限 max_tokens_per_run (token)' +
+    sessTag('max_tokens_per_run') +
+    '</div>' +
     '<input id="set_max_tokens_per_run" type="number" step="1000" min="1000" value="' +
     esc(v.max_tokens_per_run) +
     '" style="' +
     INP +
-    '">' +
+    '"' +
+    dis('max_tokens_per_run') +
+    '>' +
     '<div class="muted" style="' +
     HINT +
-    '">当前默认 200000；网页「新会话」也会把已用量归零重计</div></label>' +
+    '">当前默认 200000；本会话预算独立累计，网页「新会话」只清零<b>本会话</b>已用量</div></label>' +
     '<label style="' +
     LABEL +
-    '"><div style="font-weight:600;margin-bottom:3px">收尾预留额度 finalize_reserve_tokens (token)</div>' +
+    '"><div style="font-weight:600;margin-bottom:3px">收尾预留额度 finalize_reserve_tokens (token)' +
+    sessTag('finalize_reserve_tokens') +
+    '</div>' +
     '<input id="set_finalize_reserve_tokens" type="number" step="1000" min="0" value="' +
     esc(v.finalize_reserve_tokens) +
     '" style="' +
     INP +
-    '">' +
+    '"' +
+    dis('finalize_reserve_tokens') +
+    '>' +
     '<div class="muted" style="' +
     HINT +
     '">预算末段的收尾专用额度：正常调用只能用到「上限 − 预留」，触顶后的总结陈词可动用预留段，保证耗尽时也有体面收尾（0 = 关闭预留）。须不小于收尾窗口体积（建议 ≥ 24000）</div></label>' +
@@ -158,33 +218,52 @@ export function renderSettingsHtml(j: SettingsResponse): string {
     LABEL +
     '"><div style="font-weight:600;margin-bottom:3px"><input id="set_cost_calibration" type="checkbox"' +
     (v.cost_calibration ? ' checked' : '') +
-    '> 口径自校准 cost_calibration</div>' +
-    '<div class="muted" style="font-size:11px">用服务商真实用量持续修正字符估算的偏差（实测约 30%），使预算判定与窗口装配贴近真实计费；样本不足 5 次时自动退回裸估算。关闭 = 回到纯估算口径。</div></label></div>' +
+    dis('cost_calibration') +
+    '> 口径自校准 cost_calibration' +
+    sessTag('cost_calibration') +
+    '</div>' +
+    (onlyContainer('cost_calibration')
+      ? '<div class="muted" style="font-size:11px">仅容器级：校正是**模型属性**，按会话拆会让每个会话样本不足而退化成裸估算，精度反而更差。</div>'
+      : '<div class="muted" style="font-size:11px">用服务商真实用量持续修正字符估算的偏差（实测约 30%），使预算判定与窗口装配贴近真实计费；样本不足 5 次时自动退回裸估算。关闭 = 回到纯估算口径。</div>') +
+    '</label></div>' +
     '<div class="card" style="margin-top:16px"><h3 style="margin-top:0">循环内上下文治理（plugins.react）</h3>' +
     '<div class="muted" style="margin-bottom:10px">开启后每次请求只携带「工具目录卡」（名称+一行描述+参数名，无完整 JSON Schema），模型经 tool_search / tool_load 元工具按需加载完整定义，可显著降低工具定义的 token 开销。默认关闭（灰度）。</div>' +
     '<label style="' +
     LABEL +
     '"><div style="font-weight:600;margin-bottom:3px"><input id="set_lazy_tools" type="checkbox"' +
     (v.lazy_tools ? ' checked' : '') +
-    '> 启用懒加载 lazy_tools</div>' +
+    dis('lazy_tools') +
+    '> 启用懒加载 lazy_tools' +
+    sessTag('lazy_tools') +
+    '</div>' +
     '<div class="muted" style="font-size:11px">模型对未加载工具的调用会得到「未加载」错误观察并自行纠正；执行面闸门（审批/只读裁剪）不受影响。</div></label>' +
     '<label style="' +
     LABEL +
     '"><div style="font-weight:600;margin-bottom:3px"><input id="set_alignment_enabled" type="checkbox"' +
     (v.alignment_enabled ? ' checked' : '') +
-    '> 续接前缀对齐 alignment_enabled</div>' +
+    dis('alignment_enabled') +
+    '> 续接前缀对齐 alignment_enabled' +
+    sessTag('alignment_enabled') +
+    '</div>' +
     '<div class="muted" style="font-size:11px">续接时冻结头部快照（system/前置上下文/首轮提示词）跨 run 逐字节稳定，新消息追加链尾，使请求构成前序请求的严格前缀，命中提示缓存（实测前缀断裂时整链按 miss 计价）。关闭 = 回退旧行为，续接时头部随当前提示词重建（并发出 prefix-unstable 事件）。</div></label>' +
     '<label style="' +
     LABEL +
     '"><div style="font-weight:600;margin-bottom:3px"><input id="set_tool_domains_enabled" type="checkbox"' +
     (v.tool_domains_enabled ? ' checked' : '') +
-    '> 启用域级裁剪 tool_domains_enabled</div>' +
+    dis('tool_domains_enabled') +
+    '> 启用域级裁剪 tool_domains_enabled' +
+    sessTag('tool_domains_enabled') +
+    '</div>' +
     '<div class="muted" style="font-size:11px">按工具「域」(注册来源 owner = 插件 id) 裁剪暴露面：未列名的域对模型不可见，但仍可经 tool_search / tool_load 检索加载（<b>隐藏但可检索</b>）。<b>仅在懒加载开启时生效</b> —— 非懒加载没有检索通道，裁剪会让被隐藏工具彻底失联。默认关闭。</div></label>' +
     '<div style="' +
     LABEL +
-    '"><div style="font-weight:600;margin-bottom:3px">放行域白名单 tool_domains</div>' +
+    '"><div style="font-weight:600;margin-bottom:3px">放行域白名单 tool_domains' +
+    sessTag('tool_domains') +
+    '</div>' +
     '<div style="position:relative;width:340px">' +
-    '<button type="button" id="set_tool_domains_btn" aria-haspopup="true" aria-expanded="false" style="' +
+    '<button type="button" id="set_tool_domains_btn" aria-haspopup="true" aria-expanded="false"' +
+    dis('tool_domains') +
+    ' style="' +
     DD_BTN +
     '"><span id="set_tool_domains_label" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
     esc(ddLabel) +
@@ -211,6 +290,7 @@ export function renderSettingsHtml(j: SettingsResponse): string {
         LABEL +
         '"><div style="font-weight:600;margin-bottom:3px">' +
         esc(label) +
+        sessTag(k) +
         '</div>' +
         '<input id="set_' +
         k +
@@ -220,7 +300,9 @@ export function renderSettingsHtml(j: SettingsResponse): string {
         esc(v[k]) +
         '" style="' +
         INP +
-        '">' +
+        '"' +
+        dis(k) +
+        '>' +
         '<div class="muted" style="' +
         HINT +
         '">' +
@@ -230,10 +312,14 @@ export function renderSettingsHtml(j: SettingsResponse): string {
     h +=
       '<label style="' +
       LABEL +
-      '"><div style="font-weight:600;margin-bottom:3px">压缩模式 compact_mode</div>' +
+      '"><div style="font-weight:600;margin-bottom:3px">压缩模式 compact_mode' +
+      sessTag('compact_mode') +
+      '</div>' +
       '<select id="set_compact_mode" style="' +
       SEL +
-      '">' +
+      '"' +
+      dis('compact_mode') +
+      '>' +
       COMPACT_MODES.map(
         (o) =>
           '<option value="' + o + '"' + (v.compact_mode === o ? ' selected' : '') + '>' + o + '（' + COMPACT_MODE_LABELS[o] + '）</option>',
@@ -253,10 +339,14 @@ export function renderSettingsHtml(j: SettingsResponse): string {
       '<div class="muted" style="margin-bottom:10px">调整审批通道与名单；保存后立即重建容器生效（会话档位回到默认）。覆盖写入 data/agent_plugin_config.json，重启后保持。</div>' +
       '<label style="' +
       LABEL +
-      '"><div style="font-weight:600;margin-bottom:3px">问人通道 provider</div>' +
+      '"><div style="font-weight:600;margin-bottom:3px">问人通道 provider' +
+      sessTag('provider') +
+      '</div>' +
       '<select id="set_provider" style="' +
       SEL +
-      '">' +
+      '"' +
+      dis('provider') +
+      '>' +
       APPROVAL_PROVIDERS.map(
         (o) =>
           '<option value="' +
@@ -274,28 +364,39 @@ export function renderSettingsHtml(j: SettingsResponse): string {
       '">仅 web / cli 为交互式，会真正等人答复（web 才有网页弹窗）</div></label>' +
       '<label style="' +
       LABEL +
-      '"><div style="font-weight:600;margin-bottom:3px">等待时限 timeout_s（秒）</div>' +
+      '"><div style="font-weight:600;margin-bottom:3px">等待时限 timeout_s（秒）' +
+      sessTag('timeout_s') +
+      '</div>' +
       '<input id="set_timeout_s" type="number" step="1" min="1" value="' +
       esc(v.timeout_s) +
       '" style="' +
       INP +
-      '">' +
+      '"' +
+      dis('timeout_s') +
+      '>' +
       '<div class="muted" style="' +
       HINT +
       '">无人应答超过此时限 → 默认拒绝（fail-safe）</div></label>' +
       '<label style="' +
       LABEL +
-      '"><div style="font-weight:600;margin-bottom:3px">必问名单 ask（fnmatch，逗号分隔）</div>' +
+      '"><div style="font-weight:600;margin-bottom:3px">必问名单 ask（fnmatch，逗号分隔）' +
+      sessTag('ask') +
+      '</div>' +
       '<input id="set_ask" type="text" value="' +
       esc(((v.ask || []) as string[]).join(', ')) +
-      '" placeholder="如 t.write*, *delete*" style="width:360px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit">' +
+      '" placeholder="如 t.write*, *delete*" style="width:360px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit"' +
+      dis('ask') +
+      '>' +
       '<div class="muted" style="' +
       HINT +
       '">命中名单的工具执行前必问人；配合对话页「审批」档可让所有非只读工具都问</div></label></div>'
   }
 
   h +=
-    '<div style="margin-top:16px"><button class="btn" id="saveSettings">保存</button> ' +
-    '<button class="btn ghost" id="resetSettings">恢复默认</button> <span class="muted" id="setMsg"></span></div>'
+    '<div style="margin-top:16px"><button class="btn" id="saveSettings">' +
+    (isSession ? '保存到本会话' : '保存（容器级）') +
+    '</button> ' +
+    '<button class="btn ghost" id="resetSettings">恢复默认（容器级）</button> ' +
+    '<span class="muted" id="setMsg"></span></div>'
   return h
 }

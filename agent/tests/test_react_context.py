@@ -267,7 +267,10 @@ def test_headroom_gate_compresses_once_when_prior_over_budget(tmp_path, monkeypa
         def _boom(blocks, **_kw):                       # 装配失败 → 退回无界拼接
             raise RuntimeError("assemble down")
 
-        monkeypatch.setattr(type(gov), "assemble", _boom)
+        # G2：``Services.CONTEXT`` 是会话感知门面 ⇒ 要 patch 的是**当前会话实例**的类
+        # （``current()`` 返回容器实例；插件按文件路径加载，模块名与 import 路径不同，
+        # 故只能从实例取类，不能 import 具体类）。
+        monkeypatch.setattr(type(gov.current()), "assemble", _boom)
         filler = "很长的历史内容。" * 400                # 远超 1024 token
         short = c.root.get(Services.SHORT_TERM)
         await short.append(c.root, "h", "user", filler)

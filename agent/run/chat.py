@@ -19,14 +19,16 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 import uuid
 from pathlib import Path
 
-from agent.api import (AgentError, Services, SessionIdError, StateKeys,
-                       make_identity)
+from agent.api import (AgentError, SESSION_CFG_VIEW, Services, SessionIdError,
+                       StateKeys, make_identity)
 from agent.profiles import BASE_AGENT_CONFIG, build_agent
+from agent.run.config_store import ConfigStore
 from agent.sys.progress import tap_progress
 
 # 本模块开了 ``from __future__ import annotations`` ⇒ 路由签名里的注解是**字符串**，
@@ -74,27 +76,33 @@ def _cfg(args: argparse.Namespace) -> dict:
 
 
 # ---- 插件配置覆盖（前端「设置」持久化；与插件启停期望态分离，单文件存储） ----
+# 会话级化（G2）：覆盖文件升级为 v2 分 scope 结构（container / sessions），
+# 读写一律经 ``ConfigStore``（v1 平铺只读兼容 + 写前备份 + LRU 上限）。
+# 两个旧函数名保留为薄封装 —— 语义不变（容器级整体读写），避免全仓调用点改动。
 _OVERRIDE_FILE = Path("data/agent_plugin_config.json")
+
+# 进程内唯一真源：``_merge_cfg`` / 设置接口 / ``session.cfg_view`` 接缝共用同一份。
+# 惰性访问：``_OVERRIDE_FILE`` 可能被重定向（测试注入 tmp 路径 / 多环境部署），
+# 直接固化路径会让重定向失效——故按「路径变了就重建」保持单一真源。
+_STORE = ConfigStore(path=_OVERRIDE_FILE)
+
+
+def _store() -> ConfigStore:
+    """当前覆盖存储（路径变化即重建；单一真源语义不变）。"""
+    global _STORE
+    if Path(_STORE.path) != Path(_OVERRIDE_FILE):
+        _STORE = ConfigStore(path=_OVERRIDE_FILE)
+    return _STORE
 
 
 def _load_overrides() -> dict:
-    """读取用户对插件运行时配置的覆盖（data/agent_plugin_config.json）。
-
-    形态：``{ "plugins.<名>": {键: 值, ...}, ... }``；缺失/损坏返回空 dict（不裸崩）。
-    """
-    if not _OVERRIDE_FILE.exists():
-        return {}
-    try:
-        return json.loads(_OVERRIDE_FILE.read_text(encoding="utf-8")) or {}
-    except Exception:  # noqa: BLE001 —— 损坏按空处理，不阻断启动
-        return {}
+    """读取用户对插件运行时配置的**容器级**覆盖（v1 形状 ``{plugins.X: {...}}``）。"""
+    return _store().container()
 
 
 def _save_overrides(data: dict) -> None:
-    _OVERRIDE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _OVERRIDE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(_OVERRIDE_FILE)
+    """整份写回容器级覆盖（v1 形状）。"""
+    _store().replace_container(data)
 
 
 def _merge_cfg(args: argparse.Namespace) -> dict:
@@ -123,127 +131,149 @@ def _merge_cfg(args: argparse.Namespace) -> dict:
     return cfg
 
 
-# ---- 上下文管理设置项 schema（前端「设置 → 上下文管理」可调） ----
-# 校验/钳制：键 → (类型, 下限, 上限)；归属插件由 _PLUGIN_OF_KEY 路由。
-_SETTING_SCHEMA = {
-    "compact_trigger_tokens": (int, 256, 1_000_000),      # 来自 plugins.short_term
-    "max_context_tokens": (int, 1024, 1_000_000),
-    "reserve_output_tokens": (int, 0, 1_000_000),
-    "memory_ratio": (float, 0.01, 0.99),
-    "history_ratio": (float, 0.01, 0.99),
-    "source_clip_tokens": (int, 0, 1_000_000),
+# ---- 设置项元数据（**单一真相源**，前端「设置」页可调） ----
+# G2（会话级化，S5-0）：校验/归属/默认/作用域**四件事实合并为一张表**。
+# 此前散在 _SETTING_SCHEMA / _PLUGIN_OF_KEY / _SETTING_DEFAULTS 三处（外加一条
+# 靠注释维持的同源纪律），加 scope 维度后三表 + scope 必然漂移——故先合并再扩展。
+# 每键四项：
+#   spec    : 校验规则（见 _coerce_setting；``(类型, 下, 上)`` / ``("choice", [...])`` / ``("bool",)`` / ``("list",)``）
+#   plugin  : 归属插件节——决定落 ``plugins.<名>``（_merge_cfg 再映射到 ``agent.<名>``）
+#   default : 默认值（与 profiles.BASE_AGENT_CONFIG 同源，避免硬编码漂移）
+#   scope   : 允许写入的作用域层。``"session"`` = 可写到「本会话」（G2）；
+#             ``"container"`` = 仅容器级（改装配/资源/进程语义，会话化无意义或有害，见方案 §3.2）。
+# G2.0（P1）：context 节默认值单一真相源（与 profiles.BASE_AGENT_CONFIG 同源，避免漂移）
+_CTX_DEFAULTS = ((BASE_AGENT_CONFIG.get("agent") or {}).get("context") or {})
+_BUDGET_DEFAULTS = ((BASE_AGENT_CONFIG.get("agent") or {}).get("budget") or {})
+_REACT_DEFAULTS = ((BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {})
+
+_SETTING_META: dict[str, dict] = {
+    # ---- 短期记忆（plugins.short_term）----
+    "compact_trigger_tokens": {
+        "spec": (int, 256, 1_000_000), "plugin": "plugins.short_term",
+        "default": 12000, "scope": "session"},
+    # ---- 上下文窗口与配比（plugins.context）----
+    "max_context_tokens": {
+        "spec": (int, 1024, 1_000_000), "plugin": "plugins.context",
+        "default": 24000, "scope": "session"},
+    "reserve_output_tokens": {
+        "spec": (int, 0, 1_000_000), "plugin": "plugins.context",
+        "default": 4000, "scope": "session"},
+    "memory_ratio": {
+        "spec": (float, 0.01, 0.99), "plugin": "plugins.context",
+        "default": 0.10, "scope": "session"},
+    "history_ratio": {
+        "spec": (float, 0.01, 0.99), "plugin": "plugins.context",
+        "default": 0.60, "scope": "session"},
+    "source_clip_tokens": {
+        "spec": (int, 0, 1_000_000), "plugin": "plugins.context",
+        "default": 8192, "scope": "session"},
     # ---- S3：循环内（react）上下文治理 ----
-    "clip_max_tokens": (int, 0, 1_000_000),            # 单条观察超此值即首尾折叠
-    "clip_head_tokens": (int, 0, 1_000_000),           # 折叠后头部保留
-    "clip_tail_tokens": (int, 0, 1_000_000),           # 折叠后尾部保留
-    "react_keep_recent": (int, 0, 1000),                  # 最近 N 条链原文保留
-    "react_min_chain_tokens": (int, 0, 1_000_000),        # 循环内 chain 保底额度
+    "clip_max_tokens": {
+        "spec": (int, 0, 1_000_000), "plugin": "plugins.context",
+        "default": 1000, "scope": "session"},          # 单条观察超此值即首尾折叠
+    "clip_head_tokens": {
+        "spec": (int, 0, 1_000_000), "plugin": "plugins.context",
+        "default": 500, "scope": "session"},           # 折叠后头部保留
+    "clip_tail_tokens": {
+        "spec": (int, 0, 1_000_000), "plugin": "plugins.context",
+        "default": 500, "scope": "session"},           # 折叠后尾部保留
+    "react_keep_recent": {
+        "spec": (int, 0, 1000), "plugin": "plugins.context",
+        "default": 6, "scope": "session"},             # 最近 N 条链原文保留
+    "react_min_chain_tokens": {
+        "spec": (int, 0, 1_000_000), "plugin": "plugins.context",
+        "default": 2048, "scope": "session"},          # 循环内 chain 保底额度
     # ---- G2.0（P1）：双窗口解耦 + 水位 + 层 cap ----
-    "working_window_tokens": (int, 1, 1_000_000),          # 经济窗口（水位分母）
-    "window_high_ratio": (float, 0.01, 0.99),              # 触发水位
-    "window_low_ratio": (float, 0.01, 0.99),               # 回落目标（记录用）
-    "resident_cap_tokens": (int, 0, 1_000_000),            # 常驻层 cap（0=无）
-    "on_demand_cap_tokens": (int, 0, 1_000_000),           # 按需层 cap（0=无）
-    "prompt_cap_tokens": (int, 0, 1_000_000),              # 输入层 cap（0=无）
+    "working_window_tokens": {
+        "spec": (int, 1, 1_000_000), "plugin": "plugins.context",
+        "default": _CTX_DEFAULTS.get("working_window_tokens", 96000),
+        "scope": "session"},                           # 经济窗口（水位分母）
+    "window_high_ratio": {
+        "spec": (float, 0.01, 0.99), "plugin": "plugins.context",
+        "default": _CTX_DEFAULTS.get("window_high_ratio", 0.70),
+        "scope": "session"},                           # 触发水位
+    "window_low_ratio": {
+        "spec": (float, 0.01, 0.99), "plugin": "plugins.context",
+        "default": _CTX_DEFAULTS.get("window_low_ratio", 0.40),
+        "scope": "session"},                           # 回落目标（记录用）
+    "resident_cap_tokens": {
+        "spec": (int, 0, 1_000_000), "plugin": "plugins.context",
+        "default": _CTX_DEFAULTS.get("resident_cap_tokens", 8000),
+        "scope": "session"},                           # 常驻层 cap（0=无）
+    "on_demand_cap_tokens": {
+        "spec": (int, 0, 1_000_000), "plugin": "plugins.context",
+        "default": _CTX_DEFAULTS.get("on_demand_cap_tokens", 8000),
+        "scope": "session"},                           # 按需层 cap（0=无）
+    "prompt_cap_tokens": {
+        "spec": (int, 0, 1_000_000), "plugin": "plugins.context",
+        "default": _CTX_DEFAULTS.get("prompt_cap_tokens", 2000),
+        "scope": "session"},                           # 输入层 cap（0=无）
     # ---- G2.0（P2）：治理动词（模式 + clear 最小释放量）----
-    "compact_mode": ("choice", ["off", "shadow", "on"]),   # 默认 shadow（只算不做）
-    "clear_at_least_tokens": (int, 0, 1_000_000),          # 单次清除的最小释放量
+    "compact_mode": {
+        "spec": ("choice", ["off", "shadow", "on"]), "plugin": "plugins.context",
+        "default": _CTX_DEFAULTS.get("compact_mode", "shadow"),
+        "scope": "session"},                           # 默认 shadow（只算不做）
+    "clear_at_least_tokens": {
+        "spec": (int, 0, 1_000_000), "plugin": "plugins.context",
+        "default": _CTX_DEFAULTS.get("clear_at_least_tokens", 4000),
+        "scope": "session"},                           # 单次清除的最小释放量
     # ---- 审批插件（plugins.approval）：通道 / 超时 / 必问名单 ----
-    "provider": ("choice", ["auto-deny", "auto-allow", "web", "cli"]),
-    "timeout_s": (int, 1, 3600),
-    "ask": ("list",),                                      # fnmatch 工具名名单
+    # 容器级：provider/timeout 属「装配与运行通道」语义（改 provider 要重装通道），
+    # 会话化只会让不同会话的审批行为不可预期；名单的会话级化留后续批次。
+    "provider": {
+        "spec": ("choice", ["auto-deny", "auto-allow", "web", "cli"]),
+        "plugin": "plugins.approval", "default": "web", "scope": "container"},
+    "timeout_s": {
+        "spec": (int, 1, 3600), "plugin": "plugins.approval",
+        "default": 30, "scope": "container"},
+    "ask": {
+        "spec": ("list",), "plugin": "plugins.approval",
+        "default": [], "scope": "container"},          # fnmatch 工具名名单
     # ---- 成本护栏（agent.budget 内核托管节；经 plugins.budget 覆盖映射，见 _merge_cfg）----
-    "max_tokens_per_run": (int, 1000, 10_000_000),         # 容器生命周期累计 LLM token 上限
-    "finalize_reserve_tokens": (int, 0, 1_000_000),        # 方案A：收尾预留额度（收尾专用）
-    "cost_calibration": ("bool",),                        # F1：口径自校准（EWMA 因子）
+    "max_tokens_per_run": {
+        "spec": (int, 1000, 10_000_000), "plugin": "plugins.budget",
+        "default": _BUDGET_DEFAULTS.get("max_tokens_per_run", 200000),
+        "scope": "session"},                           # 本会话累计 LLM token 上限
+    "finalize_reserve_tokens": {
+        "spec": (int, 0, 1_000_000), "plugin": "plugins.budget",
+        "default": _BUDGET_DEFAULTS.get("finalize_reserve_tokens", 0),
+        "scope": "session"},                           # 方案A：收尾预留额度（收尾专用）
+    "cost_calibration": {
+        "spec": ("bool",), "plugin": "plugins.budget",
+        "default": _BUDGET_DEFAULTS.get("cost_calibration", True),
+        "scope": "container"},                         # F1：口径校准是模型属性，不随会话拆
     # ---- 工具懒加载（plugins.react；L1 灰度开关）----
-    "lazy_tools": ("bool",),
+    # 容器级：属「暴露层装配」开关，会话化会让同一模型的工具面在不同会话里漂移。
+    "lazy_tools": {
+        "spec": ("bool",), "plugin": "plugins.react",
+        "default": _REACT_DEFAULTS.get("lazy_tools", False), "scope": "container"},
     # ---- 域级裁剪（plugins.react；路线 2：投影层按域裁剪工具暴露面）----
     # 硬前提：仅 lazy_tools=True 时生效（非懒加载无 tool_search/tool_load，
     # 裁剪即硬隐藏＝不可回溯）。空白名单视同未配置（不做全隐藏）。
-    "tool_domains_enabled": ("bool",),
-    "tool_domains": ("list",),                             # 放行域白名单（owner，如 plugins.windows_mcp）
-    # ---- P0-2：续接前缀对齐（plugins.react；头部快照冻结，可回退）----
-    "alignment_enabled": ("bool",),
-}
-_PLUGIN_OF_KEY = {
-    "compact_trigger_tokens": "plugins.short_term",
-    "max_context_tokens": "plugins.context",
-    "reserve_output_tokens": "plugins.context",
-    "memory_ratio": "plugins.context",
-    "history_ratio": "plugins.context",
-    "source_clip_tokens": "plugins.context",
-    "clip_max_tokens": "plugins.context",
-    "clip_head_tokens": "plugins.context",
-    "clip_tail_tokens": "plugins.context",
-    "react_keep_recent": "plugins.context",
-    "react_min_chain_tokens": "plugins.context",
-    "working_window_tokens": "plugins.context",
-    "window_high_ratio": "plugins.context",
-    "window_low_ratio": "plugins.context",
-    "resident_cap_tokens": "plugins.context",
-    "on_demand_cap_tokens": "plugins.context",
-    "prompt_cap_tokens": "plugins.context",
-    "compact_mode": "plugins.context",
-    "clear_at_least_tokens": "plugins.context",
-    "provider": "plugins.approval",
-    "timeout_s": "plugins.approval",
-    "ask": "plugins.approval",
-    "max_tokens_per_run": "plugins.budget",
-    "finalize_reserve_tokens": "plugins.budget",
-    "cost_calibration": "plugins.budget",
-    "lazy_tools": "plugins.react",
-    "tool_domains_enabled": "plugins.react",
-    "tool_domains": "plugins.react",
-    "alignment_enabled": "plugins.react",
-}
-# G2.0（P1）：context 节默认值单一真相源（与 profiles.BASE_AGENT_CONFIG 同源，避免漂移）
-_CTX_DEFAULTS = ((BASE_AGENT_CONFIG.get("agent") or {}).get("context") or {})
-_SETTING_DEFAULTS = {
-    "compact_trigger_tokens": 12000,
-    "max_context_tokens": 24000,
-    "reserve_output_tokens": 4000,
-    "memory_ratio": 0.10,
-    "history_ratio": 0.60,
-    "source_clip_tokens": 8192,
-    "clip_max_tokens": 1000,
-    "clip_head_tokens": 500,
-    "clip_tail_tokens": 500,
-    "react_keep_recent": 6,
-    "react_min_chain_tokens": 2048,
-    # G2.0（P1）：与 profiles.BASE_AGENT_CONFIG.agent.context 同源
-    "working_window_tokens": _CTX_DEFAULTS.get("working_window_tokens", 96000),
-    "window_high_ratio": _CTX_DEFAULTS.get("window_high_ratio", 0.70),
-    "window_low_ratio": _CTX_DEFAULTS.get("window_low_ratio", 0.40),
-    "resident_cap_tokens": _CTX_DEFAULTS.get("resident_cap_tokens", 8000),
-    "on_demand_cap_tokens": _CTX_DEFAULTS.get("on_demand_cap_tokens", 8000),
-    "prompt_cap_tokens": _CTX_DEFAULTS.get("prompt_cap_tokens", 2000),
-    # G2.0（P2）：与 profiles.BASE_AGENT_CONFIG.agent.context 同源
-    "compact_mode": _CTX_DEFAULTS.get("compact_mode", "shadow"),
-    "clear_at_least_tokens": _CTX_DEFAULTS.get("clear_at_least_tokens", 4000),
-    "provider": "web",
-    "timeout_s": 30,
-    "ask": [],
-    # 与 profiles.BASE_AGENT_CONFIG 的 budget 默认同源（避免两处硬编码漂移）
-    "max_tokens_per_run": (((BASE_AGENT_CONFIG.get("agent") or {}).get("budget") or {})
-                           .get("max_tokens_per_run", 200000)),
-    "finalize_reserve_tokens": (((BASE_AGENT_CONFIG.get("agent") or {}).get("budget") or {})
-                                .get("finalize_reserve_tokens", 0)),
-    "cost_calibration": (((BASE_AGENT_CONFIG.get("agent") or {}).get("budget") or {})
-                         .get("cost_calibration", True)),
-    "lazy_tools": (((BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {})
-                   .get("lazy_tools", False)),
-    # 域级裁剪：与 profiles.BASE_AGENT_CONFIG agent.react 同源。
+    "tool_domains_enabled": {
+        "spec": ("bool",), "plugin": "plugins.react",
+        "default": _REACT_DEFAULTS.get("tool_domains_enabled", False),
+        "scope": "container"},
     # 陷阱：tool_domains 的默认值**必须是 []，不能是 None** —— _coerce_setting 的
     # "list" 分支对非 str/list 走 ``parts=[raw]``，None 会被收成字符串 "None"。
-    "tool_domains_enabled": (((BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {})
-                             .get("tool_domains_enabled", False)),
-    "tool_domains": (((BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {})
-                     .get("tool_domains", [])),
-    # P0-2：与 profiles.BASE_AGENT_CONFIG agent.react 同源；默认开启
-    "alignment_enabled": (((BASE_AGENT_CONFIG.get("agent") or {}).get("react") or {})
-                          .get("alignment_enabled", True)),
+    "tool_domains": {
+        "spec": ("list",), "plugin": "plugins.react",
+        "default": _REACT_DEFAULTS.get("tool_domains", []),
+        "scope": "container"},                         # 放行域白名单（owner，如 plugins.windows_mcp）
+    # ---- P0-2：续接前缀对齐（plugins.react；头部快照冻结，可回退）----
+    "alignment_enabled": {
+        "spec": ("bool",), "plugin": "plugins.react",
+        "default": _REACT_DEFAULTS.get("alignment_enabled", True),
+        "scope": "container"},
 }
+
+# 以下三张表为**派生视图**（保留旧名：既有测试与调用点零改动）——单一真相源是 _SETTING_META。
+_SETTING_SCHEMA = {k: m["spec"] for k, m in _SETTING_META.items()}
+_PLUGIN_OF_KEY = {k: m["plugin"] for k, m in _SETTING_META.items()}
+_SETTING_DEFAULTS = {k: m["default"] for k, m in _SETTING_META.items()}
+# 允许写到「本会话」层的键（G2）：设置接口据此拒绝把容器级键写进会话覆盖。
+_SETTING_SCOPABLE = frozenset(k for k, m in _SETTING_META.items()
+                              if m.get("scope") == "session")
 
 
 def _coerce_setting(key: str, raw):
@@ -318,7 +348,47 @@ async def _boot(args: argparse.Namespace):
     c = build_agent(config=_merge_cfg(args), plugin_mgr=pm)
     await c.assemble()
     await c.start()
+    _attach_session_cfg_view(c.root)
     return c, pm
+
+
+# ---- G2（会话级）：接缝注入 -------------------------------------------------
+# 解耦纪律：插件**不得 import 适配层**（run/*）。会话配置经 ctx 接缝传递——
+# ``view(section, session_key) -> dict``（纯读、返回副本）。插件侧 ctx.get 软取，
+# 缺失即退化为容器级单实例 ⇒ 未启用会话覆盖时行为与改造前逐值等价。
+# 接缝名取自 ``agent.api.SESSION_CFG_VIEW``（内核定义，双方可见、不产生反向依赖）。
+
+
+def _budget_view(root, ident, container_cfg: dict) -> dict:
+    """状态栏预算视图：**本会话**已用 + 本会话上限（会话覆盖优先于容器）。
+
+    G2 前 ``BUDGET_SPENT`` 是容器单值 ⇒ 状态栏看到的其实是「所有会话合计」；
+    现改为按会话取，上限亦走同一份会话配置视图（与 budget 插件的判定同源）。
+    """
+    sk = ident.session_key
+    m = root.state.get(StateKeys.BUDGET_SPENT)
+    mine = int(m.get(sk, 0) or 0) if isinstance(m, dict) else int(m or 0)
+    cfg = dict(container_cfg or {})
+    if sk:
+        try:
+            sess = _store().view("budget", sk) or {}
+        except Exception:                    # noqa: BLE001 —— 视图异常回落容器值
+            sess = {}
+        if sess:
+            cfg.update(sess)
+    return {"spent": mine, "max": cfg.get("max_tokens_per_run", 0), "session": sk}
+
+
+def _attach_session_cfg_view(root) -> None:
+    """把会话配置视图挂到根容器（rebuild 后必须重新挂：新容器是新作用域）。"""
+    if root is None:
+        return
+    try:
+        # 传 lambda 而非 ``_store().view`` 绑定：存储被重定向（测试/多环境）后
+        # 接缝仍指向**当前**真源，不会读到旧实例。
+        root.provide(SESSION_CFG_VIEW, lambda section, sk=None: _store().view(section, sk))
+    except Exception:                        # noqa: BLE001 —— 接缝不可用时降级为容器级
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +538,7 @@ async def _serve(args: argparse.Namespace) -> int:
         except Exception:  # noqa: BLE001
             pass
         c.set(c2)
+        _attach_session_cfg_view(c2.root)     # 新容器 ⇒ 重新挂接缝
 
     app = FastAPI(title="Agent Harness", docs_url=None, redoc_url=None)
 
@@ -555,11 +626,28 @@ async def _serve(args: argparse.Namespace) -> int:
                                     status_code=503)
         return {"status": "ok"}
 
+    def _metrics_session_labels() -> bool:
+        """per-session 指标开关（默认关，见 S7）。"""
+        if os.environ.get("PRISM_METRICS_SESSION_LABELS", "").strip().lower() in (
+                "1", "true", "on", "yes"):
+            return True
+        cfg = ((c.root.config or {}).get("agent") or {}).get("metrics") or {}
+        return bool(cfg.get("session_labels"))
+
+    def _prom_label(value: object) -> str:
+        """Prometheus 标签值转义（反斜杠 / 双引号 / 换行）。"""
+        return (str(value).replace("\\", "\\\\").replace('"', '\\"')
+                .replace("\n", "\\n"))
+
     @app.get("/metrics")
     async def _metrics() -> Response:
         """极简 Prometheus 文本指标（核心指标；多会话后加 tenant/user label）。"""
         budget_cfg = ((c.root.config or {}).get("agent") or {}).get("budget") or {}
-        spent = c.root.state.get(StateKeys.BUDGET_SPENT, 0)
+        # G2：BUDGET_SPENT 已按**会话分桶**。metrics 保持「容器总计」语义（既有图表不破），
+        # 需要 per-session 明细时打开 PRISM_METRICS_SESSION_LABELS=1（默认关：防标签基数爆炸）。
+        _spent_map = c.root.state.get(StateKeys.BUDGET_SPENT)
+        spent = (sum(int(v or 0) for v in _spent_map.values())
+                 if isinstance(_spent_map, dict) else int(_spent_map or 0))
         catalog = c.root.tasks.catalog()
         tool_total = len(catalog)
         # TODO(multi-session): 加 tenant/user label，当前仅全局 session_id
@@ -585,6 +673,18 @@ async def _serve(args: argparse.Namespace) -> int:
         for owner, n in sorted(owners.items()):
             if owner:
                 lines.append(f'agent_tools_by_owner{{owner="{owner}"}} {n}')
+        # G2（S7）：per-session 预算明细——**默认关闭**（标签基数随会话数无界增长，
+        # 会撑爆 Prometheus）。开启方式二选一：环境变量 ``PRISM_METRICS_SESSION_LABELS=1``
+        # 或配置 ``agent.metrics.session_labels=true``。
+        if _metrics_session_labels() and isinstance(_spent_map, dict):
+            lines += [
+                "# HELP agent_budget_spent_by_session 各会话已用 token（默认关：基数受限）",
+                "# TYPE agent_budget_spent_by_session gauge",
+            ]
+            for _sk, _v in sorted(_spent_map.items()):
+                lines.append(
+                    f'agent_budget_spent_by_session{{session="{_prom_label(_sk)}"}} '
+                    f"{int(_v or 0)}")
         return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
     @app.post("/api/chat")
@@ -780,8 +880,8 @@ async def _serve(args: argparse.Namespace) -> int:
                 "session_id": ident.session_key,
                 # 2.2：回显身份（tenant/user 服务端配置决定，便于前端确认自己落在哪个桶）
                 "tenant": ident.tenant, "user": ident.user, "session": ident.session,
-                "budget": {"spent": c.root.state.get(StateKeys.BUDGET_SPENT, 0),
-                           "max": budget_cfg.get("max_tokens_per_run", 0)}}
+                # G2：预算按会话统计（状态栏显示「本会话已用/上限」；max 亦取会话覆盖值）
+                "budget": _budget_view(c.root, ident, budget_cfg)}
 
     @app.get("/api/events")
     async def _events() -> dict:
@@ -970,52 +1070,102 @@ async def _serve(args: argparse.Namespace) -> int:
 
     # ---- 设置：上下文管理（前端「设置」页；覆盖持久化 + 即时重建生效） ----
 
-    @app.get("/api/settings")
-    async def _settings() -> dict:
-        ctx_enabled = "plugins.context" in set(pm.enabled())
-        ov = _load_overrides()
-        values: dict = {}
+    def _setting_values(ov: dict) -> dict:
+        """把一份覆盖（``{plugins.X: {...}}``）解析成键值（缺项回落默认）。"""
+        out: dict = {}
         for k in _SETTING_SCHEMA:
             cur = (ov.get(_PLUGIN_OF_KEY.get(k, ""), {}) or {}).get(k, _SETTING_DEFAULTS[k])
             try:
-                values[k] = _coerce_setting(k, cur)
+                out[k] = _coerce_setting(k, cur)
             except (ValueError, TypeError):
-                values[k] = _SETTING_DEFAULTS[k]
+                out[k] = _SETTING_DEFAULTS[k]
+        return out
+
+    def _session_raw(sk: str) -> dict:
+        """本会话**显式**覆盖（仅用户确实写过的键）——「继承 vs 覆盖」据此区分。"""
+        raw = _store().session(sk)
+        out: dict = {}
+        for k in _SETTING_SCHEMA:
+            pid = _PLUGIN_OF_KEY.get(k, "")
+            if k in (raw.get(pid) or {}):
+                try:
+                    out[k] = _coerce_setting(k, raw[pid][k])
+                except (ValueError, TypeError):
+                    pass
+        return out
+
+    @app.get("/api/settings")
+    async def _settings(request: Request) -> dict:
+        ident = _identity(request)
+        sk = ident.session_key
+        ctx_enabled = "plugins.context" in set(pm.enabled())
+        # G2（S5-2）：三份视图——容器级生效值 / 本会话显式覆盖 / 二者合成的生效值。
+        # ``values`` 保持旧名 = effective（既有调用点与前端零改动）；新增三个字段供
+        # 设置页区分「容器级 / 本会话级」并渲染「重置为继承」。
+        values = _setting_values(_store().effective(sk))
         ap_enabled = "plugins.approval" in set(pm.enabled())
         return {"context_plugin_enabled": ctx_enabled,
                 "approval_enabled": ap_enabled, "values": values,
+                "session_id": sk,
+                "scopable": sorted(_SETTING_SCOPABLE),
+                "container": _setting_values(_store().container()),
+                "session": _session_raw(sk),
+                "effective": values,
                 # 域清单：设置页据此把 tool_domains 渲染为「可勾选」而非手填
                 "domains": _domain_options(c.root.tasks.catalog(),
                                            values.get("tool_domains"))}
 
     @app.post("/api/settings")
-    async def _settings_update(body: dict):
+    async def _settings_update(body: dict, request: Request):
         try:
+            # scope：``container``（默认，保持旧行为）| ``session``（G2 本会话级）。
+            scope = str((body or {}).get("scope") or "container").strip().lower()
+            if scope not in ("container", "session"):
+                return JSONResponse({"ok": False, "error": f"未知 scope: {scope}"},
+                                    status_code=400)
+            ident = _identity(request)
+            sk = ident.session_key
             if bool(body.get("reset")):
+                if scope == "session":
+                    # 只清本会话覆盖 ⇒ 逐键回落到容器/默认；**不重建容器**（下个请求自然生效）
+                    _store().clear_session(sk)
+                    return JSONResponse({"ok": True, "settings": await _settings(request)})
                 ov = _load_overrides()
                 for pid in ("plugins.context", "plugins.short_term", "plugins.approval",
                             "plugins.budget", "plugins.react"):
                     ov.pop(pid, None)
                 _save_overrides(ov)
                 await _apply_rebuild()
-                return JSONResponse({"ok": True, "settings": await _settings()})
+                return JSONResponse({"ok": True, "settings": await _settings(request)})
             patch = body.get("patch") or {}
             if not isinstance(patch, dict) or not patch:
                 return JSONResponse({"ok": False, "error": "patch 为空"}, status_code=400)
+            if scope == "session":
+                bad = sorted(k for k in patch if k not in _SETTING_SCOPABLE)
+                if bad:
+                    return JSONResponse(
+                        {"ok": False,
+                         "error": f"以下设置不支持会话级（仅容器级）: {', '.join(bad)}"},
+                        status_code=400)
             buckets: dict[str, dict] = {}
             for k, v in patch.items():
                 if k not in _SETTING_SCHEMA:
                     return JSONResponse({"ok": False, "error": f"未知设置项: {k}"}, status_code=400)
                 coerced = _coerce_setting(k, v)
                 buckets.setdefault(_PLUGIN_OF_KEY[k], {})[k] = coerced
-            ov = _load_overrides()
-            for pid, b in buckets.items():
-                cur = dict(ov.get(pid, {}))
-                cur.update(b)
-                ov[pid] = cur
-            _save_overrides(ov)
-            await _apply_rebuild()
-            return JSONResponse({"ok": True, "settings": await _settings()})
+            if scope == "session":
+                # 会话级写入**不触发 _apply_rebuild**：门面/预算/压缩阈值都在请求时现取
+                # 会话配置视图 ⇒ 下个请求自然生效（这也是「永不 rebuild」的收益）。
+                _store().patch_session(sk, buckets)
+            else:
+                ov = _load_overrides()
+                for pid, b in buckets.items():
+                    cur = dict(ov.get(pid, {}))
+                    cur.update(b)
+                    ov[pid] = cur
+                _save_overrides(ov)
+                await _apply_rebuild()
+            return JSONResponse({"ok": True, "settings": await _settings(request)})
         except (ValueError, TypeError) as exc:
             return JSONResponse({"ok": False, "error": f"参数错误: {exc}"}, status_code=400)
 

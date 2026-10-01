@@ -41,9 +41,11 @@ def test_concurrent_callers_each_reconcile_own_est(tmp_path):
         ests = sorted(r["est_cost"] for r in rows)
         assert ests[0] < ests[1], "两条预借 est 应随消息长度区分（证明未被覆盖）"
         total_actual = sum(r["tokens_in"] + r["tokens_out"] for r in rows)
-        spent = c.root.state.get("budget_spent", 0)
+        # G2：budget_spent 已按会话分桶（本用例无身份 ⇒ 全部落在 "" 桶）
+        spent = sum((c.root.state.get("budget_spent") or {}).values())
         assert spent == total_actual, f"对账后总账应精确：spent={spent} vs Σ实际={total_actual}"
-        assert not c.root.state.get("budget_pending_est"), "两个槽位都应消账"
+        assert not ((c.root.state.get("budget_pending_est") or {}).get("") or {}), \
+            "本会话的两个 caller 槽位都应消账"
         await c.teardown()
 
     _run(s())
@@ -73,12 +75,13 @@ def test_failed_call_refunds_only_own_slot(tmp_path):
                                   caller="ok_caller")
         for _ in range(5):
             await asyncio.sleep(0)
-        spent_mid = c.root.state.get("budget_spent", 0)
+        spent_mid = sum((c.root.state.get("budget_spent") or {}).values())
         with pytest.raises(RuntimeError):      # S1 契约：失败原样上抛（先发 call-failed 退款）
             await c.root.llm.complete(c.root, [{"role": "user", "content": "FAIL please"}],
                                       caller="fail_caller")
-        assert c.root.state.get("budget_spent") == spent_mid, "失败退款应恰好回滚到失败前账面"
-        pending = c.root.state.get("budget_pending_est") or {}
+        assert sum((c.root.state.get("budget_spent") or {}).values()) == spent_mid, \
+            "失败退款应恰好回滚到失败前账面"
+        pending = (c.root.state.get("budget_pending_est") or {}).get("") or {}
         assert not pending, f"两个槽位都应已消账: {pending}"
         await c.teardown()
 

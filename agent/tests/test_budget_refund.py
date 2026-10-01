@@ -24,12 +24,14 @@ def test_failed_call_refunds_pre_debit_and_audits(tmp_path):
 
     async def s():
         await c.assemble()
-        spent0 = c.root.state.get("budget_spent", 0)
+        spent0 = sum((c.root.state.get("budget_spent") or {}).values())
         with pytest.raises(CapabilityNotImplemented):
             await c.root.llm.complete(
                 c.root, [{"role": "user", "content": "你好" * 50}], caller="t")
-        assert c.root.state.get("budget_spent") == spent0, "失败调用应全额退还预借"
-        assert not c.root.state.get("budget_pending_est"), "pending est 分槽应清空"
+        assert sum((c.root.state.get("budget_spent") or {}).values()) == spent0, \
+            "失败调用应全额退还预借"
+        assert not ((c.root.state.get("budget_pending_est") or {}).get("") or {}), \
+            "pending est 分槽应清空"
         rows = await c.root.db.query(
             c.root, "SELECT event FROM agent_events WHERE event='agent/llm/call-failed'")
         assert rows, "失败应落 durable 审计"
@@ -48,11 +50,11 @@ def test_successful_call_reconciles_to_actual(tmp_path):
         await c.root.llm.complete(c.root, messages, caller="t")
         for _ in range(5):                     # _post 为 async 监听器（fire-and-forget），让其对账任务落地
             await asyncio.sleep(0)
-        spent = c.root.state.get("budget_spent", 0)
+        spent = sum((c.root.state.get("budget_spent") or {}).values())
         # 实际入账 = tokens_in(messages) + tokens_out(响应)；预借多出的部分已回冲
         actual = estimate_tokens(messages) + estimate_tokens({"text": "（fixture 默认响应）"})
         assert spent == actual, f"对账后 spent 应等于实际入账 {actual}，得到 {spent}"
-        assert not c.root.state.get("budget_pending_est")
+        assert not ((c.root.state.get("budget_pending_est") or {}).get("") or {})
         rows = await c.root.db.query(
             c.root, "SELECT est_cost FROM agent_budget_log")
         assert rows and rows[-1]["est_cost"] is not None, "est_cost 应落值"
