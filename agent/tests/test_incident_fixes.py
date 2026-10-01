@@ -566,6 +566,22 @@ def test_react_checkpoints_full_act_arguments(tmp_path):
         async def finish(self, tid):
             pass
 
+        # 阶段 2（2.1）：快照接口契约对齐（spy 直接 provide 绕过门面 → 须齐全）
+        async def snapshot_save(self, tenant, task_id, data, ttl=None):
+            self.checkpoints.append((task_id, "snapshot", data))
+
+        async def snapshot_load(self, tenant, task_id):
+            return None
+
+        async def snapshot_list(self, tenant):
+            return []
+
+        async def snapshot_mark_finished(self, tenant, task_id):
+            pass
+
+        async def snapshot_flag_finished(self, tenant, task_id):
+            pass
+
     c = _build(tmp_path, context=True, patch={"agent": {"react": {"max_steps": 1}}})
 
     async def s():

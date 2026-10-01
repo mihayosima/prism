@@ -51,9 +51,18 @@ class WorkMemory:
         cfg = ((ctx.config or {}).get("agent") or {}).get("work_memory") or {}
         ttl = int(cfg.get("ttl", 3600))
         prefix = cfg.get("prefix", "wm:")
+        snapshot_ttl = int(cfg.get("snapshot_ttl_s", 86400))
+        # 阶段 2（D10）：required=True → Redis 是**硬依赖**，不可用即**启动失败**（装配期 raise，
+        # 容器 fail-fast，见 core/container.py:280-287 apply 异常向上传播）；
+        # False（默认，保 dev 兼容）→ 不可用则降级 InMemory + 启动 WARNING。
+        required = bool(cfg.get("required", False))
         if not cfg.get("enabled", True):
+            if required:
+                raise RuntimeError(
+                    "work_memory: required=True 但 enabled=False —— 配置矛盾：required 须启用 Redis 后端")
             logger.info("work_memory: disabled by config, in-memory fallback")
-            self._impl = InMemoryWorkMemory(ttl=ttl, prefix=prefix)
+            self._impl = InMemoryWorkMemory(ttl=ttl, prefix=prefix,
+                                            snapshot_ttl=snapshot_ttl)
             ctx.provide(Services.WORK_MEMORY, self)
             return
         try:
@@ -61,11 +70,18 @@ class WorkMemory:
             url = cfg.get("url", "redis://localhost:6379/0")
             client = aioredis.from_url(url, decode_responses=True, socket_connect_timeout=2)
             await client.ping()
-            self._impl = RedisWorkMemory(client, ttl=ttl, prefix=prefix)
+            self._impl = RedisWorkMemory(client, ttl=ttl, prefix=prefix,
+                                         snapshot_ttl=snapshot_ttl)
             logger.info("work_memory: redis backend active (%s)", url)
-        except Exception as exc:                             # 任何失败 → 降级内存版
-            logger.warning("work_memory: redis unavailable (%s), degrade to in-memory", exc)
-            self._impl = InMemoryWorkMemory(ttl=ttl, prefix=prefix)
+        except Exception as exc:                             # 任何失败 → 视 required 而定
+            if required:
+                logger.error("work_memory: required=True 但 redis 不可用（%s）—— 启动失败", exc)
+                raise RuntimeError(
+                    f"work_memory: required=True but redis unavailable: {exc}") from exc
+            logger.warning("work_memory: redis unavailable (%s), degrade to in-memory"
+                           " —— 自动续接在降级下不保证，生产请置 required=True", exc)
+            self._impl = InMemoryWorkMemory(ttl=ttl, prefix=prefix,
+                                            snapshot_ttl=snapshot_ttl)
         ctx.provide(Services.WORK_MEMORY, self)
 
     # ---- 委托（吞异常，主链路不崩） ----
@@ -110,6 +126,54 @@ class WorkMemory:
         except Exception as exc:
             logger.warning("work_memory.list_active failed: %s", exc)
             return []
+
+    # ---- 跨进程 run 快照（阶段 2）----
+    # 纪律：save/load/list 走"吞异常仅告警"（同工作记忆主链路——快照失败绝不拖累 run）；
+    #      mark_finished **例外**（D16）——"收尾置位失败会被误判为崩溃"，故单独走重试+确认键路径。
+
+    async def snapshot_save(self, tenant: str, task_id: str, data: dict,
+                            ttl: int | None = None) -> None:
+        try:
+            if self._impl:
+                await self._impl.snapshot_save(tenant, task_id, data, ttl)
+        except Exception as exc:                             # noqa: BLE001
+            logger.warning("work_memory.snapshot_save failed: %s", exc)
+
+    async def snapshot_load(self, tenant: str, task_id: str) -> dict | None:
+        try:
+            return await self._impl.snapshot_load(tenant, task_id) if self._impl else None
+        except Exception as exc:                             # noqa: BLE001
+            logger.warning("work_memory.snapshot_load failed: %s", exc)
+            return None
+
+    async def snapshot_list(self, tenant: str) -> list[dict]:
+        try:
+            return await self._impl.snapshot_list(tenant) if self._impl else []
+        except Exception as exc:                             # noqa: BLE001
+            logger.warning("work_memory.snapshot_list failed: %s", exc)
+            return []
+
+    async def snapshot_mark_finished(self, tenant: str, task_id: str) -> None:
+        """D16：**不走**吞异常路径。
+
+        收尾置位失败会导致下次启动误判为"崩溃残留"→ 错误自动续接，故：置位 → 失败重试一次
+        → 仍失败则 ERROR + 写独立确认键 ``run_snapshot_finished:*``（短 TTL）兜底防误判。
+        """
+        if not self._impl:
+            return
+        try:
+            await self._impl.snapshot_mark_finished(tenant, task_id)
+            return
+        except Exception as exc:                             # noqa: BLE001
+            logger.warning("work_memory.snapshot_mark_finished failed, retrying: %s", exc)
+        try:
+            await self._impl.snapshot_mark_finished(tenant, task_id)
+        except Exception as exc:                             # noqa: BLE001
+            logger.error("work_memory.snapshot_mark_finished failed twice: %s", exc)
+            try:
+                await self._impl.snapshot_flag_finished(tenant, task_id)
+            except Exception as exc2:                        # noqa: BLE001 —— 确认键亦失败：仅记录
+                logger.error("work_memory.snapshot_flag_finished failed: %s", exc2)
 
 
 __all__ = ["WorkMemory", "InMemoryWorkMemory", "RedisWorkMemory", "WorkMemoryLike"]

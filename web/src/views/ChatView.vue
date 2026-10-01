@@ -142,7 +142,11 @@ function handleFrame(ev: string, p: Record<string, unknown>): void {
     k.useSeg().addStep(p as { source?: string; data?: Record<string, unknown> })
   } else if (ev === sseFrameName('THINKING')) k.useSeg().appendThinking((d as { text?: string }).text || '')
   else if (ev === sseFrameName('TOKEN')) k.useSeg().appendToken((d as { text?: string }).text || '')
-  else if (ev === sseFrameName('FINAL')) k.useSeg().finish((p.text as string) || '', (p.evidence as never) || null)
+  else if (ev === sseFrameName('FINAL')) {
+    k.useSeg().finish((p.text as string) || '', (p.evidence as never) || null)
+    // 阶段 2（D9）：自动续接等可见提示（如有）——来自后端 final payload.notice
+    if (p.notice) addUserNote(String(p.notice))
+  }
   else if (ev === sseFrameName('CANCELLED')) {
     /* 由 useSeg 收尾 */
   } else if (ev === sseFrameName('APPROVAL')) {

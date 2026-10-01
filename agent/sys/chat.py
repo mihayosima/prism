@@ -157,6 +157,19 @@ def is_resume_intent(ctx, message: str) -> bool:
     return any(str(k).lower() in text for k in kws)
 
 
+# ---- 阶段 2（2.1）：崩溃自动续接探测辅助 ----------------------------------------
+# tenant 暂固定 "default"（2.2 多会话扩为 {tenant}；与 plugins.react.loop._SNAPSHOT_TENANT 对齐）。
+_SNAPSHOT_TENANT = "default"
+
+
+async def _set_snapshot_status(wm, task_id: str, status: str) -> None:
+    """改写快照状态（读-改-写单 key；原子性由后端单 key 保证）。"""
+    snap = await wm.snapshot_load(_SNAPSHOT_TENANT, task_id)
+    if snap:
+        snap["status"] = status
+        await wm.snapshot_save(_SNAPSHOT_TENANT, task_id, snap)
+
+
 @dataclass(slots=True)
 class ChatReply:
     text: str                       # 解说 markdown
@@ -167,6 +180,7 @@ class ChatReply:
     ok: bool                        # 执行是否成功
     error: str | None = None
     session_id: str = "default"     # 会话（短期记忆单元）
+    notice: str | None = None       # 阶段 2（D9）：自动续接等可见提示（前端可选展示）
 
 
 class ChatDriver:
@@ -226,17 +240,61 @@ class ChatDriver:
 
     # ---------- 多步循环（plugins.react 委托路径） ----------
 
+    async def _probe_resume(self, ctx, message: str,
+                            is_continue: bool) -> tuple[dict | None, str | None]:
+        """阶段 2（2.1/D6/D8/D9/D15）：崩溃自动续接探测 + 意图分流（落点在 plan 花钱之前）。
+
+        返回 ``(resume_state, notice)``：
+        - 命中未完成快照（status=="running"）且本条为「继续」意图 → 续接**最新 1 个**（其余标
+          orphaned，D8），返回其快照（优先于 react_chain，D15）+ 可见提示；
+        - 命中但本条为「新任务」意图 → **不**自动续接（旧 run 全标 orphaned），处理新消息（D9，
+          避免"我要查天气却在写代码"）；
+        - 无未完成快照 → ``(None, None)``（走原有 react_chain「继续」/全新 run 逻辑）。
+        """
+        if not ctx.has(Services.WORK_MEMORY):
+            return None, None
+        wm = ctx.get(Services.WORK_MEMORY)
+        try:
+            pending = [s for s in await wm.snapshot_list(_SNAPSHOT_TENANT)
+                       if s.get("status") == "running"]
+        except Exception:                                    # noqa: BLE001 —— 探测失败不阻断主链路
+            return None, None
+        if not pending:
+            return None, None
+        if is_continue:
+            latest = pending[0]                              # snapshot_list 已按 ts 倒序
+            state = await wm.snapshot_load(_SNAPSHOT_TENANT, latest["task_id"])
+            # 被续接者标 ``resumed``（**关键：否则旧快照仍 running，下次探测会重复续接**）；
+            # 其余未完成标 orphaned（D8）。
+            await _set_snapshot_status(wm, latest["task_id"], "resumed")
+            for s in pending[1:]:
+                await _set_snapshot_status(wm, s["task_id"], "orphaned")
+            if state:
+                logging.getLogger("agent.chat").info(
+                    "chat: auto-resume unfinished run %s", latest["task_id"])
+                return state, "检测到上一次任务未完成，正在继续……"
+            return None, None
+        # 新任务意图：不吞掉新语义，旧 run 全部 orphaned（D9）
+        for s in pending:
+            await _set_snapshot_status(wm, s["task_id"], "orphaned")
+        return None, None
+
     async def _send_via_react(self, ctx, message: str, session_id: str,
                               prior: list[dict]) -> ChatReply:
         """把本轮交给 ReAct 循环（多步 Think→Act+Observe），再按同一纪律收尾。
 
         与单步路径保持同一外部纪律：写短期记忆（user/assistant）、写 durable
         ``agent/chat/done``、喂 ``ctx.memory``（若启用）、返回 ``ChatReply``。
+
+        阶段 2（2.1/D6）：进入 react 循环（plan 花钱）**之前**先探测未完成 run 快照并按意图分流。
         """
+        is_continue = is_resume_intent(ctx, message)
+        resume_state, notice = await self._probe_resume(ctx, message, is_continue)
         try:
-            res: ReactResultLike = await ctx.react.run(ctx, message, session_id=session_id,
-                                                       prior=prior,
-                                                       resume=is_resume_intent(ctx, message))
+            res: ReactResultLike = await ctx.react.run(
+                ctx, message, session_id=session_id, prior=prior,
+                resume=(is_continue or resume_state is not None),
+                resume_state=resume_state)
         except asyncio.CancelledError:
             # 取消既非成功也非失败：如实落审计后**原样抛出**（不吞，保持取消语义）
             try:
@@ -271,7 +329,8 @@ class ChatDriver:
             asyncio.create_task(self._safe_compress(ctx, session_id))
         return ChatReply(text=text, plan={"intent": "react"}, evidence=res.as_evidence(),
                          tokens_in=res.tokens_in, tokens_out=res.tokens_out, ok=res.ok,
-                         error=None if res.ok else res.reason, session_id=session_id)
+                         error=None if res.ok else res.reason, session_id=session_id,
+                         notice=notice)
 
     # ---------- 短期记忆：会话转写（session-scoped 历史） ----------
     #

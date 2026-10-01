@@ -96,6 +96,8 @@ export interface TextDeltaPayload {
 export interface FinalPayload {
   text?: string
   evidence?: Evidence
+  /** 阶段 2（D9）：自动续接等可见提示（可选展示） */
+  notice?: string
 }
 
 /** `error` 帧 payload */

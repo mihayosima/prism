@@ -558,6 +558,7 @@ async def _serve(args: argparse.Namespace) -> int:
             reply = await c.root.chat.send(c.root, str(body.get("message") or ""),
                                            session_id=session_id)
             return JSONResponse({"text": reply.text, "ok": reply.ok, "error": reply.error,
+                                 "notice": reply.notice,
                                  "evidence": {"plan": reply.plan, "evidence": reply.evidence,
                                               "tokens_in": reply.tokens_in,
                                               "tokens_out": reply.tokens_out}})
@@ -580,6 +581,7 @@ async def _serve(args: argparse.Namespace) -> int:
                 reply = await c.root.chat.send(c.root, message, session_id=session_id)
                 await q.put({"event": "final", "payload": {
                     "text": reply.text, "ok": reply.ok, "error": reply.error,
+                    "notice": reply.notice,
                     "evidence": {"plan": reply.plan, "evidence": reply.evidence,
                                  "tokens_in": reply.tokens_in, "tokens_out": reply.tokens_out}}})
             except asyncio.CancelledError:

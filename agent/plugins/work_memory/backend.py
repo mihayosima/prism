@@ -38,6 +38,24 @@ def _initial_data(meta: dict, ttl: int) -> dict:
     }
 
 
+# ---- 跨进程 run 快照键空间（阶段 2 / D1：与 wm: 完全独立）------------------------
+# 纪律：``finish`` 只删 ``wm:{task_id}``，**绝不**触及 ``run_snapshot:`` 前缀。三种键独立：
+#   wm:{task_id}                             —— run 期间；finish 删；供运行内 wm_read 渐进披露。
+#   run_snapshot:{tenant}:{task_id}          —— 每轮写；长 TTL；跨进程恢复依据；finish 不碰。
+#   run_snapshot_finished:{tenant}:{task_id} —— mark_finished 失败兜底确认键（短 TTL，防误判崩溃）。
+_SNAP_PREFIX = "run_snapshot:"
+_SNAP_FLAG_PREFIX = "run_snapshot_finished:"
+_SNAP_FLAG_TTL = 300
+
+
+def _snap_key(tenant: str, task_id: str) -> str:
+    return f"{_SNAP_PREFIX}{tenant or 'default'}:{task_id}"
+
+
+def _snap_flag_key(tenant: str, task_id: str) -> str:
+    return f"{_SNAP_FLAG_PREFIX}{tenant or 'default'}:{task_id}"
+
+
 class WorkMemoryLike(Protocol):
     """工作记忆接缝契约（消费方依此调用，可注入替换）。"""
 
@@ -47,6 +65,13 @@ class WorkMemoryLike(Protocol):
     async def get(self, task_id: str) -> dict | None: ...
     async def finish(self, task_id: str) -> None: ...
     async def list_active(self, session_id: str | None = None) -> list[str]: ...
+    # ---- 跨进程 run 快照（阶段 2；键 run_snapshot:{tenant}:{task_id}，与 wm: 独立）----
+    async def snapshot_save(self, tenant: str, task_id: str, data: dict,
+                            ttl: int | None = None) -> None: ...
+    async def snapshot_load(self, tenant: str, task_id: str) -> dict | None: ...
+    async def snapshot_list(self, tenant: str) -> list[dict]: ...
+    async def snapshot_mark_finished(self, tenant: str, task_id: str) -> None: ...
+    async def snapshot_flag_finished(self, tenant: str, task_id: str) -> None: ...
 
 
 class InMemoryWorkMemory:
@@ -55,10 +80,14 @@ class InMemoryWorkMemory:
     仅在单进程、无 Redis 时生效；跨进程 / 重启后失效（与 Redis 语义一致，只是不跨进程）。
     """
 
-    def __init__(self, ttl: int = 3600, prefix: str = "wm:"):
+    def __init__(self, ttl: int = 3600, prefix: str = "wm:",
+                 snapshot_ttl: int = 86400):
         self._ttl = ttl
         self._prefix = prefix
         self._store: dict[str, tuple[float, dict]] = {}   # key -> (expire_at, data)
+        self._snapshot_ttl = snapshot_ttl
+        # 快照键 -> (expire_at, json_str)：JSON 字符串存储，语义与 Redis 后端严格一致
+        self._snap: dict[str, tuple[float, str]] = {}
 
     def _k(self, task_id: str) -> str:
         return f"{self._prefix}{task_id}"
@@ -122,6 +151,61 @@ class InMemoryWorkMemory:
                 out.append(key[len(self._prefix):])
         return out
 
+    # ---- 跨进程 run 快照（阶段 2）----（JSON 字符串存储，与 Redis 后端语义一致）
+
+    async def snapshot_save(self, tenant: str, task_id: str, data: dict,
+                            ttl: int | None = None) -> None:
+        t = self._snapshot_ttl if ttl is None else ttl
+        self._snap[_snap_key(tenant, task_id)] = (
+            time.time() + t, json.dumps(data, ensure_ascii=False))
+
+    async def snapshot_load(self, tenant: str, task_id: str) -> dict | None:
+        key = _snap_key(tenant, task_id)
+        entry = self._snap.get(key)
+        if entry is None:
+            return None
+        exp, raw = entry
+        if exp < time.time():
+            self._snap.pop(key, None)
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:                       # noqa: BLE001 —— 坏数据视同缺失
+            return None
+
+    async def snapshot_list(self, tenant: str) -> list[dict]:
+        now = time.time()
+        pfx = f"{_SNAP_PREFIX}{tenant or 'default'}:"
+        out: list[dict] = []
+        for key, (exp, raw) in list(self._snap.items()):
+            if exp < now or not key.startswith(pfx):
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:                   # noqa: BLE001
+                continue
+            out.append({"task_id": key[len(pfx):],
+                        "status": data.get("status"), "ts": data.get("ts") or ""})
+        out.sort(key=lambda x: x.get("ts") or "", reverse=True)
+        return out
+
+    async def snapshot_mark_finished(self, tenant: str, task_id: str) -> None:
+        key = _snap_key(tenant, task_id)
+        entry = self._snap.get(key)
+        if entry is None:
+            return
+        exp, raw = entry
+        try:
+            data = json.loads(raw)
+        except Exception:                       # noqa: BLE001
+            return
+        data["status"] = "finished"
+        self._snap[key] = (exp, json.dumps(data, ensure_ascii=False))
+
+    async def snapshot_flag_finished(self, tenant: str, task_id: str) -> None:
+        self._snap[_snap_flag_key(tenant, task_id)] = (
+            time.time() + _SNAP_FLAG_TTL, "1")
+
 
 class RedisWorkMemory:
     """Redis 后端实现（duck-typed ``redis.asyncio`` 客户端）。
@@ -130,10 +214,12 @@ class RedisWorkMemory:
     所有可变字段以字符串存储；list/dict 经 json.dumps。
     """
 
-    def __init__(self, client, ttl: int = 3600, prefix: str = "wm:"):
+    def __init__(self, client, ttl: int = 3600, prefix: str = "wm:",
+                 snapshot_ttl: int = 86400):
         self._r = client
         self._ttl = ttl
         self._prefix = prefix
+        self._snapshot_ttl = snapshot_ttl
 
     def _k(self, task_id: str) -> str:
         return f"{self._prefix}{task_id}"
@@ -184,6 +270,8 @@ class RedisWorkMemory:
         return dict(raw) if raw else None
 
     async def finish(self, task_id: str) -> None:
+        # D1 锁死：只删工作记忆键 wm:{task_id}，**绝不**触及 run_snapshot: 前缀
+        # （跨进程快照的存活是断点续传前提；finish 只结束"运行内"工作记忆）。
         key = self._k(task_id)
         await self._r.delete(key)
         # 索引清理：遍历所有 idx 集合代价高，仅当能从 data 取 session_id 时精确 SREM
@@ -200,6 +288,57 @@ class RedisWorkMemory:
                 continue
             out.append(ks[len(self._prefix):])
         return out
+
+    # ---- 跨进程 run 快照（阶段 2）----
+
+    async def snapshot_save(self, tenant: str, task_id: str, data: dict,
+                            ttl: int | None = None) -> None:
+        t = self._snapshot_ttl if ttl is None else ttl
+        await self._r.set(_snap_key(tenant, task_id),
+                          json.dumps(data, ensure_ascii=False), ex=t)
+
+    async def snapshot_load(self, tenant: str, task_id: str) -> dict | None:
+        raw = await self._r.get(_snap_key(tenant, task_id))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:                       # noqa: BLE001
+            return None
+
+    async def snapshot_list(self, tenant: str) -> list[dict]:
+        pfx = f"{_SNAP_PREFIX}{tenant or 'default'}:"
+        out: list[dict] = []
+        async for k in self._r.scan_iter(match=pfx + "*"):
+            ks = k if isinstance(k, str) else k.decode("utf-8")
+            raw = await self._r.get(ks)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:                   # noqa: BLE001
+                continue
+            out.append({"task_id": ks[len(pfx):],
+                        "status": data.get("status"), "ts": data.get("ts") or ""})
+        out.sort(key=lambda x: x.get("ts") or "", reverse=True)
+        return out
+
+    async def snapshot_mark_finished(self, tenant: str, task_id: str) -> None:
+        key = _snap_key(tenant, task_id)
+        raw = await self._r.get(key)
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except Exception:                       # noqa: BLE001
+            return
+        data["status"] = "finished"
+        # 重设 TTL（收尾后快照寿命回归 snapshot_ttl；不用 keepttl 以规避 fakeredis 兼容性）
+        await self._r.set(key, json.dumps(data, ensure_ascii=False),
+                          ex=self._snapshot_ttl)
+
+    async def snapshot_flag_finished(self, tenant: str, task_id: str) -> None:
+        await self._r.set(_snap_flag_key(tenant, task_id), "1", ex=_SNAP_FLAG_TTL)
 
 
 __all__ = ["WorkMemoryLike", "InMemoryWorkMemory", "RedisWorkMemory"]

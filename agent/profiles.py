@@ -70,6 +70,16 @@ BASE_AGENT_CONFIG: dict = {
         "approval": {"provider": "web", "allow": ["*"], "deny": [], "ask": [],
                       "timeout_s": 30, "default": "deny"},
         "loop": {"deadline_s": 60},
+        # 阶段 2（2.0）：工作记忆持久化 + 跨进程 run 快照。agent.work_memory 为 _any（免 schema），
+        # 但默认值须有单一真相源，故显式收口于此（原为插件内 hardcode 默认）。
+        # - enabled/ttl/prefix：既有键（收口，不改语义）。
+        # - required：True 时 Redis 不可用 → **启动失败**（required 语义）；False（默认，保 dev 兼容）
+        #   → 降级 InMemory + 启动 WARNING。生产部署建议置 True。
+        # - snapshot_ttl_s：跨进程 run 快照（run_snapshot:{tenant}:{task_id}）TTL，2.3 回滚窗口上界。
+        # - snapshot_chain_keep：快照内 chain 保留「最近 N 轮 + 头部快照」，防单 key 膨胀（D19）。
+        "work_memory": {"enabled": True, "ttl": 3600, "prefix": "wm:",
+                        "required": False, "snapshot_ttl_s": 86400,
+                        "snapshot_chain_keep": 20},
     },
 }
 

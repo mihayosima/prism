@@ -385,7 +385,8 @@ class ReactLoop:
         return visible_tools(ctx)
 
     async def run(self, ctx, prompt: str, *, session_id: str = "default",
-                  prior: list[dict] | None = None, resume: bool = False) -> ReactResult:
+                  prior: list[dict] | None = None, resume: bool = False,
+                  resume_state: dict | None = None) -> ReactResult:
         cfg = self._cfg
         await durable(ctx, Events.REACT_START, {
             "prompt": (prompt or "")[:500], "session_id": session_id,
@@ -407,6 +408,9 @@ class ReactLoop:
         wm = ctx.get(Services.WORK_MEMORY)
         run_id = uuid.uuid4().hex
         task_id = f"{session_id}:{run_id}"
+        # 阶段 2（2.1/D19）：跨进程 run 快照保留最近 N 条 chain；tenant 暂固定 default（2.2 扩展）
+        _wm_cfg = ((ctx.config or {}).get("agent") or {}).get("work_memory") or {}
+        snap_keep = int(_wm_cfg.get("snapshot_chain_keep", 20))
         # F2：账单归组键（尽力而为——budget 的 pre-call 读此键落 agent_budget_log.run_id）
         ctx.state[StateKeys.REACT_RUN_ID] = run_id
         if wm is not None:
@@ -421,12 +425,18 @@ class ReactLoop:
         # G2.0（P0/F-1）：同时取回**头部快照**并整体冻结 —— 使续接请求的首个差异点
         # 落在链尾（追加）而非头部（改写），上一轮请求由此成为本轮请求的真前缀。
         resumed = False
-        if resume and wm is not None:
+        if (resume or resume_state) and wm is not None:
             try:
-                arc = await wm.get(f"react_chain:{session_id}")
-                cps = json.loads((arc or {}).get("checkpoints") or "[]")
-                data = next((c.get("data") or {} for c in reversed(cps)
-                             if c.get("name") == "chain"), {})
+                if resume_state:
+                    # 阶段 2（2.1/D6/D15）：崩溃自动续接——快照（run_snapshot）由调用方
+                    # （sys/chat.py::_send_via_react 探测）直接传入，**优先于** react_chain。
+                    data = dict(resume_state)
+                else:
+                    # 显式「继续」：读 run 收尾归档 react_chain:{session}（现有语义不变）
+                    arc = await wm.get(f"react_chain:{session_id}")
+                    cps = json.loads((arc or {}).get("checkpoints") or "[]")
+                    data = next((c.get("data") or {} for c in reversed(cps)
+                                 if c.get("name") == "chain"), {})
                 archived = [dict(m) for m in (data.get("chain") or [])
                             if isinstance(m, dict)]
                 if archived:
@@ -565,6 +575,9 @@ class ReactLoop:
                                           tokens_in, tokens_out)
                 await self._emit_waterline(ctx, int(win.get("total_used", 0)))
                 if wm is not None:
+                    # 阶段 2（2.1/D1/D16）：收尾置完成标记（不删快照——供「已完成」查询/审计）。
+                    # 与 wm.finish（删工作记忆键）是两条独立路径。
+                    await _snapshot_call(wm, "snapshot_mark_finished", _SNAPSHOT_TENANT, task_id)
                     await wm.finish(task_id)
                 ctx.state[StateKeys.REACT_RUN_ID] = ""
                 return ReactResult(ok=True, text=out.text or "（未给出回答）", steps=steps,
@@ -621,6 +634,15 @@ class ReactLoop:
                                     {"tool_trace": list(tool_trace[-10:]),
                                      "last_action": last, "note": "step completed",
                                      "act_calls": [c.as_dict() for c in out.tool_calls]})
+                # 阶段 2（2.1/D2/D3/D19）：跨进程 run 快照——**只在完整一轮（Observe）之后**写，
+                # 记录已完成轮的 chain（截断最近 N 条）+ 头部快照；崩溃可从最近完整轮恢复。
+                # 单 key 单 JSON（D3，原子）；不随 wm.finish 删除（D1）。经 _snapshot_call 容错：
+                # 旧/裸 wm 实现无该方法 → 跳过（快照是可选增强能力），不拖累 run。
+                await _snapshot_call(wm, "snapshot_save", _SNAPSHOT_TENANT, task_id, {
+                    "chain": _snapshot_chain(task.chain, snap_keep),
+                    "head": dict(task.head) if task.head else None,
+                    "step": steps, "budget_used": int(win.get("total_used", 0)),
+                    "status": "running", "retry_count": 0, "ts": now_iso()})
             if stop_reason:
                 reason = stop_reason
                 break
@@ -653,6 +675,8 @@ class ReactLoop:
         await self._archive_chain(ctx, wm, session_id, task, steps, tokens_in, tokens_out)
         await self._emit_waterline(ctx, int(win.get("total_used", 0)))
         if wm is not None:
+            # 阶段 2（2.1/D1/D16）：触顶收尾同样置完成标记（不删快照）
+            await _snapshot_call(wm, "snapshot_mark_finished", _SNAPSHOT_TENANT, task_id)
             await wm.finish(task_id)
         ctx.state[StateKeys.REACT_RUN_ID] = ""
         return ReactResult(ok=not hard, text=text, steps=steps, tokens_in=tokens_in,
@@ -1220,6 +1244,32 @@ class ReactLoop:
                                                "at": now_iso()}
         except Exception:                                # noqa: BLE001 —— 诊断不阻断主链路
             pass
+
+
+# ---- 阶段 2（2.1）：跨进程 run 快照辅助 -----------------------------------------
+# tenant 暂固定 "default"（2.2 多会话扩为 {tenant}；键结构 run_snapshot:{tenant}:{task_id} 不变）。
+_SNAPSHOT_TENANT = "default"
+
+
+def _snapshot_chain(chain: list[dict], keep: int) -> list[dict]:
+    """D19：快照内 chain 只保留**最近 keep 条**（防单 key 膨胀）。
+
+    头部上下文由快照的 ``head`` 字段单独保存，续接时二者合并恢复；中间老条可截（取舍见方案 §3 D19）。
+    """
+    if keep <= 0 or len(chain) <= keep:
+        return [dict(m) for m in chain]
+    return [dict(m) for m in chain[-keep:]]
+
+
+async def _snapshot_call(wm, method: str, *args) -> None:
+    """容错调用 ``wm`` 的快照方法（阶段 2）。
+
+    wm 可能是**不支持快照的旧/裸实现**（无该方法）→ 跳过，不拖累 run（快照是可选增强能力）；
+    生产门面 ``WorkMemory`` 自带"吞异常仅告警"，故此处仅做方法存在性守卫，不重复 try/except。
+    """
+    fn = getattr(wm, method, None)
+    if fn is not None:
+        await fn(*args)
 
 
 __all__ = ["ReactConfig", "ReactResult", "ReactLoop", "TaskContext", "visible_tools"]

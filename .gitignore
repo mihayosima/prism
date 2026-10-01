@@ -5,6 +5,9 @@ data/
 *.db
 *.tmp
 .pytest_cache/
+# 仓库内 pytest basetemp（避开 %TEMP% 下的安全删除守卫，见 skill/文档）
+agent/tests/.pt/
+agent/tests/.pytest-tmp*/
 agent_runtime.egg-info/
 .playwright-mcp/
 
