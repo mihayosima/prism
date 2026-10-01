@@ -14,9 +14,9 @@ S4 加固（死亡可见 + 归因唯一 + 不泄漏子孙进程）：
 - 子进程以**独立进程组**启动，退出时**杀整棵进程树**（Windows ``taskkill /T`` / POSIX
   ``killpg``）⇒ 不再残留 uvx→uv→python 这类孙进程（实测线上曾堆积 6 天）。
 
-S5 加固（宿主安全删除策略隔离）：
+S5 加固（宿主安全删除防护隔离）：
 - MCP 服务器是**独立第三方程序**，不应继承宿主（WorkBuddy CLI）注入到本进程树里的
-  文件操作策略。宿主通过 ``PYTHONPATH=<...>\\cli\\vendor\\shim`` 让每个 Python 子进程自动
+  文件操作防护。宿主通过 ``PYTHONPATH=<...>\\cli\\vendor\\shim`` 让每个 Python 子进程自动
   加载 ``sitecustomize.py``，其中 ``_check_bulk_delete_guard`` 在计数超阈值时会
   ``raise SystemExit(1)``；``SystemExit`` 是 BaseException，会顺着 anyio TaskGroup /
   ``stdio_server()`` 把**整个 MCP 服务器进程**打掉（实测：一次 ``delete_path`` 让
@@ -53,8 +53,8 @@ from typing import Any
 
 _MCP_VERSION = "2024-11-05"
 
-#: 宿主（WorkBuddy CLI）注入的「安全删除」策略变量。MCP 子进程是独立第三方程序，
-#: 不应继承宿主的文件操作策略；尤其批量删除守卫会 ``raise SystemExit(1)``，
+#: 宿主（WorkBuddy CLI）注入的「安全删除」防护变量。MCP 子进程是独立第三方程序，
+#: 不应继承宿主的文件操作防护；尤其批量删除守卫会 ``raise SystemExit(1)``，
 #: 顺着 asyncio 任务组把整个 MCP 服务器进程打死（详见模块 docstring 的 S5 段）。
 #: 只剥这 4 个：``_check_bulk_delete_guard`` 首个分支即 ``if not STATE_DIR or not
 #: TOOL_CALL_ID: return``，剥掉即短路守卫，而 PYTHONPATH 保留 ⇒ 回收站语义不丢。

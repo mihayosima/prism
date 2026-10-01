@@ -13,20 +13,14 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
-from agent.api import (AgentError, CapabilityNotImplemented, Events, Services, durable,
-                       now_iso, plugin)
+# LlmProvider 契约的单一定义在 core/contract.py，经 api 出口取用（此前本文件有一份
+# 字节级同构的副本，改契约时只改一处即静默漂移）。
+from agent.api import (AgentError, CapabilityNotImplemented, Events, LlmProvider,
+                       Services, durable, now_iso, plugin)
 from agent.api import estimate_tokens
-from agent.core.request_cost import wire_messages as _wire_messages, wire_tools as _wire_tools
-
-
-class LlmProvider(Protocol):
-    interface_version = (1, 0)
-
-    async def complete(self, ctx: Any, messages: list[dict],
-                       schema: dict | None = None,
-                       tools: list[dict] | None = None) -> dict: ...
+from agent.api import wire_messages as _wire_messages, wire_tools as _wire_tools
 
 
 @dataclass(slots=True)

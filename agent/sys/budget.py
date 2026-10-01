@@ -20,9 +20,8 @@
 
 from __future__ import annotations
 
-from agent.api import (Events, Services, StateKeys, cost_factor, durable, now_iso,
-                       plugin)
-from agent.core.request_cost import estimate_request_cost
+from agent.api import (Events, Services, StateKeys, cost_factor, durable,
+                       estimate_request_cost, now_iso, plugin)
 
 
 @plugin

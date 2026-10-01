@@ -25,7 +25,9 @@ from agent.core.errors import (
 from agent.core.events import EventBus
 from agent.core.events_catalog import Events, all_events, EVENT_MODE, REQUIRED_SUBSCRIBER_EVENTS
 from agent.core.mcp_client import McpStdioClient, build_task_schema
-from agent.core.request_cost import estimate_request_cost
+from agent.core.config_schema import coerce_config, validate_config
+from agent.core.request_cost import (estimate_request_cost, wire_messages,
+                                     wire_tools)
 from agent.core.services_catalog import ALL as SERVICE_KEYS, Services
 from agent.core.state_keys import StateKeys
 from agent.core.tokens import (clip_json, clip_text, clip_text_hard, estimate_tokens,
@@ -98,6 +100,12 @@ __all__ = [
     "clip_json",
     "clip_text_hard",
     "guard_source",
+    # 请求装配原语（实现位于 core/request_cost；供 sys 层经本出口取用）
+    "wire_messages",
+    "wire_tools",
+    # 配置归一/校验（实现位于 core/config_schema；装配根 profiles 经本出口取用）
+    "coerce_config",
+    "validate_config",
     # 提示词标记 SSOT（D4：离线 fixture 据此路由；`<!--` 字面量只许出现在本文件）
     "MARK_CHAT_PLAN",
     "MARK_CHAT_ANSWER",

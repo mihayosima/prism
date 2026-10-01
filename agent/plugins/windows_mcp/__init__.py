@@ -67,6 +67,8 @@ class WindowsMcp:
     version = "0.1.0"
     layer = "business"
     provides = [Services.WINDOWS_MCP]
+    # apply() 里 ctx.tasks.register(...)：声明内核服务依赖，装配顺序才可机器校验
+    inject = [Services.TASKS]
     description = "windows-mcp-server 工具桥（MCP stdio → agent tool_call）"
 
     def __init__(self):

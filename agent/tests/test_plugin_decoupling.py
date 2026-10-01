@@ -35,7 +35,9 @@ def _py_files() -> list[Path]:
             continue
         rel = fp.relative_to(AGENT)
         # run/ 纳入扫描（2026-09-26 审查 P1：run/chat.py 曾直连 agent_memories 漏检）
-        if rel.parts[0] not in ("core", "sys", "plugins", "run") and rel.name != "api.py":
+        # profiles.py 纳入扫描（2026-10-01 复核：装配根曾直连 core.config_schema 且完全不可见）
+        if (rel.parts[0] not in ("core", "sys", "plugins", "run")
+                and rel.name not in ("api.py", "profiles.py")):
             continue
         out.append(fp)
     return sorted(out)
@@ -49,7 +51,34 @@ def _layer(fp: Path) -> str:
         return "sys"
     if rel.parts[0] == "plugins":
         return f"plugins/{rel.parts[1]}"
-    return rel.parts[0]
+    if rel.name == "profiles.py":
+        # 装配根：唯一允许 import sys 插件清单（SYS_PLUGINS / BUSINESS_PLUGINS）的地方。
+        return "assembly"
+    return "run"
+
+
+def _package_parts(fp: Path) -> tuple[str, ...]:
+    """文件所在包的模块名分段（``__init__.py`` 自身即包），供相对导入反解。
+
+    ``agent/plugins/react/loop.py``      -> ("agent", "plugins", "react")
+    ``agent/plugins/react/__init__.py``  -> ("agent", "plugins", "react")
+    ``agent/api.py``                     -> ("agent",)
+    """
+    rel = fp.relative_to(AGENT.parent)
+    return tuple(rel.parts[:-1])
+
+
+def _resolve_relative(fp: Path, level: int, module: str | None) -> str | None:
+    """把 ``from ..X import Y`` 反解成绝对模块名（AST 不直接给）。
+
+    扫描器此前用 ``not n.level`` 把全部相对导入丢弃 ⇒ 插件写一句
+    ``from ..other import X`` 即可横向耦合且零告警。目录插件以包形式加载
+    （``agent_plugins.<pkg>`` 带 ``__path__``），这种写法语法上完全合法。
+    """
+    pkg = _package_parts(fp)
+    base = pkg[: len(pkg) - (level - 1)] if level - 1 <= len(pkg) else ()
+    parts = list(base) + (module.split(".") if module else [])
+    return ".".join(parts) or None
 
 
 def _imported_modules(fp: Path) -> list[str]:
@@ -61,8 +90,13 @@ def _imported_modules(fp: Path) -> list[str]:
     for n in ast.walk(tree):
         if isinstance(n, ast.Import):
             mods += [a.name for a in n.names]
-        elif isinstance(n, ast.ImportFrom) and not n.level and n.module:
-            mods.append(n.module)
+        elif isinstance(n, ast.ImportFrom):
+            if n.level:
+                resolved = _resolve_relative(fp, n.level, n.module)
+                if resolved:
+                    mods.append(resolved)
+            elif n.module:
+                mods.append(n.module)
     return mods
 
 
@@ -98,7 +132,53 @@ def test_layered_import_direction():
                 bad.append((str(fp.relative_to(AGENT)), m, "插件依赖 sys 实现"))
             if src.startswith("plugins/") and tgt == "core":
                 bad.append((str(fp.relative_to(AGENT)), m, "插件绕过 api 直连 core"))
+            if src == "sys" and tgt == "core" and fp.name not in SYS_TO_CORE_ALLOWED_FILES:
+                # 2026-10-01 复核补齐：此前只剩「插件 → core」一条，sys 层直连 core
+                # 无人看守（budget/chat/llm 三处即由此长期逃逸）。
+                bad.append((str(fp.relative_to(AGENT)), m, "系统层绕过 api 直连 core"))
+            if src in ("run", "assembly") and tgt == "core":
+                bad.append((str(fp.relative_to(AGENT)), m, "装配/传输层绕过 api 直连 core"))
+            if src in ("run", "assembly") and tgt.startswith("plugins/"):
+                bad.append((str(fp.relative_to(AGENT)), m, "装配/传输层依赖业务插件实现"))
+            # 注：run → sys 由 test_run_layer_sys_imports_are_declared 单独登记（有已知缺口），
+            #     assembly → sys 放行（装配清单本就要 import 插件类）。
     assert not bad, "分层依赖方向违规:\n" + "\n".join(f"  {f} -> {m}  ({why})" for f, m, why in bad)
+
+
+# ---------------------------------------------------------------------------
+# 1b) 传输层 → sys 的已知缺口登记（防静默扩张）
+# ---------------------------------------------------------------------------
+
+# sys → core 直连的**唯一豁免**：``agent/sys/audit.py`` 是 D4 把审计公共面迁到
+# ``core/audit`` 后留下的兼容 shim，它自身必须 import core 才能转发。
+# 该文件已无人 import（``test_decouple_guards.test_no_direct_sys_audit_imports`` 明令禁止），
+# 删掉它即可摘掉这条豁免 —— **不要往里加第二个名字**。
+SYS_TO_CORE_ALLOWED_FILES = {"audit.py"}
+
+# 传输层（run/）→ sys 的**已知缺口白名单**。两条都是 sys 实现、且无法经 api 导出
+# （api 受 K0 红线约束不得反向依赖 sys），故维持直连 —— 但登记在案：
+# 新增任何其它 sys 直连都必须先评审再补进本表，不允许静默扩张。
+#   - agent.sys.progress      ：传输桥接（tap_progress）。只依赖 agent.api（Events + ctx.scope），
+#                               本质是内核原语的封装，但实现位于 sys 层。
+#   - agent.sys.plugin_manager：插件启停/装卸管理（HTTP「插件」页端点）。操作对象就是
+#                               sys 层的管理器本身，无内核等价物。
+# 注：本白名单是在补上 run 层红线后才被清点出来的 —— 此前 run 层没有任何规则，
+#     这两处直连一直是隐形的（其中 plugin_manager 还是函数内延迟导入，行首 grep 会漏）。
+RUN_TO_SYS_ALLOWED = {"agent.sys.progress", "agent.sys.plugin_manager"}
+
+
+def test_run_layer_sys_imports_are_declared():
+    bad: list[tuple[str, str]] = []
+    for fp in _py_files():
+        if _layer(fp) != "run":
+            continue
+        for m in _imported_modules(fp):
+            if m.startswith("agent.sys.") and m not in RUN_TO_SYS_ALLOWED:
+                bad.append((str(fp.relative_to(AGENT)), m))
+    assert not bad, (
+        "传输层（run/）新增了未登记的 sys 直连 —— sys 实现不应经传输层绕过 api 取用；"
+        "若确属无法经 api 导出的缺口，请先评审再补进 RUN_TO_SYS_ALLOWED:\n"
+        + "\n".join(f"  {f} -> {m}" for f, m in bad))
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +265,7 @@ TABLE_OWNER = {
     "agent_memory_edges": "plugins/memory",
     "agent_entities": "plugins/memory",
     "agent_budget_log": "sys",   # owner = sys/budget（唯一写方；sys 层内互信，插件/run 不得直连）
+    "agent_migrations": "sys",   # 迁移登记表（MigrationRegistry 防脏武校验依赖；sys/storage 管）
 }
 # 内核审计脊柱：各层只读展示可接受（agent_events 落盘于库；agent_plugin_state 是
 # **JSON 文件**不是表、agent_runs 已废弃——二者不得出现在本清单，见存在性精确断言）。
@@ -245,3 +326,18 @@ def test_every_owned_table_exists_in_migrations():
     assert declared, "tables.py 未提取到任何建表语句（正则与 DDL 形状脱节）"
     for t in TABLE_OWNER:
         assert t in declared, f"{t} 未在 agent/tables.py 建表（幻影表名或拼写错误）"
+
+
+def test_every_migrated_table_has_declared_owner():
+    """反向断言：建表清单里的每张表都必须有归属声明。
+
+    只做「owner → 已建表」单向断言时，**新表漏登记 owner 是静默的** ——
+    归属守卫对未登记的表直接放行（``owner is None → continue``），
+    `agent_migrations` 就曾长期处于这种空转状态。
+    """
+    text = (AGENT / "tables.py").read_text(encoding="utf-8")
+    declared = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", text))
+    unowned = declared - set(TABLE_OWNER) - KERNEL_TABLES
+    assert not unowned, (
+        "建表清单中存在未登记归属的表（归属守卫对其空转，需补进 TABLE_OWNER 或 "
+        "KERNEL_TABLES）: " + ", ".join(sorted(unowned)))

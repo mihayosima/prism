@@ -29,11 +29,11 @@ from agent.api import (
     ReactResultLike,
     Services,
     durable,
+    estimate_request_cost,
     estimate_tokens,
     now_iso,
     plugin,
 )
-from agent.core.request_cost import estimate_request_cost
 
 PLAN_SYSTEM = (
     "你是通用 Agent 的任务规划器。根据用户输入只输出一个 JSON（不要解释，不要 markdown 围栏）：\n"

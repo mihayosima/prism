@@ -24,8 +24,16 @@ _SCAN_ROOTS = [
     AGENT / "profiles.py",
 ]
 
-_STATE_KEYS = {"budget_spent", "budget_pending_est", "react_last",
-               "permission_mode", "loop_running"}
+from agent.api import StateKeys
+
+# 由 StateKeys **反射生成**，不再手写常量清单。
+# 此前手写 5 个值、漏掉 budget_warning / llm_cost_ratio / react_run_id ——
+# 新增共享键时守卫会静默失效（写裸字面量不报错），这是最危险的失效模式。
+# 模板键（``{bridge}_tools`` / ``{bridge}_error``）含 ``{``，无法字面量比对，合理豁免。
+_STATE_KEYS = {
+    v for k, v in vars(StateKeys).items()
+    if not k.startswith("_") and isinstance(v, str) and "{" not in v
+}
 _STATE_KEYS_SSOT = AGENT / "core" / "state_keys.py"
 _MARKER_SSOT = AGENT / "api.py"
 

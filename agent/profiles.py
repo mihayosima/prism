@@ -18,8 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent.api import Container
-from agent.core.config_schema import validate_config, coerce_config
+from agent.api import Container, coerce_config, validate_config
 from agent.sys.budget import Budget
 from agent.sys.chat import Chat
 from agent.sys.events_plugin import EventsPlugin
