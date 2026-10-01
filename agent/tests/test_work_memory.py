@@ -180,8 +180,13 @@ def test_react_writes_and_clears_work_memory(tmp_path):
         assert "begin" in rec and "finish" in rec
         # 两步链路：每步一次 update + 一次 checkpoint
         assert rec.count("update") >= 1 and rec.count("checkpoint") >= 1
-        # 任务结束 → 内存 store 已清空
-        assert impl._store == {}
+        # 任务结束 → 任务自身运行态已清空；react_chain:{session} 归档键为续接保留（设计意图，非泄漏）
+        # 后端无关断言：底层 store 随 Redis/内存两种实现而异（Redis 版无 _store 属性，
+        # 且本机装了 redis 库后 _impl 即为 RedisWorkMemory），故经 WorkMemory 接缝的
+        # list_active() 取活跃键，仅允许 react_chain: 前缀，避免依赖具体后端字段。
+        active = await wm.list_active()
+        assert any(k.startswith("react_chain:") for k in active), "运行态未清空：无 react_chain 归档键"
+        assert all(k.startswith("react_chain:") for k in active), "不应混入非 react_chain 键（运行态泄漏）"
         await c.teardown()
 
     _run(s())

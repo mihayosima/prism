@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
+
 # LlmProvider 契约的单一定义在 core/contract.py，经 api 出口取用（此前本文件有一份
 # 字节级同构的副本，改契约时只改一处即静默漂移）。
 from agent.api import (AgentError, CapabilityNotImplemented, Events, LlmProvider,
-                       Services, durable, now_iso, plugin)
+                       LlmUnavailableError, Services, durable, now_iso, plugin)
 from agent.api import estimate_tokens
 from agent.api import wire_messages as _wire_messages, wire_tools as _wire_tools
 
@@ -215,11 +218,155 @@ class DeepSeekLlm:
             await self._client.aclose()
         self._client = None
 
+    # #3：可重试的 HTTP 状态（限流/网关 5xx/网络抖动视为瞬态；4xx 视为不可重试）。
+    _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+    def _backoff(self, attempt: int) -> float:
+        """指数退避 + 抖动（±50%），避免重试风暴对上游造成同步冲击。"""
+        base = self._retry_backoff_s * (2 ** attempt)
+        return base * (0.5 + random.random() * 0.5)
+
+    async def _post_with_retry(self, client, payload, headers):
+        """非流式封装：对可重试错误做指数退避重试；末次仍失败抛 LlmUnavailableError。
+
+        成功返回 200 的 resp；不可重试状态（400/401/403 等）立即抛 AgentError（维持旧语义）。
+        """
+        last_status = None
+        last_exc = None
+        for attempt in range(self._retry_max + 1):
+            try:
+                resp = await client.post(self.BASE_URL, json=payload, headers=headers)
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.TransportError) as exc:
+                last_exc = exc
+                if attempt < self._retry_max:
+                    await asyncio.sleep(self._backoff(attempt))
+                    continue
+                break
+            if resp.status_code == 200:
+                return resp
+            last_status = resp.status_code
+            if resp.status_code in self._RETRYABLE_STATUS:
+                if attempt < self._retry_max:
+                    await asyncio.sleep(self._backoff(attempt))
+                    continue
+                break  # 末次仍 5xx/429 → 退出循环，统一抛 LlmUnavailableError
+            raise AgentError(f"deepseek api 异常 {resp.status_code}: {resp.text[:200]}")
+        raise LlmUnavailableError(
+            f"llm 在 {self._retry_max} 次重试后仍不可用；last_status={last_status}；"
+            f"last_error={last_exc}"
+        )
+
+    async def _stream_with_retry(self, client, payload, headers, ctx, schema):
+        """流式重试编排：复用 _stream_once，仅对「首帧前」的瞬态失败重试。"""
+        last_status = None
+        last_exc = None
+        for attempt in range(self._retry_max + 1):
+            outcome = await self._stream_once(client, payload, headers, ctx, schema)
+            if outcome[0] == "ok":
+                return outcome[1]
+            if outcome[0] == "fail":
+                status, text = outcome[1], outcome[2]
+                raise AgentError(f"deepseek api 异常 {status}: {text}")
+            # outcome[0] == "retry"
+            last_status, last_exc = outcome[1], outcome[2]
+            if attempt < self._retry_max:
+                await asyncio.sleep(self._backoff(attempt))
+                continue
+            break
+        raise LlmUnavailableError(
+            f"llm 在 {self._retry_max} 次重试后仍不可用；last_status={last_status}；"
+            f"last_error={last_exc}"
+        )
+
+    async def _stream_once(self, client, payload, headers, ctx, schema):
+        """单次流式请求与聚合（含实时 token/thinking 帧发射）。
+
+        返回元组首元素：
+          "ok"    —— 成功，(content_acc, reasoning_acc, tool_acc, usage, finish)
+          "retry" —— 瞬态失败，(status|None, error_str)，调用方可重试
+          "fail"  —— 不可重试失败，(status, text)，调用方立即抛 AgentError
+        三档边界（v1.1 固化）：连接建立失败 / 首帧前断开 → 可重试；
+        首帧后断开 → 原样抛出（避免半截结果被当成完整响应）。
+        重试只发生在「首帧前」，故 token/thinking 帧仅在最终成功的那次发出，不会重复。
+        """
+        content_acc = ""
+        reasoning_acc = ""
+        tool_acc: dict[int, dict] = {}
+        usage: dict | None = None
+        finish: str | None = None
+        first_frame = False
+        try:
+            async with client.stream("POST", self.BASE_URL, json=payload, headers=headers) as resp:
+                if resp.status_code != 200:
+                    await resp.aread()                  # 流式下不能 resp.json()
+                    text = resp.text[:200]
+                    if resp.status_code in self._RETRYABLE_STATUS:
+                        return ("retry", resp.status_code, text)
+                    return ("fail", resp.status_code, text)
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    if not data:
+                        continue
+                    try:
+                        obj = json.loads(data)
+                    except (TypeError, ValueError):
+                        continue                            # 跳过非 JSON 行（注释/心跳）
+                    first_frame = True
+                    usage = obj.get("usage") or usage       # S6：usage 帧不含 choices，照单收下
+                    choice = (obj.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    # 文本片段：**累积永远执行**（schema 调用也要拿到完整 content 解析 JSON）；
+                    # 仅 token 帧受 schema 门控——schema 调用的中间散文不外发（D5 设计）。
+                    piece = delta.get("content") or ""
+                    if piece:
+                        content_acc += piece
+                        if schema is None:
+                            await ctx.events.emit(Events.LLM_TOKEN, {"text": piece})
+                    # D4 思考链（reasoning_content）照单全流：模型把推理过程放在该字段，
+                    # 不并入最终 text（text 仅来自 content），避免思考混入答案。
+                    # B-fix：无论 schema 门控与否都要**累积**——回传历史须携带，丢弃即 400。
+                    rpiece = delta.get("reasoning_content") or ""
+                    if rpiece:
+                        reasoning_acc += rpiece
+                        if schema is None:
+                            await ctx.events.emit(Events.LLM_THINKING, {"text": rpiece})
+                    # 工具调用 delta 归并（按 index）
+                    for tc in (delta.get("tool_calls") or []):
+                        idx = tc.get("index", 0)
+                        slot = tool_acc.setdefault(idx, {
+                            "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""}})
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        if tc.get("type"):
+                            slot["type"] = tc["type"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            slot["function"]["arguments"] += fn["arguments"]
+                    if choice.get("finish_reason"):
+                        finish = choice.get("finish_reason")   # E：此前仅用于 break，现在留证
+                        break
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.TransportError) as exc:
+            # 连接建立失败，或（首帧前）断开 → 可重试；首帧后断开 → 原样抛出（不重试）
+            if not first_frame:
+                return ("retry", None, str(exc))
+            raise
+        return ("ok", (content_acc, reasoning_acc, dict(tool_acc), usage, finish))
+
     async def complete(self, ctx: Any, messages: list[dict],
                        schema: dict | None = None,
                        tools: list[dict] | None = None) -> dict:
         cfg = (((ctx.config or {}).get("agent") or {}).get("llm") or {})
         stream_on = bool(cfg.get("stream", True))      # D5 默认 true
+        # #3：重试参数（默认 3 次指数退避；max_retries=0 退化为旧行为：零重试）
+        self._retry_max = int(cfg.get("max_retries", 3) or 0)
+        self._retry_backoff_s = float(cfg.get("retry_backoff_s", 0.5) or 0.5)
 
         payload: dict = {
             "model": self._model,
@@ -245,10 +392,10 @@ class DeepSeekLlm:
         client = self._get_client()                    # S6：跨调用复用连接池
 
         if not stream_on:
-            # —— 非流式（行为同今天）——
-            resp = await client.post(self.BASE_URL, json=payload, headers=headers)
-            if resp.status_code != 200:
-                raise AgentError(f"deepseek api 异常 {resp.status_code}: {resp.text[:200]}")
+            # —— 非流式（行为同今天，仅叠加可重试层）——
+            resp = await self._post_with_retry(client, payload, headers)
+            # 此处 status 必为 200（非 200 重试耗尽已抛 LlmUnavailableError，
+            # 不可重试状态已抛 AgentError）
             body = resp.json()
             message = body["choices"][0]["message"]
             finish = body["choices"][0].get("finish_reason")
@@ -280,66 +427,11 @@ class DeepSeekLlm:
                 parsed["usage"] = usage
             return parsed
 
-        # —— 流式（B5.2 打字机）——
+        # —— 流式（B5.2 打字机，叠加可重试层）——
         payload["stream"] = True                           # 关键：告知 DeepSeek 返回 SSE 而非单条 JSON
         payload["stream_options"] = {"include_usage": True}  # S6：末帧附带真实 usage
-        content_acc = ""
-        reasoning_acc = ""                                # D4 思考链（reasoning_content 每片累积）
-        tool_acc: dict[int, dict] = {}                     # index -> 归并槽（D3 完整重组）
-        usage: dict | None = None
-        finish: str | None = None                          # E：截断判定依据，捕获而非丢弃
-        async with client.stream("POST", self.BASE_URL, json=payload, headers=headers) as resp:
-            if resp.status_code != 200:
-                await resp.aread()                      # 流式下不能 resp.json()
-                raise AgentError(f"deepseek api 异常 {resp.status_code}: {resp.text[:200]}")
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                if not data:
-                    continue
-                try:
-                    obj = json.loads(data)
-                except (TypeError, ValueError):
-                    continue                            # 跳过非 JSON 行（注释/心跳）
-                usage = obj.get("usage") or usage       # S6：usage 帧不含 choices，照单收下
-                choice = (obj.get("choices") or [{}])[0]
-                delta = choice.get("delta") or {}
-                # 文本片段：**累积永远执行**（schema 调用也要拿到完整 content 解析 JSON）；
-                # 仅 token 帧受 schema 门控——schema 调用的中间散文不外发（D5 设计）。
-                piece = delta.get("content") or ""
-                if piece:
-                    content_acc += piece
-                    if schema is None:
-                        await ctx.events.emit(Events.LLM_TOKEN, {"text": piece})
-                # D4 思考链（reasoning_content）照单全流：模型把推理过程放在该字段，
-                # 不并入最终 text（text 仅来自 content），避免思考混入答案。
-                # B-fix：无论 schema 门控与否都要**累积**——回传历史须携带，丢弃即 400。
-                rpiece = delta.get("reasoning_content") or ""
-                if rpiece:
-                    reasoning_acc += rpiece
-                    if schema is None:
-                        await ctx.events.emit(Events.LLM_THINKING, {"text": rpiece})
-                # 工具调用 delta 归并（按 index）
-                for tc in (delta.get("tool_calls") or []):
-                    idx = tc.get("index", 0)
-                    slot = tool_acc.setdefault(idx, {
-                        "id": "", "type": "function",
-                        "function": {"name": "", "arguments": ""}})
-                    if tc.get("id"):
-                        slot["id"] = tc["id"]
-                    if tc.get("type"):
-                        slot["type"] = tc["type"]
-                    fn = tc.get("function") or {}
-                    if fn.get("name"):
-                        slot["function"]["name"] += fn["name"]
-                    if fn.get("arguments"):
-                        slot["function"]["arguments"] += fn["arguments"]
-                if choice.get("finish_reason"):
-                    finish = choice.get("finish_reason")   # E：此前仅用于 break，现在留证
-                    break
+        content_acc, reasoning_acc, tool_acc, usage, finish = await self._stream_with_retry(
+            client, payload, headers, ctx, schema)
         raw_calls = [slot for _idx, slot in sorted(tool_acc.items())]
         usage_kv = {"usage": usage} if usage else {}
         reasoning_kv = {"reasoning_content": reasoning_acc} if reasoning_acc else {}

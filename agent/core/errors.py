@@ -93,6 +93,15 @@ class EventWiringError(AgentError):
     """capability 接缝接线校验失败（装配期/运行期监听缺失）。"""
 
 
+class LlmUnavailableError(AgentError):
+    """模型调用在重试耗尽后仍不可用（429/5xx/网络抖动/超时）。
+
+    由 provider 内部重试逻辑抛出；沿 ``LlmService.complete`` 既有失败路径上行
+    （durable ``LLM_CALL_FAILED`` + emit + budget 同步退款），**不引入备用 provider**——
+    避免「当前用哪个 provider」隐藏状态及其预算归组/审计归因/错误语义改写（属后续阶段）。
+    """
+
+
 __all__ = [
     "AgentError",
     "CapabilityNotImplemented",
@@ -100,6 +109,7 @@ __all__ = [
     "CyclicDependencyError",
     "EventDispatchError",
     "EventWiringError",
+    "LlmUnavailableError",
     "MissingDependencyError",
     "ScopeClosedError",
     "ServiceConflictError",

@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import logging
+import signal
 import sys
 import uuid
 from pathlib import Path
@@ -47,6 +48,9 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
                         "`Authorization: Bearer <TOKEN>` 或 `?token=<TOKEN>`；"
                         "`/` 与 `/api/status` 始终放行（健康检查），"
                         "非 `/api/` 的前端静态产物亦放行（浏览器无法为其附加令牌）")
+    p.add_argument("--hardened", action="store_true",
+                   help="生产加固画像：权限 deny-by-default（task_allow=[]）+ 强制要求 --token；"
+                        "默认不开启（本地 dev 与既有测试零影响）。")
     return p.parse_args(argv)
 
 
@@ -98,6 +102,13 @@ def _merge_cfg(args: argparse.Namespace) -> dict:
         base = pid[len("plugins."):]
         node = agent.setdefault(base, {})
         node.update(pconf)
+    if getattr(args, "hardened", False):
+        # 生产改造 #4：加固画像 —— deny-by-default，显式白名单才放行（不破坏其它配置节）。
+        # build_agent 内的 deep_merge 递归合并，仅覆盖 permissions 的 default / task_allow，
+        # 保留 task_deny / llm 等键。
+        perms = agent.setdefault("permissions", {})
+        perms["default"] = "deny"
+        perms["task_allow"] = []
     return cfg
 
 
@@ -482,6 +493,64 @@ async def _serve(args: argparse.Namespace) -> int:
                 return _JSONResponse({"error": "未授权：缺少或无效的 token"},
                                      status_code=401)
             return await call_next(request)
+
+    # ---- 生产改造 #2：健康/就绪/指标探针（顶层路径，免 /api/ 鉴权）----
+    # 必须在 SPA mount("/")（约 904 行）之前注册，否则被 catch-all 吞成 index.html。
+    # 顶层路径（非 /api/）即便启用 --token 也由中间件豁免（见 _AUTH_EXEMPT：非 /api/ 直接放行）。
+    from datetime import datetime, timezone
+    from fastapi.responses import Response
+
+    @app.get("/health")
+    async def _health() -> dict:
+        """liveness 探针：恒 200，不依赖任何内部状态（K8s livenessProbe）。"""
+        return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
+
+    @app.get("/ready")
+    async def _ready():
+        """readiness 探针：只查硬依赖（DB 可达 + 核心服务已注册），不查可选插件层。
+        用 container.has 查**注册态**，不触发懒加载实例化；任一硬依赖缺失即 503。"""
+        try:
+            await c.root.db.query(c.root, "SELECT 1")
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"status": "degraded", "reason": f"db unreachable: {exc}"},
+                                status_code=503)
+        for svc in (Services.LLM, Services.REACT, Services.GUARD):
+            if not c.root.has(svc):
+                return JSONResponse({"status": "degraded", "reason": f"{svc} not registered"},
+                                    status_code=503)
+        return {"status": "ok"}
+
+    @app.get("/metrics")
+    async def _metrics() -> Response:
+        """极简 Prometheus 文本指标（核心指标；多会话后加 tenant/user label）。"""
+        budget_cfg = ((c.root.config or {}).get("agent") or {}).get("budget") or {}
+        spent = c.root.state.get(StateKeys.BUDGET_SPENT, 0)
+        catalog = c.root.tasks.catalog()
+        tool_total = len(catalog)
+        # TODO(multi-session): 加 tenant/user label，当前仅全局 session_id
+        from collections import Counter
+        owners = Counter(t.get("owner", "") for t in catalog)
+        lines = [
+            "# HELP agent_up 进程存活",
+            "# TYPE agent_up gauge",
+            "agent_up 1",
+            "# HELP agent_budget_spent 已用 token",
+            "# TYPE agent_budget_spent gauge",
+            f"agent_budget_spent {spent}",
+            "# HELP agent_budget_max token 上限",
+            "# TYPE agent_budget_max gauge",
+            f"agent_budget_max {budget_cfg.get('max_tokens_per_run', 0)}",
+            "# HELP agent_runs_active 在跑任务数",
+            "# TYPE agent_runs_active gauge",
+            f"agent_runs_active {len(active_runs)}",
+            "# HELP agent_tools_total 工具总数",
+            "# TYPE agent_tools_total gauge",
+            f"agent_tools_total {tool_total}",
+        ]
+        for owner, n in sorted(owners.items()):
+            if owner:
+                lines.append(f'agent_tools_by_owner{{owner="{owner}"}} {n}')
+        return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
     @app.post("/api/chat")
     async def _chat(body: dict):
@@ -918,12 +987,64 @@ async def _serve(args: argparse.Namespace) -> int:
         print(f"[web] 未找到前端产物 {_DIST} —— 首页将返回 503 与构建指引",
               file=sys.stderr)
 
+    # ---- 生产改造 #4：安全姿态告警 ----
+    # 无论是否 hardened，只要「无 token 且权限开放」即打印醒目 WARNING（部署风险）。
+    # hardened 模式下若仍缺 token，deny-by-default 会让所有工具调用（含 chat）被拒，
+    # 故额外强告警提示必须同时提供 --token。
+    _perms_cfg = ((c.root.config or {}).get("agent") or {}).get("permissions") or {}
+    if _perms_cfg.get("default") != "deny":
+        if _token:
+            logging.getLogger("agent.chat").warning(
+                "权限默认开放（default=open）但已启用 token：匿名访问已挡，但工具调用仍走 "
+                "guard 默认放行；生产加固请用 --hardened 开启 deny-by-default。")
+        else:
+            logging.getLogger("agent.chat").warning(
+                "未启用 token 且权限默认开放（default=open）：部署到网络即任何人可写插件/删文件。"
+                "生产环境请加 --token 并启用 --hardened。")
+    if getattr(args, "hardened", False) and not _token:
+        logging.getLogger("agent.chat").warning(
+            "--hardened 已启用但未设置 --token：deny-by-default 下所有工具调用将被拒绝"
+            "（包括 chat）。请务必同时提供 --token。")
+
     url = f"http://{args.host}:{args.port}"
     print(f"Agent Harness 就绪: {url}   （Ctrl+C 退出）", file=sys.stderr)
     config = uvicorn.Config(app, host=args.host, port=args.port, log_level="warning")
     server = uvicorn.Server(config)
-    server.install_signal_handlers = lambda: None
+    server.install_signal_handlers = lambda: None  # 禁用 uvicorn 自带信号处理器，下面自己接管
     task = asyncio.create_task(server.serve())
+
+    # ---- #1 SIGTERM/SIGINT 优雅退出（容器/K8s/systemd 默认发 SIGTERM） ----
+    # uvicorn 自带处理器已被禁用，这里注册双信号；收到后设置 should_exit 并取消 serve 任务，
+    # 使 finally 中的 c.teardown()（含 MCP 子进程回收）一定执行，避免孤儿进程累积。
+    loop = asyncio.get_running_loop()
+    _svc_log = logging.getLogger("agent.chat")
+
+    def _graceful() -> None:
+        _svc_log.warning("received shutdown signal, tearing down (SIGTERM/SIGINT)")
+        server.should_exit = True
+        # 即便 serve() 正阻塞在 accept，也强制取消该任务以确保退出路径被触发
+        loop.call_soon_threadsafe(task.cancel)
+
+    try:
+        # POSIX：handler 直接调度在事件循环线程内执行
+        loop.add_signal_handler(signal.SIGTERM, _graceful)
+        loop.add_signal_handler(signal.SIGINT, _graceful)
+        _sig_mode = "loop.add_signal_handler"
+    except (NotImplementedError, RuntimeError):
+        # Windows：asyncio 不支持 add_signal_handler（NotImplementedError）。
+        # 回退 signal.signal：handler 在主线程同步执行，必须经 call_soon_threadsafe
+        # 把置位动作扔回事件循环线程，否则正 await server.serve() 的循环不会被唤醒。
+        signal.signal(signal.SIGTERM, lambda *_: _graceful())
+        signal.signal(signal.SIGINT, lambda *_: _graceful())
+        # 控制台下 CTRL_BREAK / taskkill 不带 /F（CTRL_CLOSE_EVENT）走 SIGBREAK，一并接管
+        try:
+            signal.signal(signal.SIGBREAK, lambda *_: _graceful())  # type: ignore[attr-defined]
+        except (ValueError, OSError, AttributeError):
+            pass
+        _sig_mode = "signal.signal"
+    _svc_log.info("shutdown signal handlers installed (%s)", _sig_mode)
+    # ---- /#1 ----
+
     try:
         await task
     except (KeyboardInterrupt, asyncio.CancelledError):

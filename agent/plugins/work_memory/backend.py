@@ -195,9 +195,10 @@ class RedisWorkMemory:
             return [i for i in ids if await self._r.exists(self._prefix + i)]
         out: list[str] = []
         async for k in self._r.scan_iter(match=self._prefix + "*"):
-            if k.endswith(b"idx") or ":idx:" in k:    # 跳过索引键
+            ks = k if isinstance(k, str) else k.decode("utf-8")  # decode_responses 开/关两种形态
+            if ks.endswith("idx") or ":idx:" in ks:    # 跳过索引键
                 continue
-            out.append(k[len(self._prefix):])
+            out.append(ks[len(self._prefix):])
         return out
 
 
