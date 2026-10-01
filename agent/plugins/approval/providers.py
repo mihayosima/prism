@@ -72,7 +72,9 @@ class WebProvider:
         kwargs = req.get("kwargs") or {}
         key = str(req.get("tool", "")) + "|" + json.dumps(
             kwargs, sort_keys=True, ensure_ascii=False, default=str)
-        ans, _ = await self._table.wait(key, req, call_id=req.get("call_id"))
+        # 2.2：入表带会话 —— 去重与快照均按会话分桶（跨会话不合并、不可见）
+        ans, _ = await self._table.wait(key, req, call_id=req.get("call_id"),
+                                        session=str(req.get("session") or ""))
         return ans
 
 

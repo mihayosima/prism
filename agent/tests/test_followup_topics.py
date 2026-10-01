@@ -204,7 +204,8 @@ def test_chain_archived_to_work_memory(tmp_path):
         _register_echo(c.root)
         await c.root.react.run(c.root, "请触顶循环")
         wm = c.root.get(Services.WORK_MEMORY)
-        arc = await wm.get("react_chain:default")     # run 未传 session → default
+        # 2.2：归档键按**会话键** ``{user}:{session}``（不同用户同名会话不串档）
+        arc = await wm.get("react_chain:default:default")   # 未传 session → 全 default
         assert arc, "链存档必须落工作记忆"
         cps = json.loads(arc.get("checkpoints") or "[]")
         data = next((x.get("data") or {} for x in reversed(cps)

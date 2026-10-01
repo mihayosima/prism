@@ -146,9 +146,10 @@ class WorkMemory:
             logger.warning("work_memory.snapshot_load failed: %s", exc)
             return None
 
-    async def snapshot_list(self, tenant: str) -> list[dict]:
+    async def snapshot_list(self, tenant: str, prefix: str | None = None) -> list[dict]:
+        """列出未完成/已完成快照。**务必传 ``prefix``**（会话级），否则退化为全租户扫描（H1）。"""
         try:
-            return await self._impl.snapshot_list(tenant) if self._impl else []
+            return await self._impl.snapshot_list(tenant, prefix) if self._impl else []
         except Exception as exc:                             # noqa: BLE001
             logger.warning("work_memory.snapshot_list failed: %s", exc)
             return []

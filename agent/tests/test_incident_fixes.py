@@ -573,7 +573,7 @@ def test_react_checkpoints_full_act_arguments(tmp_path):
         async def snapshot_load(self, tenant, task_id):
             return None
 
-        async def snapshot_list(self, tenant):
+        async def snapshot_list(self, tenant, prefix=None):
             return []
 
         async def snapshot_mark_finished(self, tenant, task_id):

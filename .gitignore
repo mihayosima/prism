@@ -6,8 +6,9 @@ data/
 *.tmp
 .pytest_cache/
 # 仓库内 pytest basetemp（避开 %TEMP% 下的安全删除守卫，见 skill/文档）
+# 统一规则：agent/tests/.pytest-* 全部忽略（ms/dbg/full 等各批次临时目录）
 agent/tests/.pt/
-agent/tests/.pytest-tmp*/
+agent/tests/.pytest-*/
 agent_runtime.egg-info/
 .playwright-mcp/
 

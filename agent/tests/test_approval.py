@@ -637,8 +637,10 @@ def test_session_allow_batch(tmp_path):
         assert c.root.approval.pending.size() == 0, "session-allow 不应再问"
         assert await inv2 == {"ok": True}
         inv3 = asyncio.ensure_future(c.root.tasks.invoke(c.root, "t.write", caller="t"))
-        c.root.approval._session_allow.clear()
-        c.root.approval._session_deny.add("t.write")
+        # 2.2：名单改为**按会话分桶**（dict[session, set]）——测试按当前会话取桶操作
+        c.root.approval._session_allow.get(c.root.approval._skey(), set()).clear()
+        c.root.approval._session_deny.setdefault(
+            c.root.approval._skey(), set()).add("t.write")
         await asyncio.sleep(0.05)
         assert c.root.approval.pending.size() == 0, "session-deny 不应再问"
         try:

@@ -13,6 +13,12 @@
                          EWMA 校准因子 ``dict[model, dict[ratio, samples]]``）
 - ``REACT_RUN_ID``       F2：react 写、budget 读（当前 run 的归组键，落 agent_budget_log；
                          尽力而为——并发多会话时以后写者为准）
+                         2.2 起值为 **task_id**（``{user}:{session}:{run}``）——即便被后写者
+                         覆盖，账单行仍自带会话维度（治 H5 串号）
+- ``SESSION_KEY``        2.2：run/chat 解析身份后写、approval 读（当前会话 ``{user}:{session}``）。
+                         与 REACT_RUN_ID 同为「尽力而为」的当前上下文提示（``ctx.state`` 是
+                         容器级，并发下以后写者为准）；它是**无参数线程化时**approval 判定
+                         「这次请求属于哪个会话」的唯一依据
 - ``REACT_LAST``         react 写、react.status 读（最近一次 run 摘要）
 - ``PERMISSION_MODE``    **前向契约**：approval 插件（未实施）写、react 读；当前无写者
 - ``LOOP_RUNNING``       sys/loop 写读（在跑任务集合）
@@ -29,7 +35,8 @@ class StateKeys:
     BUDGET_PENDING_EST = "budget_pending_est"
     BUDGET_WARNING = "budget_warning"        # D1：budget 写 / react 读（预警旗标，非直连）
     LLM_COST_RATIO = "llm_cost_ratio"        # F1：budget 写 / cost_factor 读（口径校准 EWMA）
-    REACT_RUN_ID = "react_run_id"            # F2：react 写 / budget 读（账单归组键）
+    REACT_RUN_ID = "react_run_id"            # F2：react 写 / budget 读（账单归组键；= task_id）
+    SESSION_KEY = "session_key"              # 2.2：run/chat 写 / approval 读（当前会话键）
     REACT_LAST = "react_last"
     PERMISSION_MODE = "permission_mode"      # 前向契约：approval 写 / react 读（当前无写者）
     LOOP_RUNNING = "loop_running"

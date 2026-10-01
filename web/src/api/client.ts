@@ -12,6 +12,7 @@
  */
 
 import type { ApiError } from './types'
+import { getSessionId } from './session'
 
 /**
  * 后端 API 基地址（B3 起可配置）。
@@ -90,11 +91,17 @@ export function buildUrl(path: string, params?: Record<string, string>): string 
   return u.toString()
 }
 
-/** 构造鉴权头（无 token 时不含 Authorization，保持与改造前一致） */
+/**
+ * 构造鉴权头（无 token 时不含 Authorization，保持与改造前一致）。
+ *
+ * 2.2：一并注入 `X-Session-Id`（会话标识）。后端据此做快照 / 审批 / 取消的归属隔离；
+ * 不传则后端落到 `{user}:{default}` 桶（等价单会话旧行为）。
+ */
 export function authHeaders(extra?: Record<string, string>): Record<string, string> {
   const h: Record<string, string> = { ...(extra || {}) }
   const token = getToken()
   if (token) h['Authorization'] = 'Bearer ' + token
+  h['X-Session-Id'] = getSessionId()
   return h
 }
 

@@ -30,6 +30,9 @@ from agent.core.config_schema import coerce_config, validate_config
 from agent.core.request_cost import (estimate_request_cost, wire_messages,
                                      wire_tools)
 from agent.core.services_catalog import ALL as SERVICE_KEYS, Services
+from agent.core.session import (DEFAULT_SESSION, DEFAULT_TENANT, DEFAULT_USER,
+                                SessionIdError, SessionIdentity, build_task_id,
+                                coerce_identity, make_identity, parse_task_id)
 from agent.core.state_keys import StateKeys
 from agent.core.tokens import (clip_json, clip_text, clip_text_hard, estimate_tokens,
                                guard_source)
@@ -85,6 +88,16 @@ __all__ = [
     "SERVICE_KEYS",
     # ctx.state 共享键（跨插件契约）
     "StateKeys",
+    # 会话/租户身份原语（阶段 2.2；实现位于 core/session，纯值对象 + 纯函数）
+    "SessionIdentity",
+    "SessionIdError",
+    "build_task_id",
+    "parse_task_id",
+    "make_identity",
+    "coerce_identity",
+    "DEFAULT_TENANT",
+    "DEFAULT_USER",
+    "DEFAULT_SESSION",
     # 审计公共面（D4 转正；实现位于 core/audit）
     "durable",
     "now_iso",

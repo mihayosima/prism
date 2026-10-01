@@ -24,9 +24,20 @@ import sys
 import uuid
 from pathlib import Path
 
-from agent.api import AgentError, Services, StateKeys
+from agent.api import (AgentError, Services, SessionIdError, StateKeys,
+                       make_identity)
 from agent.profiles import BASE_AGENT_CONFIG, build_agent
 from agent.sys.progress import tap_progress
+
+# 本模块开了 ``from __future__ import annotations`` ⇒ 路由签名里的注解是**字符串**，
+# FastAPI 用**模块全局**解析它们。故 ``Request``/``HTTPException`` 必须在模块级可见，
+# 只在 create_app 内局部 import 会被当成普通查询参数（实测：路由报 `query.request`
+# Field required，422）。fastapi 仍是**软依赖**（--once 无头形态不需要）：缺失时置 None。
+try:
+    from fastapi import HTTPException, Request          # noqa: F401
+except Exception:                                       # pragma: no cover
+    Request = None                                      # type: ignore[assignment]
+    HTTPException = None                                # type: ignore[assignment]
 
 
 def _parse(argv: list[str] | None) -> argparse.Namespace:
@@ -387,7 +398,7 @@ async def _context_view_payload(root, *, limit: int = 60) -> dict:
 
 async def _serve(args: argparse.Namespace) -> int:
     import uvicorn
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
     c, pm = await _boot(args)
@@ -413,9 +424,33 @@ async def _serve(args: argparse.Namespace) -> int:
             await self._c.teardown()
 
     c = _Box(c)
-    session_id = uuid.uuid4().hex[:8]
-    # B6/B5 共用：run_id -> 在跑的任务。取消端点据此 cancel；断连时清理，防孤儿任务。
-    active_runs: dict[str, asyncio.Task] = {}
+    # 2.2：**不再有「进程级全局会话」**——原 ``session_id = uuid4().hex[:8]`` 是启动时生成
+    # 一次的闭包常量，所有请求共用（多会话下即串数据）。现改为每请求经 ``_identity()`` 解析。
+    # B6/B5 共用：run_id -> (在跑的任务, 归属会话键)。取消端点据此 cancel **并校验归属**
+    # （H4：否则任一会话都能取消别人的 run）；断连时清理，防孤儿任务。
+    active_runs: dict[str, tuple[asyncio.Task, str]] = {}
+
+    # ---- 阶段 2（2.2）：请求级身份解析 -----------------------------------------
+    # 信任边界：**tenant/user 只来自服务端配置**（客户端可伪造 ⇒ 不下放）；
+    # session 来自请求头 ``X-Session-Id``（无隔离语义，伪造只影响伪造者自己）。
+    # 键构造/净化的唯一真源是 ``core/session.py``——任何非法标识在此 fail-fast（400），
+    # 不静默回退（否则用户以为在私密会话，实则落进共享桶 / 前缀扫描越权命中他人）。
+
+    def _session_cfg() -> dict:
+        return ((c.root.config or {}).get("agent") or {}).get("session") or {}
+
+    def _identity(request: Request | None = None, body: dict | None = None):
+        cfg = _session_cfg()
+        raw = ""
+        if request is not None:
+            raw = str(request.headers.get("x-session-id") or "")
+        if not raw and isinstance(body, dict):
+            raw = str(body.get("session") or "")
+        try:
+            return make_identity(tenant=cfg.get("tenant"), user=cfg.get("user"),
+                                 session=raw)
+        except SessionIdError as exc:
+            raise HTTPException(status_code=400, detail=f"非法会话标识：{exc}")
 
     def _sse(event: str, payload: dict) -> str:
         """一帧 SSE（data: {...}\\n\\n）。帧类型见设计方案 §4.5。"""
@@ -553,10 +588,12 @@ async def _serve(args: argparse.Namespace) -> int:
         return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
     @app.post("/api/chat")
-    async def _chat(body: dict):
+    async def _chat(body: dict, request: Request):
+        ident = _identity(request, body)
         try:
             reply = await c.root.chat.send(c.root, str(body.get("message") or ""),
-                                           session_id=session_id)
+                                           session_id=ident.session_key,
+                                           identity=ident)
             return JSONResponse({"text": reply.text, "ok": reply.ok, "error": reply.error,
                                  "notice": reply.notice,
                                  "evidence": {"plan": reply.plan, "evidence": reply.evidence,
@@ -566,19 +603,25 @@ async def _serve(args: argparse.Namespace) -> int:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     @app.post("/api/chat/stream")
-    async def _chat_stream(body: dict):
+    async def _chat_stream(body: dict, request: Request):
         """B5 流式：SSE 逐帧推送（start → progress… → final / error / cancelled）。
 
-        与 B6 共用同一 run 生命周期：本端点持有任务并登记 run_id，取消端点据此 cancel。
-        ``/api/chat`` 保留不动（--once 与离线测试依赖它）。
+        与 B6 共用同一 run 生命周期：本端点持有任务并登记 run_id（**带归属会话**），
+        取消端点据此 cancel 并校验归属。``/api/chat`` 保留不动（--once 与离线测试依赖它）。
+
+        2.2：会话标识经 ``X-Session-Id`` 请求头（本端点是 fetch POST，可自定义头；
+        与 EventSource 不同，无需退化到 query）。
         """
+        ident = _identity(request, body)
         message = str(body.get("message") or "")
         run_id = uuid.uuid4().hex[:8]
         q: asyncio.Queue = asyncio.Queue()
 
         async def _worker() -> None:
             try:
-                reply = await c.root.chat.send(c.root, message, session_id=session_id)
+                reply = await c.root.chat.send(c.root, message,
+                                               session_id=ident.session_key,
+                                               identity=ident)
                 await q.put({"event": "final", "payload": {
                     "text": reply.text, "ok": reply.ok, "error": reply.error,
                     "notice": reply.notice,
@@ -597,7 +640,7 @@ async def _serve(args: argparse.Namespace) -> int:
                 # 先订阅（不漏帧），再起任务
                 async with tap_progress(c.root, queue=q):
                     task = asyncio.create_task(_worker())
-                    active_runs[run_id] = task
+                    active_runs[run_id] = (task, ident.session_key)
                     try:
                         while True:
                             frame = await q.get()
@@ -618,13 +661,22 @@ async def _serve(args: argparse.Namespace) -> int:
                                           "X-Accel-Buffering": "no"})
 
     @app.post("/api/chat/cancel")
-    async def _chat_cancel(body: dict):
-        """B6 取消：按 run_id 取消在跑的那轮（`asyncio.Task.cancel()`，任意 await 点即时生效）。"""
+    async def _chat_cancel(body: dict, request: Request):
+        """B6 取消：按 run_id 取消在跑的那轮（`asyncio.Task.cancel()`，任意 await 点即时生效）。
+
+        2.2（H4）：**校验归属**——run 只可被它所属的会话取消；跨会话取消返回 403
+        （否则任一会话凭 run_id 就能掐掉别人的任务）。
+        """
+        ident = _identity(request, body)
         rid = str(body.get("run_id") or "")
-        task = active_runs.get(rid)
-        if task is None:
+        entry = active_runs.get(rid)
+        if entry is None:
             return JSONResponse({"ok": False, "error": "run_id 不存在或该轮已结束"},
                                 status_code=404)
+        task, owner = entry
+        if owner != ident.session_key:
+            return JSONResponse({"ok": False, "error": "该 run 不属于当前会话，无权取消"},
+                                status_code=403)
         task.cancel()
         return JSONResponse({"ok": True, "run_id": rid})
 
@@ -637,20 +689,28 @@ async def _serve(args: argparse.Namespace) -> int:
         return c.root.get(Services.APPROVAL)
 
     @app.post("/api/approval/answer")
-    async def _approval_answer(body: dict):
+    async def _approval_answer(body: dict, request: Request):
         """人对在途请求的应答：审批（批/驳）与澄清问询（choice/text）共用。
 
         经待答表 resolve 唤醒在途等待者；附加键（answered/choice/text/note/
         always/kwargs）原样透传，由等待方按自身语义消费。
         未知/已了结的 call_id → 404（前端据此提示「已超时，默认拒绝」）。
         fail-safe 在插件侧：无人应答/超时一律默认拒绝，本端点只投喂不裁决。
+
+        2.2（H2）：**校验归属**——只能应答**本会话**的在途请求，跨会话应答返回 403
+        （此前凭 call_id 可应答任意会话的调用，等于替别人批准工具执行）。
         """
         svc = _approval_or_none()
         if svc is None:
             return JSONResponse({"ok": False, "error": "审批插件未启用"}, status_code=404)
+        ident = _identity(request, body)
         call_id = str(body.get("call_id") or "")
         if not call_id:
             return JSONResponse({"ok": False, "error": "缺少 call_id"}, status_code=400)
+        owner = svc.pending.owner_of(call_id)
+        if owner is not None and owner != ident.session_key:
+            return JSONResponse(
+                {"ok": False, "error": "该请求不属于当前会话，无权应答"}, status_code=403)
         answer: dict = {"approved": bool(body.get("approved")), "by": "user"}
         if body.get("always"):                       # 第 3 期：批量确认（本会话同类不再问）
             answer["always"] = True
@@ -669,7 +729,7 @@ async def _serve(args: argparse.Namespace) -> int:
             answer["choices"] = [str(c)[:200] for c in cs][:24]
         if isinstance(body.get("text"), str):
             answer["text"] = body["text"][:2000]
-        resolved = svc.pending.resolve(call_id, answer)
+        resolved = svc.pending.resolve(call_id, answer, session=ident.session_key)
         if not resolved:
             return JSONResponse(
                 {"ok": False, "resolved": False,
@@ -677,12 +737,16 @@ async def _serve(args: argparse.Namespace) -> int:
         return JSONResponse({"ok": True, "resolved": True, "call_id": call_id})
 
     @app.get("/api/approval/pending")
-    async def _approval_pending():
-        """在途审批快照（页面刷新后恢复弹窗用）。"""
+    async def _approval_pending(request: Request):
+        """在途审批快照（页面刷新后恢复弹窗用）。
+
+        2.2（H2）：**只返回本会话**的在途请求（此前返回全局，B 能看见 A 的待审批项）。
+        """
+        ident = _identity(request)
         svc = _approval_or_none()
         if svc is None:
             return {"items": [], "enabled": False}
-        return {"items": svc.pending.snapshot(), "enabled": True,
+        return {"items": svc.pending.snapshot(ident.session_key), "enabled": True,
                 "mode": svc.mode()}
 
     @app.post("/api/approval/mode")
@@ -706,13 +770,16 @@ async def _serve(args: argparse.Namespace) -> int:
         return JSONResponse({"ok": True, "mode": svc.mode()})
 
     @app.get("/api/status")
-    async def _status() -> dict:
+    async def _status(request: Request) -> dict:
+        ident = _identity(request)
         svc = c.root.get(Services.LLM)
         budget_cfg = ((c.root.config or {}).get("agent") or {}).get("budget") or {}
         return {"provider_label": getattr(svc, "provider_label", "?"),
                 "model": getattr(svc, "model", "?"),
                 "version": __import__("agent").__version__,
-                "session_id": session_id,
+                "session_id": ident.session_key,
+                # 2.2：回显身份（tenant/user 服务端配置决定，便于前端确认自己落在哪个桶）
+                "tenant": ident.tenant, "user": ident.user, "session": ident.session,
                 "budget": {"spent": c.root.state.get(StateKeys.BUDGET_SPENT, 0),
                            "max": budget_cfg.get("max_tokens_per_run", 0)}}
 
@@ -739,13 +806,18 @@ async def _serve(args: argparse.Namespace) -> int:
                 "mode": approval.mode() if approval else None}
 
     @app.get("/api/session")
-    async def _session() -> dict:
-        return {"session_id": session_id,
-                "history": await c.root.chat.history(c.root, session_id)}
+    async def _session(request: Request) -> dict:
+        """当前会话（2.2：按请求身份取，**不再**是进程级全局会话）。"""
+        ident = _identity(request)
+        return {"session_id": ident.session_key, "tenant": ident.tenant,
+                "user": ident.user,
+                "history": await c.root.chat.history(c.root, ident.session_key)}
 
     @app.post("/api/session/reset")
-    async def _session_reset():
-        cleared = await c.root.chat.reset(c.root, session_id)
+    async def _session_reset(request: Request):
+        """清空**当前会话**的转写（2.2：不再清空全局——那会连别人的会话一起清掉）。"""
+        ident = _identity(request)
+        cleared = await c.root.chat.reset(c.root, ident.session_key)
         return JSONResponse({"ok": True, "cleared": cleared})
 
     @app.get("/api/tools")
@@ -756,7 +828,9 @@ async def _serve(args: argparse.Namespace) -> int:
     # 解耦纪律：消费面只用 ctx.has(Services.X) 守卫 + 门面方法，不 import 任何插件内部模块。
 
     @app.get("/api/memory")
-    async def _memory() -> dict:
+    async def _memory(request: Request) -> dict:
+        ident = _identity(request)
+        sid = ident.session_key                    # 2.2：各层按**当前会话**统计
         layers: list[dict] = []
 
         # 第1层 系统记忆（SYSTEM_MEMORY 提供的是纯文本字符串，无门面对象）
@@ -776,10 +850,10 @@ async def _serve(args: argparse.Namespace) -> int:
         if c.root.has(Services.SHORT_TERM):
             short = c.root.get(Services.SHORT_TERM)
             try:
-                cnt = await short.count(c.root, session_id)
-                meta = await short.summary_meta(c.root, session_id)
+                cnt = await short.count(c.root, sid)
+                meta = await short.summary_meta(c.root, sid)
                 covers = int(meta["covers_up_to_seq"]) if meta else 0
-                latest = await short.latest_summary(c.root, session_id)
+                latest = await short.latest_summary(c.root, sid)
                 st_stats = short.stats()
             except Exception:  # noqa: BLE001 —— 单窗诊断失败不影响整体展示
                 cnt, covers, latest, st_stats = 0, 0, None, {}
@@ -799,7 +873,7 @@ async def _serve(args: argparse.Namespace) -> int:
         if c.root.has(Services.WORK_MEMORY):
             wm = c.root.get(Services.WORK_MEMORY)
             try:
-                active = await wm.list_active(session_id)
+                active = await wm.list_active(sid)
             except Exception:  # noqa: BLE001
                 active = []
             layers.append({"key": "work_memory", "name": "工作记忆",

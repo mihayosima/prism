@@ -12,12 +12,15 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from agent.api import Services
+from agent.api import Services, make_identity
 from agent.plugins.react.loop import _snapshot_chain
 from agent.plugins.work_memory import InMemoryWorkMemory
 from agent.profiles import build_agent
 from agent.sys.chat import ChatDriver
 from agent.sys.plugin_manager import PluginManager
+
+# 2.2：探测改为**会话级**前缀（H1），故快照 task_id 必须由同一身份构造
+_IDENT = make_identity()          # tenant/user/session 全 default
 
 
 def _run(coro):
@@ -66,13 +69,14 @@ def test_probe_resume_continue_intent():
     wm = InMemoryWorkMemory(ttl=60, snapshot_ttl=60)
 
     async def s():
-        await wm.snapshot_save("default", "s:r1", _running_snapshot())
+        tid = _IDENT.task_id("r1")
+        await wm.snapshot_save(_IDENT.tenant, tid, _running_snapshot())
         drv = ChatDriver()
-        state, notice = await drv._probe_resume(_Ctx(wm), "继续", True)
+        state, notice = await drv._probe_resume(_Ctx(wm), "继续", True, _IDENT)
         assert state is not None and state["chain"][0]["content"] == "旧任务"
         assert notice and "未完成" in notice
         # 被续接者标 resumed，防重复续接
-        assert (await wm.snapshot_load("default", "s:r1"))["status"] == "resumed"
+        assert (await wm.snapshot_load(_IDENT.tenant, tid))["status"] == "resumed"
 
     _run(s())
 
@@ -81,11 +85,12 @@ def test_probe_resume_new_task_marks_orphaned():
     wm = InMemoryWorkMemory(ttl=60, snapshot_ttl=60)
 
     async def s():
-        await wm.snapshot_save("default", "s:r1", _running_snapshot())
+        tid = _IDENT.task_id("r1")
+        await wm.snapshot_save(_IDENT.tenant, tid, _running_snapshot())
         drv = ChatDriver()
-        state, notice = await drv._probe_resume(_Ctx(wm), "帮我查天气", False)
+        state, notice = await drv._probe_resume(_Ctx(wm), "帮我查天气", False, _IDENT)
         assert state is None and notice is None
-        assert (await wm.snapshot_load("default", "s:r1"))["status"] == "orphaned"
+        assert (await wm.snapshot_load(_IDENT.tenant, tid))["status"] == "orphaned"
 
     _run(s())
 
@@ -95,7 +100,7 @@ def test_probe_resume_no_snapshot():
 
     async def s():
         drv = ChatDriver()
-        state, notice = await drv._probe_resume(_Ctx(wm), "继续", True)
+        state, notice = await drv._probe_resume(_Ctx(wm), "继续", True, _IDENT)
         assert state is None and notice is None
 
     _run(s())
@@ -106,15 +111,16 @@ def test_probe_resume_multiple_keeps_latest():
     wm = InMemoryWorkMemory(ttl=60, snapshot_ttl=60)
 
     async def s():
-        await wm.snapshot_save("default", "s:old",
+        old, new = _IDENT.task_id("old"), _IDENT.task_id("new")
+        await wm.snapshot_save(_IDENT.tenant, old,
                                _running_snapshot("2026-10-01T00:00:00Z", "老"))
-        await wm.snapshot_save("default", "s:new",
+        await wm.snapshot_save(_IDENT.tenant, new,
                                _running_snapshot("2026-10-01T00:00:09Z", "新"))
         drv = ChatDriver()
-        state, notice = await drv._probe_resume(_Ctx(wm), "继续", True)
+        state, notice = await drv._probe_resume(_Ctx(wm), "继续", True, _IDENT)
         assert state is not None and state["chain"][0]["content"] == "新"
-        assert (await wm.snapshot_load("default", "s:old"))["status"] == "orphaned"
-        assert (await wm.snapshot_load("default", "s:new"))["status"] == "resumed"
+        assert (await wm.snapshot_load(_IDENT.tenant, old))["status"] == "orphaned"
+        assert (await wm.snapshot_load(_IDENT.tenant, new))["status"] == "resumed"
 
     _run(s())
 
@@ -131,11 +137,13 @@ def test_auto_resume_end_to_end(tmp_path):
         await c.assemble()
         wm = c.root.get(Services.WORK_MEMORY)
         # 注入上一轮「崩溃残留」（status=running，无收尾）
-        await wm.snapshot_save("default", "default:crashed", _running_snapshot())
-        reply = await c.root.chat.send(c.root, "继续")
+        tid = _IDENT.task_id("crashed")            # {user}:{session}:{run}
+        await wm.snapshot_save(_IDENT.tenant, tid, _running_snapshot())
+        reply = await c.root.chat.send(c.root, "继续", session_id=_IDENT.session_key,
+                                       identity=_IDENT)
         assert reply.notice and "未完成" in reply.notice
         # 被续接的原残留不再是 running（标 resumed → 不会重复续接）
-        assert (await wm.snapshot_load("default", "default:crashed"))["status"] == "resumed"
+        assert (await wm.snapshot_load(_IDENT.tenant, tid))["status"] == "resumed"
         await c.teardown()
 
     _run(s())

@@ -76,8 +76,9 @@ class Approval:
         self._pending = PendingTable(self._cfg.get("timeout_s", DEFAULT_CONFIG["timeout_s"]))
         self._provider = build_provider(self._cfg.get("provider"), table=self._pending)
         # 第 3 期：会话级批量确认（内存态，重启即清；bypass/模式不涉及，无持久化风险）
-        self._session_allow: set[str] = set()
-        self._session_deny: set[str] = set()
+        # 2.2（H2）：**按会话分桶** —— 此前是全局单 set，A 的「始终允许」会泄漏给 B。
+        self._session_allow: dict[str, set[str]] = {}
+        self._session_deny: dict[str, set[str]] = {}
         self._plan_dispose = None          # submit_plan 动态注册句柄（进 plan 注册、离开注销）
         # 默认 append（不 prepend）：排 guard 之后——硬规则先裁、问人后行（设计稿 §16.3）
         ctx.on(Events.TASKS_PRE_EXECUTE, self._pre_task)
@@ -136,20 +137,22 @@ class Approval:
                 "by": "policy:deny", "waited_ms": 0})
             return self._denied(task, call_id, reason, denied_by="approval")
         # ---- ask：会话级批量确认（第 3 期）→ 问人 ----
-        if task in self._session_deny:
+        # 2.2：名单按当前会话取桶（跨会话不共享）
+        session = self._skey()
+        if task in self._session_deny.get(session, ()):
             await self._audit(Events.APPROVAL_ANSWERED, {
                 "call_id": call_id, "tool": task, "approved": False,
                 "by": "session-deny", "waited_ms": 0})
             return self._denied(task, call_id,
                                 f"approval: 任务 {task!r} 被用户设为本会话拒绝",
                                 denied_by="approval")
-        if task in self._session_allow:
+        if task in self._session_allow.get(session, ()):
             await self._audit(Events.APPROVAL_ANSWERED, {
                 "call_id": call_id, "tool": task, "approved": True,
                 "by": "session-allow", "waited_ms": 0})
             return await next()
         req = {"call_id": call_id, "tool": task, "risk": risk, "mode": mode,
-               "kwargs": payload.get("kwargs") or {}}
+               "session": session, "kwargs": payload.get("kwargs") or {}}
         await self._audit(Events.APPROVAL_ASKED,
                           {"call_id": call_id, "tool": task, "risk": risk, "mode": mode})
         # 仅交互式 provider 发弹窗信号（非交互问不等人，信号只会造成假弹窗）
@@ -167,8 +170,10 @@ class Approval:
         approved = bool(ans.get("approved"))
         by = str(ans.get("by", "unknown"))
         # 批量确认（第 3 期）：应答带 always ⇒ 记入会话级名单（此后同类请求不再问）
+        # 2.2：写回**本会话**的桶（不再写全局）
         if by == "user" and ans.get("always"):
-            (self._session_allow if approved else self._session_deny).add(task)
+            bucket = (self._session_allow if approved else self._session_deny)
+            bucket.setdefault(session, set()).add(task)
         if by == "timeout":
             await self._audit(Events.APPROVAL_TIMEOUT,
                               {"call_id": call_id, "tool": task, "waited_ms": waited_ms})
@@ -191,6 +196,17 @@ class Approval:
             return {"kwargs": rw, "denied": False,
                     "reason": "approval: 参数已经人修订", "denied_by": "approval"}
         return await next()
+
+    # ---------- 会话归属（2.2） ----------
+
+    def _skey(self) -> str:
+        """当前会话键（``{user}:{session}``）——由 run/chat 解析身份后写入。
+
+        读取通道是**容器级** ``ctx.state``（并发请求下以后写者为准，与 ``REACT_RUN_ID``
+        同款「尽力而为」契约）；未解析到时退 ``"default"``（单会话 / 离线调用方行为不变）。
+        真正的会话隔离靠待答表与名单的分桶（H2），此键只回答「此刻大概率是哪个会话」。
+        """
+        return str(self._ctx.state.get(StateKeys.SESSION_KEY) or "default")
 
     # ---------- 会话模式（mode 的唯一持有者） ----------
 
@@ -293,7 +309,7 @@ class Approval:
         opts = normalize_options(options)
         is_multi = bool(multi) and bool(opts)          # 无候选时多选无意义，退回单选语义
         req = {"call_id": call_id, "kind": "ask_user", "question": question,
-               "options": opts, "multi": is_multi,
+               "options": opts, "multi": is_multi, "session": self._skey(),
                "allow_free_text": bool(allow_free_text)}
         await self._audit(Events.APPROVAL_ASKED,
                           {"call_id": call_id, "tool": "approval.ask_user",
@@ -306,7 +322,7 @@ class Approval:
             pass
         try:
             ans, _ = await self._pending.wait(f"ask_user:{call_id}", req,
-                                              call_id=call_id)
+                                              call_id=call_id, session=self._skey())
         except Exception:                           # noqa: BLE001 —— 通道崩了也不能挂死循环
             ans = {"by": "provider-error"}
         waited_ms = int((time.monotonic() - started) * 1000)
@@ -352,8 +368,9 @@ class Approval:
                 "ask_rules": len(self._cfg.get("ask") or []),
                 "deny_rules": len(self._cfg.get("deny") or []),
                 "pending": self._pending.size(),
-                "session_allow": len(self._session_allow),
-                "session_deny": len(self._session_deny),
+                # 2.2：名单按会话分桶 ⇒ 展示**当前会话**的条目数
+                "session_allow": len(self._session_allow.get(self._skey(), ())),
+                "session_deny": len(self._session_deny.get(self._skey(), ())),
                 "plan_tool": self._plan_dispose is not None}
 
     # ---------- 内部 ----------

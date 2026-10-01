@@ -260,9 +260,10 @@ def test_resume_without_snapshot_degrades_and_flags(tmp_path):
         await c.assemble()
         _register_echo(c.root)
         wm = c.root.get(Services.WORK_MEMORY)
-        # 手工构造「只有链、没有头快照」的旧版存档
-        await wm.begin("react_chain:old", {"session_id": "old"})
-        await wm.checkpoint("react_chain:old", "chain", {
+        # 手工构造「只有链、没有头快照」的旧版存档。
+        # 2.2：归档键按**会话键** ``{user}:{session}`` ⇒ session_id="old" → "default:old"
+        await wm.begin("react_chain:default:old", {"session_id": "default:old"})
+        await wm.checkpoint("react_chain:default:old", "chain", {
             "chain": [{"role": "assistant", "content": "上轮结论", "type": "think",
                        "id": "step1_think"}],
             "steps": 1, "at": "t"})

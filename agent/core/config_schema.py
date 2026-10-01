@@ -29,6 +29,9 @@ _SCHEMA: dict[str, Any] = {
         "permissions": {"default": str, "task_allow": list, "task_deny": list, "llm": str,
                         "risk": dict},   # S5：按风险级裁决 {"read":"allow","danger":"deny",...}
         "loop": {"deadline_s": (int, float)},
+        # 阶段 2（2.2）：会话/租户身份的服务端配置面（session 另从请求头取，不在此配置）。
+        # 严格校验（非 _any）：拼错键（如 ``tennat``）在装配期即 fail-fast。
+        "session": {"tenant": str, "user": str},
         # G2.0（P1-2）：context 节由 ``_any`` **补成具体键类型**（与 budget 节同纪律）——
         # 拼错键（如 ``working_windows_tokens``）在装配期即 fail-fast，不再静默落默认值。
         "context": {

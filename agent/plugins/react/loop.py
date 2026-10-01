@@ -60,8 +60,9 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
-from agent.api import (CapabilityNotImplemented, Events, Services, StateKeys,
-                      durable, estimate_request_cost, estimate_tokens, now_iso)
+from agent.api import (CapabilityNotImplemented, Events, Services, SessionIdentity,
+                      StateKeys, coerce_identity, durable, estimate_request_cost,
+                      estimate_tokens, now_iso)
 
 logger = logging.getLogger("agent.react")
 
@@ -386,10 +387,21 @@ class ReactLoop:
 
     async def run(self, ctx, prompt: str, *, session_id: str = "default",
                   prior: list[dict] | None = None, resume: bool = False,
-                  resume_state: dict | None = None) -> ReactResult:
+                  resume_state: dict | None = None,
+                  identity: SessionIdentity | None = None) -> ReactResult:
+        """``identity``：2.2 会话/租户身份（由适配层解析后**显式线程化**传入）。
+
+        为什么是显式参数而非 ``ctx.get(...)``：``ctx.state`` 与服务都是**容器级**且被并发
+        请求共享，把「当前会话」塞进共享槽会互相覆盖（H5/H6）。显式传参零歧义、零竞态。
+        缺失时按 ``session_id`` 退化（保持既有调用方可用，见内核 ``coerce_identity``）。
+        """
         cfg = self._cfg
+        # 身份 → 键空间（task_id / 快照 tenant / 会话键）一次定型，全程不变
+        ident = identity if identity is not None else coerce_identity(session_id)
+        session_key = ident.session_key
         await durable(ctx, Events.REACT_START, {
-            "prompt": (prompt or "")[:500], "session_id": session_id,
+            "prompt": (prompt or "")[:500], "session_id": session_key,
+            "tenant": ident.tenant, "user": ident.user,
             "max_steps": cfg.max_steps, "at": now_iso()})
 
         tools = visible_tools(ctx)
@@ -407,15 +419,19 @@ class ReactLoop:
         # 工作记忆（第 3 层）：任务级进度缓存。接缝获取，缺失则跳过（不破解耦）。
         wm = ctx.get(Services.WORK_MEMORY)
         run_id = uuid.uuid4().hex
-        task_id = f"{session_id}:{run_id}"
-        # 阶段 2（2.1/D19）：跨进程 run 快照保留最近 N 条 chain；tenant 暂固定 default（2.2 扩展）
+        # 2.2：task_id = {user}:{session}:{run}（键构造唯一真源 core/session.py）
+        task_id = ident.task_id(run_id)
+        # 阶段 2（2.1/D19）：跨进程 run 快照保留最近 N 条 chain
         _wm_cfg = ((ctx.config or {}).get("agent") or {}).get("work_memory") or {}
         snap_keep = int(_wm_cfg.get("snapshot_chain_keep", 20))
         # F2：账单归组键（尽力而为——budget 的 pre-call 读此键落 agent_budget_log.run_id）
-        ctx.state[StateKeys.REACT_RUN_ID] = run_id
+        # 2.2 起存 **task_id**（自带 user/session），被并发覆盖时账单行仍有会话维度。
+        ctx.state[StateKeys.REACT_RUN_ID] = task_id
+        # 2.2：当前会话提示（approval 无参数线程化时据此判定归属；同 REACT_RUN_ID 为尽力而为）
+        ctx.state[StateKeys.SESSION_KEY] = session_key
         if wm is not None:
-            await wm.begin(task_id, {"session_id": session_id, "run_id": run_id,
-                                     "max_steps": cfg.max_steps})
+            await wm.begin(task_id, {"session_id": session_key, "tenant": ident.tenant,
+                                     "run_id": run_id, "max_steps": cfg.max_steps})
 
         # 任务级视图（S3）：prior = 入口已装配上下文（rigid，循环内不重裁）；
         # chain = **仅**循环产生的 Think/Act/Observe（草稿，循环结束即弃）。
@@ -433,7 +449,8 @@ class ReactLoop:
                     data = dict(resume_state)
                 else:
                     # 显式「继续」：读 run 收尾归档 react_chain:{session}（现有语义不变）
-                    arc = await wm.get(f"react_chain:{session_id}")
+                    # 2.2：归档键按**会话键**（{user}:{session}）——不同用户同名会话不串档
+                    arc = await wm.get(f"react_chain:{session_key}")
                     cps = json.loads((arc or {}).get("checkpoints") or "[]")
                     data = next((c.get("data") or {} for c in reversed(cps)
                                  if c.get("name") == "chain"), {})
@@ -571,13 +588,13 @@ class ReactLoop:
                 await self._govern_at_teardown(
                     ctx, task, int(win.get("total_used", 0)),
                     system_prompt=system_prompt, head_prompt=head_prompt, steps=steps)
-                await self._archive_chain(ctx, wm, session_id, task, steps,
+                await self._archive_chain(ctx, wm, session_key, task, steps,
                                           tokens_in, tokens_out)
                 await self._emit_waterline(ctx, int(win.get("total_used", 0)))
                 if wm is not None:
                     # 阶段 2（2.1/D1/D16）：收尾置完成标记（不删快照——供「已完成」查询/审计）。
                     # 与 wm.finish（删工作记忆键）是两条独立路径。
-                    await _snapshot_call(wm, "snapshot_mark_finished", _SNAPSHOT_TENANT, task_id)
+                    await _snapshot_call(wm, "snapshot_mark_finished", ident.tenant, task_id)
                     await wm.finish(task_id)
                 ctx.state[StateKeys.REACT_RUN_ID] = ""
                 return ReactResult(ok=True, text=out.text or "（未给出回答）", steps=steps,
@@ -638,7 +655,7 @@ class ReactLoop:
                 # 记录已完成轮的 chain（截断最近 N 条）+ 头部快照；崩溃可从最近完整轮恢复。
                 # 单 key 单 JSON（D3，原子）；不随 wm.finish 删除（D1）。经 _snapshot_call 容错：
                 # 旧/裸 wm 实现无该方法 → 跳过（快照是可选增强能力），不拖累 run。
-                await _snapshot_call(wm, "snapshot_save", _SNAPSHOT_TENANT, task_id, {
+                await _snapshot_call(wm, "snapshot_save", ident.tenant, task_id, {
                     "chain": _snapshot_chain(task.chain, snap_keep),
                     "head": dict(task.head) if task.head else None,
                     "step": steps, "budget_used": int(win.get("total_used", 0)),
@@ -672,11 +689,11 @@ class ReactLoop:
         await self._govern_at_teardown(
             ctx, task, int(win.get("total_used", 0)),
             system_prompt=system_prompt, head_prompt=head_prompt, steps=steps)
-        await self._archive_chain(ctx, wm, session_id, task, steps, tokens_in, tokens_out)
+        await self._archive_chain(ctx, wm, session_key, task, steps, tokens_in, tokens_out)
         await self._emit_waterline(ctx, int(win.get("total_used", 0)))
         if wm is not None:
             # 阶段 2（2.1/D1/D16）：触顶收尾同样置完成标记（不删快照）
-            await _snapshot_call(wm, "snapshot_mark_finished", _SNAPSHOT_TENANT, task_id)
+            await _snapshot_call(wm, "snapshot_mark_finished", ident.tenant, task_id)
             await wm.finish(task_id)
         ctx.state[StateKeys.REACT_RUN_ID] = ""
         return ReactResult(ok=not hard, text=text, steps=steps, tokens_in=tokens_in,
@@ -1246,9 +1263,8 @@ class ReactLoop:
             pass
 
 
-# ---- 阶段 2（2.1）：跨进程 run 快照辅助 -----------------------------------------
-# tenant 暂固定 "default"（2.2 多会话扩为 {tenant}；键结构 run_snapshot:{tenant}:{task_id} 不变）。
-_SNAPSHOT_TENANT = "default"
+# ---- 阶段 2（2.2）：跨进程 run 快照辅助 -----------------------------------------
+# 身份的**退化**逻辑在内核（``core.session.coerce_identity``），本模块只消费。
 
 
 def _snapshot_chain(chain: list[dict], keep: int) -> list[dict]:

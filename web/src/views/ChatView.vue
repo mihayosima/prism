@@ -63,7 +63,8 @@ import { createStreamKernel, type StreamKernel } from '../stores/useStreamMessag
 import { createCardKernel, type CardKernel } from '../stores/useCards'
 import { messageHtml, stepRowHtml } from '../components/messages'
 import { esc } from '../components/markdown'
-import { streamChat, getStatus, getSession, resetSession, answerApproval, getApprovalPending, setApprovalMode } from '../api/endpoints'
+import { streamChat, getStatus, getSession, answerApproval, getApprovalPending, setApprovalMode } from '../api/endpoints'
+import { rotateSessionId } from '../api/session'
 import { sseFrameName } from '../api/sse'
 import type { ApprovalMode } from '../api/types'
 
@@ -244,8 +245,15 @@ async function loadSession(): Promise<void> {
   }
 }
 
+/**
+ * 新会话（2.2）：**先轮换会话标识，再清空**。
+ *
+ * 顺序不可颠倒——`resetSession()` 清的是「当前会话」，若先清后轮换，清掉的仍是旧会话
+ * （等价于以前「清空全局历史」），新会话则带着空历史开始。现语义：本浏览器切换到新会话，
+ * 旧会话的数据**仍留在服务端**（同一浏览器再次轮换回来仍可读到）。
+ */
 async function newSession(): Promise<void> {
-  await resetSession()
+  rotateSessionId()
   if (msgBox.value) msgBox.value.innerHTML = ''
   await loadSession()
 }

@@ -69,7 +69,9 @@ class WorkMemoryLike(Protocol):
     async def snapshot_save(self, tenant: str, task_id: str, data: dict,
                             ttl: int | None = None) -> None: ...
     async def snapshot_load(self, tenant: str, task_id: str) -> dict | None: ...
-    async def snapshot_list(self, tenant: str) -> list[dict]: ...
+    # ``prefix``：会话级精确前缀（``run_snapshot:{tenant}:{user}:{session}:``）。
+    # 缺省 = 租户级（``run_snapshot:{tenant}:``）——全租户扫描会**跨会话命中**（H1）。
+    async def snapshot_list(self, tenant: str, prefix: str | None = None) -> list[dict]: ...
     async def snapshot_mark_finished(self, tenant: str, task_id: str) -> None: ...
     async def snapshot_flag_finished(self, tenant: str, task_id: str) -> None: ...
 
@@ -173,9 +175,14 @@ class InMemoryWorkMemory:
         except Exception:                       # noqa: BLE001 —— 坏数据视同缺失
             return None
 
-    async def snapshot_list(self, tenant: str) -> list[dict]:
+    async def snapshot_list(self, tenant: str, prefix: str | None = None) -> list[dict]:
+        # 2.2（H1）：``prefix`` 给定时按**会话级**精确匹配；缺省退化为租户级（旧行为）。
+        # ★ 关键纪律：``task_id`` **一律按租户前缀剥离**。扫描前缀可以窄（会话级），
+        #   但回读走 ``snapshot_load(tenant, task_id)`` = 租户前缀 + **完整** task_id；
+        #   若按扫描前缀剥离，返回会只剩 run_id，续接时按它回读必然落空。
         now = time.time()
-        pfx = f"{_SNAP_PREFIX}{tenant or 'default'}:"
+        base = f"{_SNAP_PREFIX}{tenant or 'default'}:"
+        pfx = prefix or base
         out: list[dict] = []
         for key, (exp, raw) in list(self._snap.items()):
             if exp < now or not key.startswith(pfx):
@@ -184,7 +191,7 @@ class InMemoryWorkMemory:
                 data = json.loads(raw)
             except Exception:                   # noqa: BLE001
                 continue
-            out.append({"task_id": key[len(pfx):],
+            out.append({"task_id": key[len(base):] if key.startswith(base) else key,
                         "status": data.get("status"), "ts": data.get("ts") or ""})
         out.sort(key=lambda x: x.get("ts") or "", reverse=True)
         return out
@@ -306,8 +313,13 @@ class RedisWorkMemory:
         except Exception:                       # noqa: BLE001
             return None
 
-    async def snapshot_list(self, tenant: str) -> list[dict]:
-        pfx = f"{_SNAP_PREFIX}{tenant or 'default'}:"
+    async def snapshot_list(self, tenant: str, prefix: str | None = None) -> list[dict]:
+        # 2.2（H1）：``prefix`` 给定时按**会话级**精确匹配（SCAN 范围随之缩小几个数量级）；
+        # 缺省退化为租户级（旧行为，仅管理面/兼容用）。
+        # ★ 关键纪律（同 InMemory）：``task_id`` **一律按租户前缀剥离**——扫描前缀可窄，
+        #   但回读 ``snapshot_load(tenant, task_id)`` 用的是完整 task_id。
+        base = f"{_SNAP_PREFIX}{tenant or 'default'}:"
+        pfx = prefix or base
         out: list[dict] = []
         async for k in self._r.scan_iter(match=pfx + "*"):
             ks = k if isinstance(k, str) else k.decode("utf-8")
@@ -318,7 +330,7 @@ class RedisWorkMemory:
                 data = json.loads(raw)
             except Exception:                   # noqa: BLE001
                 continue
-            out.append({"task_id": ks[len(pfx):],
+            out.append({"task_id": ks[len(base):] if ks.startswith(base) else ks,
                         "status": data.get("status"), "ts": data.get("ts") or ""})
         out.sort(key=lambda x: x.get("ts") or "", reverse=True)
         return out

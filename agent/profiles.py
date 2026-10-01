@@ -80,6 +80,11 @@ BASE_AGENT_CONFIG: dict = {
         "work_memory": {"enabled": True, "ttl": 3600, "prefix": "wm:",
                         "required": False, "snapshot_ttl_s": 86400,
                         "snapshot_chain_keep": 20},
+        # 阶段 2（2.2）：会话/租户身份的**服务端配置面**。
+        # - tenant/user **只来自此处**（客户端可伪造 ⇒ 不下放）；
+        # - session **不由此处决定**：默认 ``default``，实际值来自请求头 ``X-Session-Id``
+        #   （无隔离语义，伪造只影响伪造者自己）。三者的键构造规则见 ``core/session.py``。
+        "session": {"tenant": "default", "user": "default"},
     },
 }
 
