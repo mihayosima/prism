@@ -3,7 +3,7 @@
 管理：本包位于 agent/plugins/，经「插件」页可停用 / 启用 / 卸载（引擎式 desired/actual/delta）。
 语义上是**系统组件**（layer=system，与 guard/llm 同级）；放进 plugins 目录只是采用
 「目录插件」这一生命周期形态 —— 来源决定能否启停卸，layer 只是标签，二者正交。
-默认启用（见 data/agent_plugin_state.json）；停用后 ctx.has("memory") 为 False，chat 自动跳过记忆。
+已启用（依据 data/agent_plugin_state.json；**代码级默认是 opt-in** —— 该文件缺失时全部目录插件停用）；停用后 ctx.has("memory") 为 False，chat 自动跳过记忆。
 
 把「时序事实 + 打分衰减 + 上下文注入」压成一个自洽插件：
   表：agent_memories / agent_entities / agent_memory_edges（namespace agent_，DDL 在 agent/tables.py 由 Storage 建）

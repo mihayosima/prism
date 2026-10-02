@@ -36,6 +36,9 @@ from __future__ import annotations
 
 from agent.api import (Events, Services, SESSION_CFG_VIEW, StateKeys, cost_factor,
                        durable, estimate_request_cost, now_iso, plugin)
+# 账单表的补列定义归口 agent/tables.py（表结构真相源），此处只负责**执行**。
+# 沿用 sys → agent.tables 的既有导入方向（先例：sys/storage.py 导入 MIGRATIONS）。
+from agent.tables import BUDGET_LOG_FIELDS
 
 # 状态分桶上限（与配置覆盖的 sessions 上限**独立**）：只防内存无限增长，
 # 淘汰最久未用的桶；淘汰只丢「累计值」，不影响任何已落账的账单。
@@ -168,9 +171,10 @@ class Budget:
         model = ((ctx.config or {}).get("agent") or {}).get("llm", {}).get("model", "fixture")
         base_raw = (max_tokens, raw_reserve, raw_ratio)
         _spent_map(ctx)                      # 初始化（并把旧 int 形状迁移为分桶）
-        # F2/P3：账单列幂等迁移（run_id / cache_hit / session）
-        for col, decl in (("run_id", "TEXT"), ("cache_hit", "INTEGER"),
-                          ("reasoning_tokens", "INTEGER"), ("session", "TEXT")):
+        # F2/P3：账单明细列**幂等补列**——定义见 agent/tables.py::BUDGET_LOG_FIELDS
+        # （表结构真相源归口于该文件；此处不写死列名，避免"看表结构要翻两处"）。
+        # 容错是刻意的：存量库这些列早已存在，ALTER 必然报 duplicate column。
+        for col, decl in BUDGET_LOG_FIELDS:
             try:
                 await ctx.db.execute(
                     ctx, f"ALTER TABLE agent_budget_log ADD COLUMN {col} {decl}", ())

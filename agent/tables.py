@@ -64,6 +64,23 @@ _MSG_FIELDS = [
     "ALTER TABLE agent_messages ADD COLUMN compressed_into INTEGER",
 ]
 
+# agent_budget_log 的记账明细列（F2/P3：缓存命中 / 思考 token / 会话归属）。
+#
+# ⚠️ **为什么不写成上面那样的 MIGRATIONS 条目**：这些列在**存量库里已被早期运行时 ALTER
+# 加过**，而 MigrationRegistry 无容错（任一语句失败即整组回滚，见 sys/storage.py:120-126）
+# ⇒ `ALTER TABLE ADD COLUMN` 会报 duplicate column ⇒ 迁移失败 ⇒ **服务起不来**。
+# SQLite 亦不支持 `ADD COLUMN IF NOT EXISTS`，迁移条目只接受裸 SQL，塞不进条件判断。
+# 故采取：**定义收口到本文件**（表结构真相源归一，不必再翻插件代码），
+# 执行仍由 budget 插件在装配期以 try/except 容错跑（幂等：已存在即跳过）。
+# 注：`run_id` 已出现在上方 _BUDGET 的建表 DDL 中，此处保留是为了兼容「更旧的、
+# 建表时尚无该列」的库——运行时补列因此也是幂等的。
+BUDGET_LOG_FIELDS = [
+    ("run_id", "TEXT"),
+    ("cache_hit", "INTEGER"),
+    ("reasoning_tokens", "INTEGER"),
+    ("session", "TEXT"),
+]
+
 
 # ---- 已废弃迁移（仅登记名称，不再执行任何 DDL） ----
 # 早期领域版本曾建 agent_runs / agent_scores / agent_picks / agent_candidates 四表；代码已移除，
@@ -92,4 +109,4 @@ MIGRATIONS = [
     ("agent_012_message_fields", _per("sqlite", *_MSG_FIELDS), "agent_messages 扩 token_count + compressed_into（兼容旧库 ALTER）"),
 ]
 
-__all__ = ["MIGRATIONS"]
+__all__ = ["MIGRATIONS", "BUDGET_LOG_FIELDS"]

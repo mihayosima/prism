@@ -4,7 +4,9 @@
 - 服务读取：``ctx.<key>`` ≡ ``ctx.get(key, default)``；缺失属性读抛 ServiceNotFoundError（附可用键清单）。
 - 可逆副作用：``ctx.effect(disposer)``；作用域 teardown 逆序执行（对称卸载）。
 - 事件监听：``ctx.on / ctx.once``，依赖 ``events`` 服务；teardown 对称移除。
-- 子作用域：``ctx.child / ctx.scope``（GC 单元）；插件级 ``capture/release`` 供容器对称回收。
+- 子作用域：``ctx.child / ctx.scope``（GC 单元）。**当前生产代码仅 ``sys/progress.py`` 一处
+  在用**（SSE 订阅作用域），其余是预留能力——注意子 ctx 的 ``state`` **不继承父级**（见 ``child()``）。
+  插件级 ``capture/release`` 供容器对称回收。
 
 零业务词（test_agent_purity 守卫）。
 """

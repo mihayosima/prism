@@ -4,7 +4,9 @@
   teardown 经 ctx.effect 对称展开（注册即逆）。
 - 依赖解析 = inject 拓扑（Kahn）；缺失给缺失清单；环报错；服务键唯一（D-3）。
 - 装配/启动按拓扑序；卸载逆序回收每插件（capture/release + effect 逆序）。
-- 硬化：apply 期读某服务必须已声明 inject（不靠字母序巧合）——未声明则 ctx.get=default 或属性读报错。
+- inject 的作用是**排序**（拓扑保证提供者先 apply）；内核**不校验**「读某服务前是否声明了
+  inject」——未声明且提供者恰好排在后面时，读到的就是 default（或属性读抛 ServiceNotFoundError）。
+  故「读什么就声明什么」属**纪律，非强制**（当前无任何运行时检查）。
 
 零业务词（test_agent_purity 守卫）。
 """
