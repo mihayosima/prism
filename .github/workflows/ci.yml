@@ -72,6 +72,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
+      # ⚠️ 必须补的环境前提（CI #1 实测暴露，本地察觉不到）：
+      #   check-view-switch 的「Perms 档位按钮」「Settings 表单控件 ≥20」断言隐含
+      #   「业务插件已启用」：而 data/ 被 gitignore ⇒ CI 全新检出时
+      #   data/agent_plugin_state.json 不存在 ⇒ pm.enabled() 为空 ⇒ approval/context
+      #   未启用 ⇒ 控件骤降（实测 Settings 只 7 个控件、Perms 0 个按钮），断言失败。
+      #   本地之所以"全绿"，是因为 data/ 里有历史残留状态 —— 这不是自包含的检查。
+      #   这里按 agent/plugins/ 目录动态生成，避免插件清单写死后漂移。
+      - name: 初始化插件期望态（等价于本地 data/agent_plugin_state.json）
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          root = pathlib.Path("agent/plugins")
+          names = sorted(
+              f"plugins.{d.name}" for d in root.iterdir()
+              if d.is_dir() and not d.name.startswith("_")
+              and any((d / m).is_file() for m in ("__init__.py", "plugin.py"))
+          )
+          pathlib.Path("data").mkdir(exist_ok=True)
+          pathlib.Path("data/agent_plugin_state.json").write_text(
+              json.dumps({"enabled": names, "removed": []}, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          print(f"已生成插件期望态：{len(names)} 个 -> {names}")
+          PY
+
       # --fixture：离线夹具模式，不需要任何 LLM API key（CI 里没有密钥）
       - name: 启动后端（fixture 离线模式）
         run: |
@@ -84,6 +109,19 @@ jobs:
             sleep 2
           done
           curl -fsS http://127.0.0.1:8720/api/status
+
+      # ⚠️ 同类环境前提之二（CI 实测暴露）：
+      #   check-views-functional 的「events 表头含 seq/event/at/payload」要求
+      #   agent_events 表**非空**——干净环境里事件表为空，events 页不渲染表头，
+      #   断言即失败（实测 47 passed/1 failed）。本地"全绿"靠的是历史累积事件。
+      #   预热一条 fixture 消息即可产生 CHAT_IN / DONE / waterline 等 durable 事件。
+      #   消息用纯 ASCII：Git Bash 下中文会被转码成非 UTF-8，导致 body 解析失败。
+      - name: 预热（产生 agent_events 数据，供 events 页对拍）
+        run: |
+          curl -fsS -X POST http://127.0.0.1:8720/api/chat \
+            -H 'Content-Type: application/json' \
+            -d '{"message":"ci warmup"}' > /dev/null
+          echo "预热完成"
 
       - uses: actions/setup-node@v4
         with:
