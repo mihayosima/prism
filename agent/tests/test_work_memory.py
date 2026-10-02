@@ -118,8 +118,15 @@ def test_redis_lifecycle():
 
 
 def test_plugin_degrades_without_redis(tmp_path):
-    """无 Redis server（即便装了 redis 库也无服务）→ 降级 InMemoryWorkMemory，不致崩。"""
-    c = _build(tmp_path)
+    """Redis 不可用 → 降级 InMemoryWorkMemory，不致崩。
+
+    用**显式不可达 URL**（端口 1）构造「无 Redis」，不再依赖「本机恰好没跑 Redis」
+    —— 后者会让本测试在起了 Redis 的环境（本地部署验证、CI 加 redis service）里假红。
+    """
+    c = build_agent(
+        config={"db_path": str(tmp_path / "agent.db"),
+                "agent": {"work_memory": {"url": "redis://127.0.0.1:1/0"}}},
+        plugin_mgr=_pm(tmp_path))
 
     async def s():
         await c.assemble()
@@ -310,3 +317,96 @@ def test_plugin_required_raises_when_redis_unavailable(tmp_path):
         raise AssertionError("required=True 且 Redis 不可用时应装配失败（启动失败）")
 
     _run(s())
+
+
+# ---------------------------------------------------------------------------
+# Redis 连接串解析：显式配置 > PRISM_REDIS_URL > 默认
+#
+# 为什么要有 env 通道：容器/编排部署下无法预置 data/agent_plugin_config.json
+# （data/ 是挂载卷且被 gitignore），而 compose 网络内必须用服务名 redis:6379。
+# ---------------------------------------------------------------------------
+
+def test_resolve_url_prefers_explicit_config(monkeypatch):
+    from agent.plugins.work_memory import resolve_redis_url
+    monkeypatch.setenv("PRISM_REDIS_URL", "redis://from-env:6379/0")
+    assert resolve_redis_url({"url": "redis://from-config:6379/0"}) == \
+        "redis://from-config:6379/0"
+
+
+def test_resolve_url_falls_back_to_env(monkeypatch):
+    from agent.plugins.work_memory import resolve_redis_url
+    monkeypatch.setenv("PRISM_REDIS_URL", "redis://from-env:6379/0")
+    assert resolve_redis_url({}) == "redis://from-env:6379/0"
+    assert resolve_redis_url(None) == "redis://from-env:6379/0"
+
+
+def test_resolve_url_default_when_nothing_set(monkeypatch):
+    from agent.plugins.work_memory import resolve_redis_url
+    monkeypatch.delenv("PRISM_REDIS_URL", raising=False)
+    assert resolve_redis_url({}) == "redis://localhost:6379/0"
+
+
+def test_resolve_url_ignores_blank_values(monkeypatch):
+    """空串/纯空白视同未设置 —— 否则编排里一个空的 ${PRISM_REDIS_URL}
+    会把连接串变成空串，报出难以理解的解析错误。"""
+    from agent.plugins.work_memory import resolve_redis_url
+    monkeypatch.setenv("PRISM_REDIS_URL", "   ")
+    assert resolve_redis_url({"url": "  "}) == "redis://localhost:6379/0"
+
+
+def test_env_url_reaches_redis_client(tmp_path, monkeypatch):
+    """端到端：env 里的 URL 确实被**交给 Redis 客户端**（而非只在纯函数里生效）。
+
+    换掉 ``redis.asyncio.from_url`` 捕获入参 —— 只看 ``resolve_redis_url`` 的返回值
+    证明不了「apply 真的用了它」。
+    """
+    import redis.asyncio as aioredis
+
+    seen: dict = {}
+
+    def _fake_from_url(url, **kw):                           # noqa: ANN001
+        seen["url"] = url
+        raise RuntimeError("stop-here：仅为捕获 url，不求连通")
+
+    monkeypatch.setattr(aioredis, "from_url", _fake_from_url)
+    monkeypatch.setenv("PRISM_REDIS_URL", "redis://from-env:6379/0")
+
+    c = build_agent(
+        config={"db_path": str(tmp_path / "agent.db"),
+                "agent": {"work_memory": {"required": True}}},   # 故意不写 url
+        plugin_mgr=_pm(tmp_path))
+
+    async def s():
+        try:
+            await c.assemble()
+        except Exception:                                    # noqa: BLE001 —— 预期装配失败
+            pass
+
+    _run(s())
+    assert seen.get("url") == "redis://from-env:6379/0", \
+        f"env 的 url 未被交给 redis 客户端：{seen}"
+
+
+def test_resolve_required_defaults_false(monkeypatch):
+    from agent.plugins.work_memory import resolve_required
+    monkeypatch.delenv("PRISM_REDIS_REQUIRED", raising=False)
+    assert resolve_required({}) is False
+    assert resolve_required(None) is False
+
+
+def test_resolve_required_explicit_config_wins(monkeypatch):
+    """显式配置优先于 env —— 与 url 的优先级口径一致。"""
+    from agent.plugins.work_memory import resolve_required
+    monkeypatch.setenv("PRISM_REDIS_REQUIRED", "1")
+    assert resolve_required({"required": False}) is False
+    assert resolve_required({"required": True}) is True
+
+
+def test_resolve_required_from_env(monkeypatch):
+    from agent.plugins.work_memory import resolve_required
+    for v in ("1", "true", "TRUE", "yes", "on", " 1 "):
+        monkeypatch.setenv("PRISM_REDIS_REQUIRED", v)
+        assert resolve_required({}) is True, f"{v!r} 应判为 True"
+    for v in ("", " ", "0", "false", "no", "off", "anything"):
+        monkeypatch.setenv("PRISM_REDIS_REQUIRED", v)
+        assert resolve_required({}) is False, f"{v!r} 应判为 False"

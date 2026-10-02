@@ -1,12 +1,14 @@
 # Agent
 
+[![CI](https://github.com/mihayosima/prism/actions/workflows/ci.yml/badge.svg)](https://github.com/mihayosima/prism/actions/workflows/ci.yml)
+
 slim Cordis 运行时 + 系统层插件 + 可管理目录插件（everything-is-a-plugin）。独立可离线自举，零外部引擎依赖。
 
 - 内核：`agent/`（`agent.api` 唯一出口）
 - 设计文档（工程根）：《agent内部架构-开发文档.md》《agent记忆架构-方案.md》《记忆插件-能力缺口分析.md》《agent通用能力-完善路线.md》《ReAct插件-设计方案.md》《审批插件-设计方案.md》《B5B6-流式与取消-设计方案.md》
 - 历史归档（**不作为工作文件参考**）：`doc/` —— 专用领域设计 / 接口接入设计 / 旧计划与路线图，说明见 `doc/README.md`
 
-**已完成**：内核（`agent.api`）· 系统插件（events / loop / llm / tasks / storage / budget / guard）· 双驱动（`loop` 任务驱动 + `chat` 会话驱动）· 真实 DeepSeek provider · 目录插件管理（引擎式 desired/actual/delta，插件页可启用 / 停用 / 卸载）· 记忆插件 `plugins.memory`（LLM 提取[过 guard/budget] + 打分衰减 + recall/context 注入；**目录插件形态，默认启用**）· **ReAct 多步循环插件 `plugins.react`**（Think→Act+Observe→收敛 + `max_steps`/时延/预算三把闸 + 工具结果截断；**目录插件形态，默认启用**）· MCP 工具桥 `plugins.windows_mcp`。· **隐式契约加固**（事件名 / 配置键 / 接线守卫三层 fail-fast）· **B5 流式输出（SSE）** · **B6 取消中断**。**103 项离线测试全绿。**
+**已完成**：内核（`agent.api`）· 系统插件（events / loop / llm / tasks / storage / budget / guard）· 双驱动（`loop` 任务驱动 + `chat` 会话驱动）· 真实 DeepSeek provider · 目录插件管理（引擎式 desired/actual/delta，插件页可启用 / 停用 / 卸载）· 记忆插件 `plugins.memory`（LLM 提取[过 guard/budget] + 打分衰减 + recall/context 注入；**目录插件形态，默认启用**）· **ReAct 多步循环插件 `plugins.react`**（Think→Act+Observe→收敛 + `max_steps`/时延/预算三把闸 + 工具结果截断；**目录插件形态，默认启用**）· MCP 工具桥 `plugins.windows_mcp`。· **隐式契约加固**（事件名 / 配置键 / 接线守卫三层 fail-fast）· **B5 流式输出（SSE）** · **B6 取消中断**。**500 项离线测试全绿。** CI（`.github/workflows/ci.yml`）在每次推送时自动跑：后端全量 pytest + 前端契约自检与生产构建 + 镜像构建与 `/health` 冒烟。
 
 **ReAct 多步循环（`plugins.react`）**：`chat` 检测到 `ctx.has("react")` 即**委托**给 ReAct 循环（未装配自动回退单步「规划→执行→解说」，chat 契约未改）。收敛判据 = 模型**不再返回工具调用**；工具一律经 `ctx.tasks.invoke`（guard/schema/审计照生效），模型一律经 `ctx.llm`（guard/budget 照生效）——**无特权通道**。工具异常/参数错/被拒都转成观察回灌让模型自纠（同一工具连拒超 `max_rejects` 才终止）；触顶时如实标注（durable `agent/react/exhausted`）并再答一次。四组件（reasoner/actor/observer/finalizer）是**可换接缝**：`ctx.provide("react.actor", ...)` 即可替换。停用插件 → 回到单步路径。
 
@@ -34,3 +36,44 @@ python -m agent.run.chat --once "你好"    # 无头跑一次后退出
 ```
 
 凭据：真实 key 放 `local_secrets.json`（已在 `.gitignore`，绝不入库）；或 `env DEEPSEEK_API_KEY`。线上支持模型名 `deepseek-flash` / `deepseek-v4-pro`（`deepseek_v4_flash` 为 harness 内部名，线上 API 不收）。
+
+## 容器化部署
+
+前置：Docker（含 Compose v2）。
+
+```bash
+# 全栈（agent 服务 + Redis）
+DEEPSEEK_API_KEY=sk-xxx docker compose up -d --build
+# 访问 http://127.0.0.1:8720
+
+# 只起 Redis（agent 在宿主机上直接跑）
+docker compose up -d redis
+python -m agent.run.chat
+```
+
+**Redis 不是可选项。** 它承载 `work_memory` 的 run 快照，是**跨进程 / 跨重启续接**的前提。
+不可用时插件会降级为进程内记忆（启动打 WARNING），**断点续传静默失效** —— 代码在位、能力不生效，这类落差最难发现。因此：
+
+- `docker-compose.yml` 对 prism 显式设了 `PRISM_REDIS_REQUIRED=1`：Redis 连不上就**启动失败**（fail-fast），不静默降级。
+- 容器内用服务名连接 `redis://redis:6379/0`（`PRISM_REDIS_URL`）；宿主机直连用 `redis://localhost:6379/0`。
+  ⚠️ 若把 Redis 端口限制为 `127.0.0.1:6379:6379`，宿主侧请改用 `PRISM_REDIS_URL=redis://127.0.0.1:6379/0` —— Windows 上 `localhost` 会优先解析到 IPv6 `::1`，只绑 IPv4 时会连接超时并触发降级。
+- 生产加固（deny-by-default + 强制 token）：见 `docker-compose.yml` 里 `--hardened --token` 的注释。
+
+也可只用镜像：
+
+```bash
+docker build -t prism .
+docker run --rm -p 8720:8720 -v "$PWD/data:/app/data" \
+  -e DEEPSEEK_API_KEY=... \
+  -e PRISM_REDIS_URL=redis://host.docker.internal:6379/0 \
+  prism
+```
+
+## 环境变量（运维侧）
+
+| 变量 | 作用 | 默认 |
+| --- | --- | --- |
+| `DEEPSEEK_API_KEY` | LLM 密钥（亦可放 `local_secrets.json`） | 无 |
+| `PRISM_REDIS_URL` | `work_memory` 的 Redis 连接串（优先于插件配置） | `redis://localhost:6379/0` |
+| `PRISM_REDIS_REQUIRED` | `1/true/yes/on` ⇒ Redis 不可用时**启动失败**，不降级 | 关 |
+| `PRISM_METRICS_SESSION_LABELS` | `/metrics` 输出 per-session 标签（注意标签基数） | 关 |

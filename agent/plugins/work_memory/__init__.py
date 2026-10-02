@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from agent.api import Services, plugin
@@ -27,6 +28,36 @@ from agent.api import Services, plugin
 from .backend import InMemoryWorkMemory, RedisWorkMemory, WorkMemoryLike
 
 logger = logging.getLogger("agent.plugins.work_memory")
+
+
+def resolve_redis_url(cfg: dict | None = None) -> str:
+    """Redis 连接串解析（纯函数，便于单测）：显式配置 > 环境变量 > 默认。
+
+    为什么需要 ``PRISM_REDIS_URL`` 通道：容器/编排部署下**无法预置**
+    ``data/agent_plugin_config.json``（data/ 是挂载卷、且被 gitignore），
+    而 compose 网络内服务间必须用服务名（``redis:6379``）而非 ``localhost``。
+    与 ``DEEPSEEK_API_KEY``、``PRISM_METRICS_SESSION_LABELS`` 同属运维侧 env 约定。
+    """
+    cfg = cfg or {}
+    return (str(cfg.get("url") or "").strip()
+            or os.environ.get("PRISM_REDIS_URL", "").strip()
+            or "redis://localhost:6379/0")
+
+
+def resolve_required(cfg: dict | None = None) -> bool:
+    """Redis 是否为**硬依赖**：显式配置 > ``PRISM_REDIS_REQUIRED`` > False。
+
+    语义：True 时 Redis 不可用 → 装配期 raise（启动失败，fail-fast）；
+    False（默认）→ 降级 InMemoryWorkMemory + WARNING。
+
+    为什么生产编排该置 True：降级会让**断点续传静默失效**（代码在位、能力不生效），
+    比启动失败更难发现 —— 这正是「批次 C」要消灭的那类落差。
+    """
+    cfg = cfg or {}
+    if "required" in cfg:
+        return bool(cfg["required"])
+    env = os.environ.get("PRISM_REDIS_REQUIRED", "").strip().lower()
+    return env in ("1", "true", "yes", "on")
 
 
 @plugin
@@ -55,7 +86,7 @@ class WorkMemory:
         # 阶段 2（D10）：required=True → Redis 是**硬依赖**，不可用即**启动失败**（装配期 raise，
         # 容器 fail-fast，见 core/container.py:280-287 apply 异常向上传播）；
         # False（默认，保 dev 兼容）→ 不可用则降级 InMemory + 启动 WARNING。
-        required = bool(cfg.get("required", False))
+        required = resolve_required(cfg)
         if not cfg.get("enabled", True):
             if required:
                 raise RuntimeError(
@@ -67,7 +98,7 @@ class WorkMemory:
             return
         try:
             import redis.asyncio as aioredis                 # 延迟导入（第三方）
-            url = cfg.get("url", "redis://localhost:6379/0")
+            url = resolve_redis_url(cfg)
             client = aioredis.from_url(url, decode_responses=True, socket_connect_timeout=2)
             await client.ping()
             self._impl = RedisWorkMemory(client, ttl=ttl, prefix=prefix,

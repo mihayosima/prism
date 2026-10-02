@@ -1,0 +1,70 @@
+# prism —— 可一键复起的完整栈（agent 服务 + Redis）。
+#
+# 为什么需要它：
+#   · 批次 B 提供了镜像（Dockerfile），批次 C 引入了 Redis 依赖；
+#   · 但 work_memory 默认连 `localhost:6379` —— 在 compose 网络里那是容器**自己**，
+#     所以这里用 `PRISM_REDIS_URL` 指向服务名（env 通道见 work_memory 插件）；
+#   · Redis 不持久化的话，重启即丢 run 快照 ⇒ 断点续传静默失效，
+#     故 Redis 显式开启 AOF。
+#
+# 用法：
+#   DEEPSEEK_API_KEY=sk-xxx docker compose up -d --build
+#   docker compose logs -f prism
+#   open http://127.0.0.1:8720
+#
+# 只想要 Redis（服务在宿主机上跑）：
+#   docker compose up -d redis
+#
+# 生产加固：给 prism 的 command 追加 `--hardened --token <TOKEN>`（见下方注释）。
+
+services:
+  redis:
+    image: redis:7-alpine
+    # AOF 持久化：没有它，Redis 一重启快照全丢，跨重启续传就废了。
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    # 端口映射说明（踩过的坑）：这里**不能**写成 "127.0.0.1:6379:6379"。
+    # Windows 上 localhost 会**优先解析到 IPv6 ::1**，只绑 IPv4 loopback 时
+    # redis-py 连 ::1 会超时 ⇒ work_memory 以为 Redis 不可用而静默降级，
+    # 断点续传随之失效（表现为"代码在位但能力不生效"）。写成 "6379:6379"
+    # 会同时监听 0.0.0.0 与 [::]，宿主与容器都能连。
+    # 若部署环境要求仅本机可访问，改成 "127.0.0.1:6379:6379"，**同时**给 prism
+    # 设 PRISM_REDIS_URL=redis://127.0.0.1:6379/0（绕开 localhost 的 IPv6 优先解析）。
+    ports:
+      - "6379:6379"
+
+  prism:
+    build: .
+    depends_on:
+      redis:
+        # 等 Redis 真的 PING 通再起 —— 否则 required=1 下会因连不上而启动失败
+        condition: service_healthy
+    ports:
+      - "8720:8720"
+    environment:
+      # compose 网络内必须用服务名（不是 localhost）
+      PRISM_REDIS_URL: redis://redis:6379/0
+      # 生产形态：Redis 不可用即**启动失败**，不静默降级。
+      # 降级会让断点续传"代码在位但能力不生效"，比启动失败更难发现。
+      PRISM_REDIS_REQUIRED: "1"
+      # LLM 密钥由外部注入，绝不写进镜像
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    volumes:
+      # SQLite 库 / 插件期望态 / 配置覆盖
+      - prism-data:/app/data
+    restart: unless-stopped
+    # 生产加固（deny-by-default + 强制 token）——取消注释并替换 TOKEN：
+    # command: ["python", "-m", "agent.run.chat", "--host", "0.0.0.0",
+    #           "--port", "8720", "--hardened", "--token", "REPLACE_ME"]
+
+volumes:
+  redis-data:
+  prism-data:
