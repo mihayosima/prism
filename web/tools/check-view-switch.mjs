@@ -434,7 +434,7 @@ await go('events')
 {
   const s = secOf('events')
   const chips = findAll(s, (e) => e.classList.contains('chip') && e.hasAttribute('data-ev'))
-  ok('Events 有 4 个过滤器', chips.length === 4, `实得 ${chips.length}`)
+  ok('Events 有 5 个过滤器', chips.length === 5, `实得 ${chips.length}`)
   if (chips.length) {
     chips[1].dispatch('click')
     await settle(400)

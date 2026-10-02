@@ -58,6 +58,21 @@ export const APPROVAL_PROVIDER_LABELS: Record<string, string> = {
   cli: '终端问答（y=批 / a=本会话总是允许）',
 }
 
+/** G7 沙箱裁决档位（与后端 `_SETTING_META` 里 `default` 键的 choice 集合一致） */
+export const SANDBOX_DECISIONS = ['allow', 'ask', 'deny'] as const
+export const SANDBOX_DECISION_LABELS: Record<string, string> = {
+  allow: '放行（只记审计，行为与未启用沙箱一致）',
+  ask: '拒绝并在理由里点名（要放行请加入 allow 白名单）',
+  deny: '拒绝（兜底裁决）',
+}
+
+/** G7 沙箱三项名单键的中文标签（渲染用；键名与后端设置键一致） */
+export const SANDBOX_FIELD_LABELS: Record<string, string> = {
+  targets: '管辖范围 targets（工具名模式，逗号分隔）',
+  allow: '放行名单 allow（工具名模式，逗号分隔）',
+  deny: '拒绝名单 deny（工具名模式，逗号分隔）',
+}
+
 /** 保存时收集的数值键顺序（legacy app.js:552，原样） */
 export const SETTINGS_NUMERIC_KEYS = [
   'max_tokens_per_run',
@@ -390,6 +405,67 @@ export function renderSettingsHtml(j: SettingsResponse, scope: SettingsScope = '
       '<div class="muted" style="' +
       HINT +
       '">命中名单的工具执行前必问人；配合对话页「审批」档可让所有非只读工具都问</div></label></div>'
+  }
+
+  // ---- G7 外部工具准入沙箱（plugins.sandbox）----
+  // 目录插件默认关 ⇒ 未启用时明确提示"不受本层管辖"，避免"以为受保护"的错觉。
+  if (j.sandbox_enabled === false) {
+    h +=
+      '<div class="card muted" style="margin-top:16px">外部工具准入沙箱（plugins.sandbox）未启用 —— 在「插件」页点「启用」后，可在此调整。启用前外部工具不受本层管辖，行为与现在一致。</div>'
+  } else {
+    const listInp = (k: string, ph: string, hint: string): string =>
+      '<label style="' +
+      LABEL +
+      '"><div style="font-weight:600;margin-bottom:3px">' +
+      esc(SANDBOX_FIELD_LABELS[k]) +
+      sessTag(k) +
+      '</div>' +
+      '<input id="set_' +
+      k +
+      '" type="text" value="' +
+      esc(((v[k] || []) as string[]).join(', ')) +
+      '" placeholder="' +
+      esc(ph) +
+      '" style="width:360px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit"' +
+      dis(k) +
+      '>' +
+      '<div class="muted" style="' +
+      HINT +
+      '">' +
+      esc(hint) +
+      '</div></label>'
+    h +=
+      '<div class="card" style="margin-top:16px"><h3 style="margin-top:0">外部工具准入 · 沙箱（plugins.sandbox）</h3>' +
+      '<div class="muted" style="margin-bottom:10px">按<b>工具名模式</b>决定哪些外部工具（默认 mcp.*）可被调用，每次裁决都落审计账本（见「事件」视图的「沙箱」过滤项）。<b>启用 ≠ 已收紧</b>：默认档位是「放行」，本层目前只增加可追溯性；黑名单命中才拒，拒因会写进审计与报错文本。</div>' +
+      listInp('targets', 'mcp.*, *', '受本层管辖的工具名模式（逗号分隔）。尾部 * 通配；不在此列表的工具完全不受影响。') +
+      '<label style="' +
+      LABEL +
+      '"><div style="font-weight:600;margin-bottom:3px">兜底裁决 default' +
+      sessTag('default') +
+      '</div>' +
+      '<select id="set_default" style="' +
+      SEL +
+      '"' +
+      dis('default') +
+      '>' +
+      SANDBOX_DECISIONS.map(
+        (o) =>
+          '<option value="' +
+          o +
+          '"' +
+          (v.default === o ? ' selected' : '') +
+          '>' +
+          o +
+          '（' +
+          SANDBOX_DECISION_LABELS[o] +
+          '）</option>',
+      ).join('') +
+      '</select><div class="muted" style="' +
+      HINT +
+      '">未命中任何名单时的裁决。<b>allow</b> = 与未启用沙箱行为一致（只记审计）。</div></label>' +
+      listInp('allow', 'mcp.playwright.*', '白名单模式；<b>不能穿透黑名单</b>（deny 优先判定）。') +
+      listInp('deny', 'mcp.windows.*', '黑名单模式；命中即拒，审计与报错都会写明命中的是哪一条。') +
+      '</div>'
   }
 
   h +=

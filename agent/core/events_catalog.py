@@ -38,6 +38,13 @@ class Events:
     # 权限决策（guard 落审计；前端「权限」过滤用同名）
     PERMISSION_DECISION = "agent/permission/decision"
 
+    # 外部工具准入（plugins.sandbox）：durable 直写（不经总线）。
+    # **刻意另立**而非复用 PERMISSION_DECISION（用户裁定）：沙箱的裁决依据是
+    # "名称模式 + 会话"，与权限矩阵（guard）是**两套判据**，混在一张事件里会让
+    # 「最近裁决」无法区分是谁拒的。代价：前端「权限」视图的"最近裁决"不再包含
+    # 沙箱行；改由「事件」视图的 `agent/sandbox` 过滤项查看。
+    SANDBOX_DECISION = "agent/sandbox/decision"
+
     # 审批插件（plugins.approval）：asked/answered/timeout/mode_changed 由 durable
     # 直写 agent_events（不经总线）；PENDING 为 live emit（第 2 期前端弹窗消费）
     APPROVAL_ASKED = "agent/approval/asked"
@@ -109,6 +116,7 @@ EVENT_MODE: dict[str, str] = {
     Events.CHAT_DONE: "emit",
     Events.CHAT_RESET: "emit",
     Events.PERMISSION_DECISION: "emit",   # durable 落盘（审计脊柱）
+    Events.SANDBOX_DECISION: "emit",     # 同上（plugins.sandbox 准入裁决，另立事件）
     Events.APPROVAL_ASKED: "emit",        # durable 直写（审计脊柱）；bus 无监听者
     Events.APPROVAL_ANSWERED: "emit",     # 同上
     Events.APPROVAL_TIMEOUT: "emit",      # 同上

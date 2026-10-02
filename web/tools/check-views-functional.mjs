@@ -449,7 +449,7 @@ await go('events')
 
   // 过滤器：切到「权限」后，渲染行数应 ≤ 全量
   const chips = findAll(s, (e) => e.classList.contains('chip') && e.hasAttribute('data-ev'))
-  ok('events 有 4 个过滤器', chips.length === 4, `实得 ${chips.length}`)
+  ok('events 有 5 个过滤器', chips.length === 5, `实得 ${chips.length}`)
   const permChip = chips.find((c) => c.getAttribute('data-ev') === 'agent/permission/decision')
   if (permChip) {
     permChip.dispatch({ type: 'click' })

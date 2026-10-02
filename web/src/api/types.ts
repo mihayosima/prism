@@ -262,6 +262,8 @@ export interface SettingsResponse {
   domains?: SettingsDomainOption[]
   context_plugin_enabled?: boolean
   approval_enabled?: boolean
+  /** G7：外部工具准入沙箱（plugins.sandbox）是否启用（目录插件默认关） */
+  sandbox_enabled?: boolean
   /** 当前请求落在哪个会话键（`{user}:{session}`） */
   session_id?: string
   /** 允许写到「本会话」层的设置键白名单（G2 会话级化） */

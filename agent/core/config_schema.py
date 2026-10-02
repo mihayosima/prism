@@ -56,6 +56,14 @@ _SCHEMA: dict[str, Any] = {
         "system_memory": "_any",
         "work_memory": "_any",
         "short_term": "_any",
+        # G7（外部工具准入沙箱）：**逐键严格**而非 "_any"（沿用 context/budget 的纪律：
+        # 拼错键在装配期即 fail-fast）。登记这一节是**硬前提**——``_merge_cfg`` 把容器级
+        # 覆盖按 ``plugins.<名>`` → ``agent.<名>`` 映射进来，而 ``validate_config`` 在每次
+        # 装配都跑；不登记 ⇒ 用户一写 sandbox 配置就是 ``ConfigError`` ⇒ 服务起不来。
+        # 注：``allow``/``deny``/``default`` 是扁平设置键的通用名（approval 已有
+        # ``ask``/``provider`` 同款），由 ``_SETTING_META`` 的单值映射保证不歧义。
+        "sandbox": {"targets": list, "default": str, "allow": list,
+                    "deny": list, "risk": dict},
     },
     # 插件自管顶层节
     "windows_mcp": "_any",

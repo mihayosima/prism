@@ -70,6 +70,19 @@ function collectPatch(): Record<string, unknown> {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean)
+  // G7 沙箱三项名单（逗号分隔 → 字符串数组；后端 list 分支会再规整一遍）。
+  // 注意：只提交**控件确实渲染**的键 —— 插件未启用时整段不渲染，若此时提交空数组
+  // 会把用户已有的配置静默清空（与 tool_domains 同款陷阱，故此处逐个判存在）。
+  for (const k of ['targets', 'allow', 'deny']) {
+    const el = host.value?.querySelector<HTMLInputElement>('#set_' + k)
+    if (el && allow(k))
+      patch[k] = el.value
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+  }
+  const sdv = host.value?.querySelector<HTMLSelectElement>('#set_default')
+  if (sdv && allow('default')) patch.default = sdv.value
   return patch
 }
 

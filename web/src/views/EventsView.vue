@@ -32,6 +32,9 @@ import type { Row, EventsResponse } from '../api/types'
 const FILTERS = [
   { value: 'all', label: '全部' },
   { value: 'agent/permission/decision', label: '权限' },
+  // G7 外部工具准入（plugins.sandbox）：**另立事件**，故「权限」视图不收它，
+  // 在此单列一个过滤项（filterEvents 用 startsWith 匹配，前缀即可）。
+  { value: 'agent/sandbox', label: '沙箱' },
   { value: 'agent/chat', label: '会话' },
   { value: 'agent/turn', label: '运行' },
 ] as const

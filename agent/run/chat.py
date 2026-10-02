@@ -274,6 +274,22 @@ _SETTING_META: dict[str, dict] = {
         "spec": ("bool",), "plugin": "plugins.react",
         "default": _REACT_DEFAULTS.get("alignment_enabled", True),
         "scope": "container"},
+    # ---- G7 外部工具准入沙箱（plugins.sandbox）----
+    # 键名取**裸名**（与 approval 的 ask/provider 同款）：设置层是扁平单值命名空间，
+    # 由 _PLUGIN_OF_KEY 保证不歧义。``risk`` 刻意**不进设置页**——已核实 MCP 工具
+    # 全部是 write 档（两处 register 都没传 risk），放上去是个无效旋钮，只走配置文件。
+    "targets": {
+        "spec": ("list",), "plugin": "plugins.sandbox",
+        "default": ["mcp.*"], "scope": "session"},
+    "default": {
+        "spec": ("choice", ["allow", "ask", "deny"]), "plugin": "plugins.sandbox",
+        "default": "allow", "scope": "session"},
+    "allow": {
+        "spec": ("list",), "plugin": "plugins.sandbox",
+        "default": [], "scope": "session"},
+    "deny": {
+        "spec": ("list",), "plugin": "plugins.sandbox",
+        "default": [], "scope": "session"},
 }
 
 # 以下三张表为**派生视图**（保留旧名：既有测试与调用点零改动）——单一真相源是 _SETTING_META。
@@ -1233,8 +1249,11 @@ async def _serve(args: argparse.Namespace) -> int:
         # 设置页区分「容器级 / 本会话级」并渲染「重置为继承」。
         values = _setting_values(_store().effective(sk))
         ap_enabled = "plugins.approval" in set(pm.enabled())
+        # G7：沙箱插件默认关（目录插件惯例）⇒ 设置页据此提示"未启用"，与 context/approval 同款
+        sb_enabled = "plugins.sandbox" in set(pm.enabled())
         return {"context_plugin_enabled": ctx_enabled,
-                "approval_enabled": ap_enabled, "values": values,
+                "approval_enabled": ap_enabled, "sandbox_enabled": sb_enabled,
+                "values": values,
                 "session_id": sk,
                 "scopable": sorted(_SETTING_SCOPABLE),
                 "container": _setting_values(_store().container()),
