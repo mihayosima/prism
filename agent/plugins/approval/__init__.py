@@ -1,7 +1,10 @@
 """插件包：approval —— 人在环中（审批）与权限模式（设计稿 v1.2 第 1/2 期）。
 
 职责三分（互不混同，见设计稿 §2）：
-- **mode**（会话档位 default/plan/auto/bypass）：本插件持有，写 ``ctx.state["permission_mode"]``；
+- **mode**（会话档位 default/plan/auto/bypass）：本插件持有，写
+  ``ctx.state["permission_mode"]`` —— R1 补（2026-10-02）起值是 **``dict[会话键, mode]``**
+  （此前为单值 str ⇒ 「会话级语义、容器级存储」，A 会话切 bypass 会放行 B 会话在跑 run
+  的审批闸）。读写一律经内核助手 ``current_permission_mode()`` / ``set_permission_mode()``。
 - **policy**（三态 allow/deny/ask + fnmatch）：``policy.py`` 纯函数；
 - **provider**（怎么问人）：``providers.py`` 可换接缝（非交互 auto-deny/auto-allow、
   交互式 web 经 ``pending.py`` + SSE 弹窗信号 + 入站应答接口）。
@@ -25,7 +28,8 @@ import time
 import uuid
 
 from agent.api import (AgentError, Events, Services, StateKeys, current_session_key,
-                       durable, now_iso, plugin)
+                       durable, now_iso, current_permission_mode, plugin,
+                       set_permission_mode)
 
 from .options import normalize_options
 from .pending import PendingTable
@@ -79,12 +83,16 @@ class Approval:
         # 2.2（H2）：**按会话分桶** —— 此前是全局单 set，A 的「始终允许」会泄漏给 B。
         self._session_allow: dict[str, set[str]] = {}
         self._session_deny: dict[str, set[str]] = {}
-        self._plan_dispose = None          # submit_plan 动态注册句柄（进 plan 注册、离开注销）
+        self._plan_dispose = None          # submit_plan 动态注册句柄（见 _sync_submit_plan）
+        # R1 补：档位已按会话分桶 ⇒ 工具注册状态也必须按会话计数（否则 A 离开 plan
+        # 会把 B 的终态工具注销）。真正的越权防线是 _submit_plan 的硬兜底自拒。
+        self._plan_sessions: set[str] = set()
         # 默认 append（不 prepend）：排 guard 之后——硬规则先裁、问人后行（设计稿 §16.3）
         ctx.on(Events.TASKS_PRE_EXECUTE, self._pre_task)
         ctx.effect(self._pending.aclose)
         ctx.provide(Services.APPROVAL, self)
-        ctx.state.setdefault(StateKeys.PERMISSION_MODE, "default")
+        # 容器级默认桶（空 ⇒ 各会话取 default）；旧单值形态仍被 current_permission_mode() 认作默认
+        ctx.state.setdefault(StateKeys.PERMISSION_MODE, {})
         # 澄清问询工具（常驻、read 级 ⇒ plan 模式亦可见）：模型不确定用户意图时
         # 主动发卡片（选项 + 自由文本）等人指示——人机交互不止于「批准/拒绝」二元。
         self._ask_dispose = ctx.tasks.register(
@@ -216,25 +224,48 @@ class Approval:
     # ---------- 会话模式（mode 的唯一持有者） ----------
 
     def mode(self) -> str:
-        """当前会话档位（缺省 default；重启即回 default——不持久化）。"""
-        return str(self._ctx.state.get(StateKeys.PERMISSION_MODE, "default"))
+        """**当前会话**档位（缺省 default；重启即回 default——不持久化）。
+
+        R1 补（2026-10-02）：经内核助手读 ``dict[会话键, mode]`` 桶中**本会话**的值；
+        此前读容器级单值 ⇒ 档位跨会话互相覆盖（A 切 bypass 会放行 B 在跑 run 的闸）。
+        """
+        return current_permission_mode(self._ctx)
 
     async def set_mode(self, ctx, mode: str, *, by: str = "user") -> None:
-        """切换会话档位并落审计。OPEN-5：切 bypass 的二次确认属第 2 期交互。"""
+        """切换**当前会话**档位并落审计。OPEN-5：切 bypass 的二次确认属第 2 期交互。
+
+        会话归属来自请求作用域通道（ContextVar，由请求入口绑定）；未绑定（如单测直调）
+        时退容器键 ``"default"`` ⇒ 行为与单会话时期一致。
+        """
         if mode not in MODES:
             raise AgentError(f"mode 须 ∈ {MODES}，得到 {mode!r}")
         old = self.mode()
-        ctx.state[StateKeys.PERMISSION_MODE] = mode
+        set_permission_mode(ctx, mode)
         self._sync_submit_plan(ctx, mode)
         await self._audit(Events.APPROVAL_MODE_CHANGED,
-                          {"from": old, "to": mode, "by": by})
+                          {"from": old, "to": mode, "by": by,
+                           "session": self._skey()})
 
     # ---------- plan 终态工具（设计稿 §6.2/§6.3；第 3 期） ----------
 
     def _sync_submit_plan(self, ctx, mode: str) -> None:
-        """进 plan 动态注册终态工具 ``submit_plan``，离开即注销（§6.2「仅 plan 可见」，
-        经注册表可达性实现——react 零改动、零感知）。"""
-        if mode == "plan" and self._plan_dispose is None:
+        """终态工具 ``submit_plan`` 的可达性：**有会话在 plan** 即注册，全都离开才注销。
+
+        §6.2「仅 plan 可见」在**容器级注册表**里的最近似实现（react 零改动、零感知）。
+        R1 补（2026-10-02）：档位按会话分桶后，注册状态按会话计数——否则 A 切回 default
+        会把正在 plan 的 B 的终态工具一并注销。
+        **残留（诚实登记）**：只要有会话在 plan，该工具对**其它会话也可见**（注册表是容器级）。
+        越权面已被 ``_submit_plan`` 的硬兜底关死（非 plan 会话调用即自拒），可见性只是
+        多一个会自拒的只读工具；要彻底按会话隔离可见性，须给注册表加"按会话可见"维度，
+        属新能力，不在本批。
+        """
+        sk = self._skey()
+        if mode == "plan":
+            self._plan_sessions.add(sk)
+        else:
+            self._plan_sessions.discard(sk)
+        want = bool(self._plan_sessions)
+        if want and self._plan_dispose is None:
             self._plan_dispose = ctx.tasks.register(
                 ctx, "approval.submit_plan",
                 schema={"plan": {"type": "string", "required": True,
@@ -242,7 +273,7 @@ class Approval:
                 handler=self._submit_plan, owner="plugins.approval",
                 description="提交执行计划以获取用户批准（仅 plan 模式可见）",
                 risk="read")
-        elif mode != "plan" and self._plan_dispose is not None:
+        elif not want and self._plan_dispose is not None:
             self._plan_dispose()
             self._plan_dispose = None
 

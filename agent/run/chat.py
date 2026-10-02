@@ -879,11 +879,16 @@ async def _serve(args: argparse.Namespace) -> int:
                 "mode": svc.mode()}
 
     @app.post("/api/approval/mode")
-    async def _approval_mode(body: dict):
-        """切换会话档位（default/plan/auto/bypass）。
+    async def _approval_mode(body: dict, request: Request):
+        """切换**本会话**档位（default/plan/auto/bypass）。
 
         OPEN-5：切 bypass 属高危（跳过一切问人），需 ``confirm=true`` 二次确认。
+
+        R1 补（2026-10-02）：档位已按会话分桶，故本端点**必须解析身份**（经 ``_identity``
+        同时绑定请求作用域）——此前不解析，`set_mode` 写的是容器级单值 ⇒ 任何会话改档位
+        都会改到全局（A 切 bypass 即放行 B 在跑 run 的审批闸）。
         """
+        _identity(request, body)                  # 解析身份（副作用：绑定请求作用域）
         svc = _approval_or_none()
         if svc is None:
             return JSONResponse({"ok": False, "error": "审批插件未启用"}, status_code=404)
@@ -926,7 +931,14 @@ async def _serve(args: argparse.Namespace) -> int:
         return await _context_view_payload(c.root, limit=limit)
 
     @app.get("/api/perms")
-    async def _perms() -> dict:
+    async def _perms(request: Request) -> dict:
+        """权限视图：策略 + 最近判定 + **本会话**档位。
+
+        R1 补（2026-10-02）：``mode`` 已按会话分桶，故本端点必须解析身份——否则
+        ContextVar 未绑定 ⇒ 走到回退分支读到**上一次聊天请求留下的会话**（不确定是哪个），
+        前端显示的档位与实际生效的档位可能不是同一个会话的。
+        """
+        _identity(request)                        # 解析身份（副作用：绑定请求作用域）
         recent = await c.root.db.query(
             c.root, "SELECT seq, payload, at FROM agent_events"
                     " WHERE event='agent/permission/decision' ORDER BY seq DESC LIMIT 30")

@@ -22,9 +22,11 @@
                          判定「这次请求属于哪个会话」的唯一依据
 - ``REACT_LAST``         react 写、react.status 读（最近一次 run 摘要）
 - ``PERMISSION_MODE``    approval 写、react 读（档位 default/plan/auto/bypass）。
-                         ⚠️ **语义是会话级、存储却在容器级**（单值）⇒ A 会话切 bypass 会放行
-                         B 会话在跑 run 的审批闸。**R1 未覆盖此键**（它需要按会话分桶，属值存储
-                         问题而非选择器问题），待裁定后修
+                         **值是 ``dict[会话键, mode]``**（R1 补 2026-10-02 起分桶，与
+                         ``BUDGET_SPENT`` 同款）——此前是单值 str（会话级语义 + 容器级存储
+                         ⇒ A 切 bypass 会放行 B 在跑 run 的审批闸）。读写**一律**经内核助手
+                         ``permission_mode()`` / ``set_permission_mode()``（形状 SSOT，且
+                         容错识别遗留的 str 单值）
 - ``LOOP_RUNNING``       sys/loop 写读（在跑任务集合）
 - ``MCP_TOOLS/ERROR``    MCP 桥模板键：``.format(bridge="windows_mcp")`` 等
 """
@@ -42,7 +44,7 @@ class StateKeys:
     REACT_RUN_ID = "react_run_id"            # F2：react 写 / budget 读（归组键=task_id；R1 起读优先 ContextVar）
     SESSION_KEY = "session_key"              # 2.2：run/chat 写 / approval 等读（R1 起读优先 ContextVar）
     REACT_LAST = "react_last"
-    PERMISSION_MODE = "permission_mode"      # approval 写 / react 读；⚠️ 语义会话级但存容器级（见模块头）
+    PERMISSION_MODE = "permission_mode"      # approval 写 / react 读；值 = dict[会话键, mode]（R1 补：分桶）
     LOOP_RUNNING = "loop_running"
     MCP_TOOLS = "{bridge}_tools"             # 模板键：.format(bridge="windows_mcp") 等
     MCP_ERROR = "{bridge}_error"

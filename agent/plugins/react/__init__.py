@@ -31,7 +31,7 @@
 
 from __future__ import annotations
 
-from agent.api import Services, StateKeys, plugin
+from agent.api import Services, StateKeys, current_permission_mode, plugin
 
 from .components import (Actor, DefaultActor, DefaultFinalizer, DefaultObserver,
                          DefaultReasoner, Finalizer, Observer, Reasoner, ReasonOutput,
@@ -90,5 +90,6 @@ class React:
         cfg = ((ctx.config or {}).get("agent") or {}).get("react") or {}
         last = ctx.state.get(StateKeys.REACT_LAST) or {"runs": 0}
         return {"max_steps": int(cfg.get("max_steps", 8)),
-                "permission_mode": ctx.state.get(StateKeys.PERMISSION_MODE, "default"),
+                # R1 补：档位按会话分桶 ⇒ 经内核助手取**本会话**的值（此前读容器级单值）
+                "permission_mode": current_permission_mode(ctx),
                 **last}

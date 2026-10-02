@@ -62,8 +62,8 @@ from typing import Any
 
 from agent.api import (CapabilityNotImplemented, Events, Services, SessionIdentity,
                       StateKeys, coerce_identity, durable, estimate_request_cost,
-                      estimate_tokens, now_iso, set_current_run_id,
-                      set_current_session_key)
+                      estimate_tokens, now_iso, current_permission_mode,
+                      set_current_run_id, set_current_session_key)
 
 logger = logging.getLogger("agent.react")
 
@@ -224,8 +224,9 @@ def visible_tools(ctx) -> list[dict]:
 
     ``plan`` 模式 ⇒ 只保留 ``risk == "read"``（**软约束**：模型看不见写工具，
     防误导；幻觉调用仍由 approval 的 plan 硬兜底拒绝——软硬两层缺一不可）。
-    判定只读 ``permission_mode`` 状态键（SSOT 前向契约），对 approval **零耦合**。
-    其余模式恒全量（行为不变）。
+    判定只经内核助手 ``current_permission_mode(ctx)`` 读该状态键（SSOT 前向契约），对 approval
+    **零耦合**；R1 补（2026-10-02）起该键是 ``dict[会话键, mode]`` 分桶（此前单值 ⇒ 档位
+    跨会话互相覆盖）。其余模式恒全量（行为不变）。
 
     D4（描述瘦身）：返回前把 ``description`` 压成一行（首行 ≤120 字符）。这是
     **react 投影层**的改动——``ctx.tasks.catalog()`` 原始目录不动，approval /
@@ -233,7 +234,9 @@ def visible_tools(ctx) -> list[dict]:
     本投影，两处口径天然一致。
     """
     catalog = ctx.tasks.catalog()
-    if str(ctx.state.get(StateKeys.PERMISSION_MODE, "") or "") == "plan":
+    # R1 补：档位按会话分桶 ⇒ 经内核助手取**本会话**的值（此前读容器级单值，
+    # 会把别人的档位当自己的：A 在 plan 会让 B 的工具也只剩只读）。
+    if current_permission_mode(ctx, "") == "plan":
         catalog = [t for t in catalog if t.get("risk") == "read"]
     return [{**t, "description": _slim_description(t.get("description"))}
             for t in catalog]
