@@ -1,0 +1,133 @@
+name: CI
+
+# 触发：推 main、向 main 提 PR、以及手动触发（便于单跑排查）
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一分支连续推送时取消仍在跑的旧任务，避免排队堆积
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# 最小权限：CI 只读仓库，不需要写任何东西
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 后端：全量 pytest（含解耦守卫 / 契约守卫 / 会话隔离 / 续传等全部套件）
+  # ---------------------------------------------------------------------------
+  backend:
+    name: backend · pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: 安装依赖（含 dev：pytest / fakeredis）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # 用 -e（editable）：agent 指向源码目录，与本地开发同构。
+      # 测试入口读 pyproject 的 testpaths=agent/tests，故无需额外参数。
+      # 说明：本机（Windows + 安全删除守卫，trash 二进制不可用）会让
+      # test_windows_mcp 的 1 例假红；Linux runner 无该守卫，应当全绿。
+      - name: 全量测试
+        run: python -m pytest -q
+
+  # ---------------------------------------------------------------------------
+  # 前端：契约自检 + 生产构建
+  #
+  # ⚠️ 本 job 必须先起后端 —— 这是实测结论，不是可选优化：
+  #   tools/check-view-switch.mjs 把页面的 fetch 转发到
+  #   http://127.0.0.1:8720（真后端），后端不可达时它给空响应，
+  #   于是「Settings 表单控件数」「Perms 档位按钮」「Plugins 启停按钮」
+  #   等内容断言会失败（脚本注释里写明「属预期」）。
+  #   实测：后端未起 = 33 passed/4 failed；后端起来 = 40 passed/0 failed。
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: frontend · check + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: 安装后端依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      # --fixture：离线夹具模式，不需要任何 LLM API key（CI 里没有密钥）
+      - name: 启动后端（fixture 离线模式）
+        run: |
+          nohup python -m agent.run.chat --fixture --host 127.0.0.1 --port 8720 \
+            > /tmp/prism-backend.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8720/api/status > /dev/null 2>&1; then
+              echo "后端就绪"; break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8720/api/status
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 依赖 + 契约自检 + 生产构建
+        working-directory: web
+        run: |
+          npm ci
+          npm run check
+          npm run build
+
+      - name: 后端日志（仅失败时打印，便于排查）
+        if: failure()
+        run: tail -60 /tmp/prism-backend.log
+
+  # ---------------------------------------------------------------------------
+  # 镜像：验证 Dockerfile 能构建并真能起来（开发机无 Docker，此处是唯一验证）
+  # ---------------------------------------------------------------------------
+  docker:
+    name: docker · image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建镜像
+        run: docker build -t prism:ci .
+
+      # 冒烟：用镜像的**默认 CMD**（即生产启动方式，不带 --fixture）起容器。
+      # 已实测：无 LLM API key 时服务照常启动（key 仅在调用时解析），
+      # 但 LLM 相关的调用会失败 —— 故这里只探 /health（存活探针）。
+      - name: 容器冒烟（/health）
+        run: |
+          docker run -d --name prism-smoke -p 18720:8720 prism:ci
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18720/health > /dev/null 2>&1; then
+              echo "健康检查通过"; curl -s http://127.0.0.1:18720/health; ok=1; break
+            fi
+            sleep 2
+          done
+          echo "--- 容器日志 ---"
+          docker logs prism-smoke | tail -30
+          docker rm -f prism-smoke
+          test "$ok" = "1"

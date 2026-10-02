@@ -1,0 +1,46 @@
+# 构建上下文瘦身 + 防止本机状态/密钥进入镜像层。
+# 注意：web/dist 与 web/node_modules 必须排除 —— 镜像里的 dist 由构建阶段产出，
+# node_modules 由 npm ci 在镜像内安装。
+
+# 版本控制与 CI 自身
+.git
+.gitignore
+.github
+
+# 本机运行时数据（SQLite 库 / 插件期望态 / 配置覆盖）——绝不烤进镜像
+data/
+
+# 密钥
+local_secrets.json
+web/.env.local
+web/.env.*.local
+
+# Python 产物
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-*/
+agent/tests/.pt/
+agent/tests/.pytest-*/
+*.egg-info/
+
+# 前端产物与依赖（在镜像内重新生成）
+web/node_modules/
+web/dist/
+web/.vite/
+web/_backup_legacy/
+
+# 文档与诊断件（运行时不依赖）
+docs/
+_diag_mcp/
+_diag_final2/
+langgraph\ input/
+
+# 本地日志与临时脚本
+*.log
+.frontend*.log
+.backend*.log
+agent_chat_server.log
+patch_remove_windowing*.py
+*.bak-b4
+agent/run/chat.py.bak*
