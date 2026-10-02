@@ -24,12 +24,20 @@
 
 ⇒ 快照前缀可精确到**会话级**（``run_snapshot:{tenant}:{user}:{session}:``），
 既消除「续接别的会话」，又把每请求的 SCAN 从全租户缩小几个数量级。
+
+R1（2026-10-02）：本模块另承载**请求作用域绑定通道**（``set_current_session_key`` /
+``current_session_key``，见文件末尾）。它是"身份如何抵达**无 ctx 入参**的消费点"
+这一问题的唯一原语：``ctx.state`` 是容器级共享字典，并发请求交错时「当前会话」会被
+后写覆盖（2.2/G2 登记为 R1 遗留项）。详见《配置作用域治理/R1方案选型分析-2026-10-02.md》。
 """
 
 from __future__ import annotations
 
+import contextvars
 import re
 from dataclasses import dataclass
+
+from .state_keys import StateKeys
 
 DEFAULT_TENANT = "default"
 DEFAULT_USER = "default"
@@ -154,6 +162,57 @@ def coerce_identity(session_id: object) -> SessionIdentity:
         return make_identity()
 
 
+# ---------- 请求作用域绑定（R1：旁路会话键的强隔离） ----------
+# 用 ContextVar 而不是继续只用 ``ctx.state``：后者是**容器级**共享字典，并发请求
+# 交错时「当前会话」会被后写覆盖。ContextVar 按 asyncio task 隔离，而一个 HTTP
+# 请求就是一个 task ⇒ 天然按请求隔离；请求内派生的子任务在创建瞬间复制当前上下文
+# ⇒ 子任务读到的仍是本请求的值。内核同类做法见 ``context.py`` 的 ``CURRENT_PLUGIN``
+# （同一理由：并发下互不串扰）。
+#
+# 读取**优先 ContextVar，未绑定才回退 ``ctx.state``**：既有「测试直接写
+# ``root.state[SESSION_KEY]``」的写法与旧调用点因此保持有效（不劣化）。
+# 「未绑定」与「绑定为空串」严格区分（默认取 ``None``）——否则收尾显式置空会被
+# 回退分支重新读回上一轮的陈旧值。
+_SESSION_KEY_VAR: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "prism_session_key", default=None)
+_RUN_ID_VAR: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "prism_run_id", default=None)
+
+
+def _state_value(ctx, key: str) -> str:
+    """回退读取：从 ``ctx.state`` 取（无 ctx / 无键 / 读取异常 → 空串）。"""
+    if ctx is None:
+        return ""
+    try:
+        return str((getattr(ctx, "state", None) or {}).get(key) or "")
+    except Exception:                     # noqa: BLE001 —— 无状态通道即视作未绑定
+        return ""
+
+
+def set_current_session_key(session_key: object) -> None:
+    """绑定当前请求的会话键 ``{user}:{session}``（请求入口调用）。"""
+    _SESSION_KEY_VAR.set(str(session_key or ""))
+
+
+def current_session_key(ctx=None) -> str:
+    """当前请求的会话键：ContextVar 优先，未绑定才回退 ``ctx.state``（空串 = 未绑定）。"""
+    v = _SESSION_KEY_VAR.get()
+    return v if v is not None else _state_value(ctx, StateKeys.SESSION_KEY)
+
+
+def set_current_run_id(run_id: object) -> None:
+    """绑定当前 run 的归组键（``task_id``）；run 收尾显式置空。"""
+    _RUN_ID_VAR.set(str(run_id or ""))
+
+
+def current_run_id(ctx=None) -> str:
+    """当前 run 的归组键：ContextVar 优先，未绑定才回退 ``ctx.state``。"""
+    v = _RUN_ID_VAR.get()
+    return v if v is not None else _state_value(ctx, StateKeys.REACT_RUN_ID)
+
+
 __all__ = ["SessionIdentity", "SessionIdError", "DEFAULT_TENANT", "DEFAULT_USER",
            "DEFAULT_SESSION", "build_task_id", "parse_task_id", "make_identity",
-           "coerce_identity"]
+           "coerce_identity", "set_current_session_key", "current_session_key",
+           "set_current_run_id", "current_run_id"]
+

@@ -35,7 +35,8 @@ G2（会话级，本次改造）：
 from __future__ import annotations
 
 from agent.api import (Events, Services, SESSION_CFG_VIEW, StateKeys, cost_factor,
-                       durable, estimate_request_cost, now_iso, plugin)
+                       current_run_id, current_session_key, durable,
+                       estimate_request_cost, now_iso, plugin)
 # 账单表的补列定义归口 agent/tables.py（表结构真相源），此处只负责**执行**。
 # 沿用 sys → agent.tables 的既有导入方向（先例：sys/storage.py 导入 MIGRATIONS）。
 from agent.tables import BUDGET_LOG_FIELDS
@@ -48,11 +49,23 @@ _STATE_SESSION_LIMIT = 512
 # ---- 会话级辅助（纯函数/小工具，无业务语义） --------------------------------
 
 def _session_key(ctx) -> str:
-    """当前会话键（2.2 的「尽力而为」通道；空串 = 容器级/未知）。"""
-    try:
-        return str((getattr(ctx, "state", None) or {}).get(StateKeys.SESSION_KEY) or "")
-    except Exception:                        # noqa: BLE001
-        return ""
+    """当前会话键（空串 = 容器级/未知）。
+
+    R1（2026-10-02）：走 ``current_session_key()``——**ContextVar（按 asyncio task 隔离
+    ⇒ 每请求独立）优先，未绑定才回退 ``ctx.state``**。此前只读容器级 state：并发请求
+    交错时后写覆盖先写，会把 A 的账记进 B 的桶。
+    """
+    return current_session_key(ctx)
+
+
+def _run_id(ctx) -> str:
+    """当前 run 的账单归组键（= react 的 ``task_id``；空串 = 未知）。
+
+    与 ``_session_key`` 同款通道与理由（``current_run_id``）：此前读容器级 state，
+    并发下会把别人的 run 写进本行的 ``agent_budget_log.run_id``。独立成函数便于
+    单测直击真实读取点。
+    """
+    return current_run_id(ctx)
 
 
 def _cfg_view(ctx):
@@ -219,7 +232,8 @@ class Budget:
             _set_spent(ctx, sk, spent + est)
             _pending_map(ctx, sk)[caller] = {
                 "est": est, "raw": int(raw_est),
-                "run_id": str(ctx.state.get(StateKeys.REACT_RUN_ID) or "")}
+                # R1：归组键同走请求作用域通道（此前读容器级 state，并发下会取到别人的 run）
+                "run_id": _run_id(ctx)}
             _trim_pending(ctx)
             return await next()
 

@@ -62,7 +62,8 @@ from typing import Any
 
 from agent.api import (CapabilityNotImplemented, Events, Services, SessionIdentity,
                       StateKeys, coerce_identity, durable, estimate_request_cost,
-                      estimate_tokens, now_iso)
+                      estimate_tokens, now_iso, set_current_run_id,
+                      set_current_session_key)
 
 logger = logging.getLogger("agent.react")
 
@@ -424,10 +425,15 @@ class ReactLoop:
         # 阶段 2（2.1/D19）：跨进程 run 快照保留最近 N 条 chain
         _wm_cfg = ((ctx.config or {}).get("agent") or {}).get("work_memory") or {}
         snap_keep = int(_wm_cfg.get("snapshot_chain_keep", 20))
-        # F2：账单归组键（尽力而为——budget 的 pre-call 读此键落 agent_budget_log.run_id）
-        # 2.2 起存 **task_id**（自带 user/session），被并发覆盖时账单行仍有会话维度。
+        # F2：账单归组键（budget 的 pre-call 读此键落 agent_budget_log.run_id）。
+        # 2.2 起存 **task_id**（自带 user/session）。
+        # R1（2026-10-02）：**主通道是 ContextVar**（按 asyncio task 隔离 ⇒ 每请求独立），
+        # 否则并发请求交错时账单行会取到别人的 run；``ctx.state`` 仍照写（兼容直接读
+        # state 的既有测试与调用点），收尾清空时两通道同步置空（见本文件下方）。
+        set_current_run_id(task_id)
         ctx.state[StateKeys.REACT_RUN_ID] = task_id
-        # 2.2：当前会话提示（approval 无参数线程化时据此判定归属；同 REACT_RUN_ID 为尽力而为）
+        # 2.2：当前会话提示（approval 等无 ctx 入参的通道据此判定归属）；R1：同走请求作用域通道
+        set_current_session_key(session_key)
         ctx.state[StateKeys.SESSION_KEY] = session_key
         if wm is not None:
             await wm.begin(task_id, {"session_id": session_key, "tenant": ident.tenant,
@@ -605,6 +611,7 @@ class ReactLoop:
                     # 与 wm.finish（删工作记忆键）是两条独立路径。
                     await _snapshot_call(wm, "snapshot_mark_finished", ident.tenant, task_id)
                     await wm.finish(task_id)
+                set_current_run_id("")          # R1：两通道同步置空（见 run 开头注释）
                 ctx.state[StateKeys.REACT_RUN_ID] = ""
                 return ReactResult(ok=True, text=out.text or "（未给出回答）", steps=steps,
                                    tokens_in=tokens_in, tokens_out=tokens_out,
@@ -704,6 +711,7 @@ class ReactLoop:
             # 阶段 2（2.1/D1/D16）：触顶收尾同样置完成标记（不删快照）
             await _snapshot_call(wm, "snapshot_mark_finished", ident.tenant, task_id)
             await wm.finish(task_id)
+        set_current_run_id("")                  # R1：两通道同步置空（见 run 开头注释）
         ctx.state[StateKeys.REACT_RUN_ID] = ""
         return ReactResult(ok=not hard, text=text, steps=steps, tokens_in=tokens_in,
                            tokens_out=tokens_out, exhausted=True, reason=reason,

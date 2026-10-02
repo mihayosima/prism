@@ -9,8 +9,11 @@
   ⇒ 只要这个服务的**值随会话变化**，消费方**零改动**；
 - **无会话覆盖时门面恒返回容器实例** ⇒ 行为与改造前**逐值等价**（这是低风险的根本）。
 
-当前会话键来源：``StateKeys.SESSION_KEY``（2.2 既有的「尽力而为」通道，approval 同此口径）。
-并发下该键可能被后写覆盖 ⇒ 属已知边界（方案 R1），强一致留待「请求级 child」后手。
+当前会话键来源：``current_session_key()`` —— R1（2026-10-02）起是 **ContextVar 请求作用域
+通道**（按 asyncio task 隔离 ⇒ 每请求独立；未绑定才回退 ``ctx.state``）。此前只读容器级
+``StateKeys.SESSION_KEY``，并发请求交错时会被后写覆盖。原拟解法「请求级 child」经核实
+不可行（读方是装配期捕获的容器 ctx + 事件总线纯度契约禁传 ctx + ``State`` 无父链），
+详见《配置作用域治理/R1方案选型分析-2026-10-02.md》。
 
 零业务语义纪律（继承本插件）：门面**不理解**任何治理语义，只做「选实例 + 转发」。
 """
@@ -20,7 +23,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-from agent.api import SESSION_CFG_VIEW, StateKeys
+from agent.api import SESSION_CFG_VIEW, current_session_key
 
 _DEFAULT_CACHE_LIMIT = 64
 
@@ -48,11 +51,8 @@ class GovernorRouter:
     # ---- 会话键与配置 ----
 
     def _session_key(self) -> str:
-        try:
-            st = getattr(self._ctx, "state", None)
-            return str((st or {}).get(StateKeys.SESSION_KEY) or "")
-        except Exception:                    # noqa: BLE001 —— 无状态通道即视作容器级
-            return ""
+        """当前会话键（R1：ContextVar 优先；未绑定回退容器 state；空串 = 容器级）。"""
+        return current_session_key(self._ctx)
 
     def _cfg(self) -> dict:
         """当前会话的生效配置；无视图/无会话/取用失败 ⇒ 回落容器配置（**不劣化**）。"""

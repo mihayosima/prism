@@ -36,6 +36,7 @@ from agent.api import (
     estimate_tokens,
     now_iso,
     plugin,
+    set_current_session_key,
 )
 
 PLAN_SYSTEM = (
@@ -194,7 +195,11 @@ class ChatDriver:
                    identity: SessionIdentity | None = None) -> ChatReply:
         """``identity``：2.2 会话/租户身份（适配层解析后显式线程化；缺省按 session_id 退化）。"""
         ident = identity if identity is not None else coerce_identity(session_id)
-        # 当前会话提示：approval 等无参数通道据此判定归属（ctx.state 容器级，尽力而为）
+        # 当前会话提示：approval / guard 等**无 ctx 入参**的通道据此判定归属。
+        # R1（2026-10-02）：**主通道是 ContextVar**（按 asyncio task 隔离 ⇒ 每请求独立）；
+        # ``ctx.state`` 仍照写，只为兼容直接读 state 的既有测试与调用点。读取方一律用
+        # ``current_session_key()``（ContextVar 优先、未绑定才回退 state）。
+        set_current_session_key(ident.session_key)
         ctx.state[StateKeys.SESSION_KEY] = ident.session_key
         if not message or not message.strip():
             return ChatReply(text="请输入一条消息。", plan={"intent": "chat"},

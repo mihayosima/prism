@@ -24,8 +24,8 @@ from __future__ import annotations
 import time
 import uuid
 
-from agent.api import (AgentError, Events, Services, StateKeys, durable,
-                       now_iso, plugin)
+from agent.api import (AgentError, Events, Services, StateKeys, current_session_key,
+                       durable, now_iso, plugin)
 
 from .options import normalize_options
 from .pending import PendingTable
@@ -200,13 +200,18 @@ class Approval:
     # ---------- 会话归属（2.2） ----------
 
     def _skey(self) -> str:
-        """当前会话键（``{user}:{session}``）——由 run/chat 解析身份后写入。
+        """当前会话键（``{user}:{session}``）。
 
-        读取通道是**容器级** ``ctx.state``（并发请求下以后写者为准，与 ``REACT_RUN_ID``
-        同款「尽力而为」契约）；未解析到时退 ``"default"``（单会话 / 离线调用方行为不变）。
-        真正的会话隔离靠待答表与名单的分桶（H2），此键只回答「此刻大概率是哪个会话」。
+        R1（2026-10-02）：读取通道是 ``current_session_key()`` —— **ContextVar（按 asyncio
+        task 隔离 ⇒ 每请求独立）优先，未绑定才回退容器级 ``ctx.state``**；未解析到时退
+        ``"default"``（单会话 / 离线调用方行为不变）。真正的会话隔离靠待答表与名单的分桶
+        （H2），此键回答「此刻是哪个会话」。
+
+        本读取点**没有 ctx 入参**（waterfall 监听只收 ``(payload, next)``，且事件参数必须是
+        纯数据——见 ``core/events.py`` 的 ``_assert_pure_data``）⇒ 请求作用域通道是唯一
+        可达方案；此前读容器级 state 会被并发请求的后写覆盖（可能替别人批准工具执行）。
         """
-        return str(self._ctx.state.get(StateKeys.SESSION_KEY) or "default")
+        return current_session_key(self._ctx) or "default"
 
     # ---------- 会话模式（mode 的唯一持有者） ----------
 

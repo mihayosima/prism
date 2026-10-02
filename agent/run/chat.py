@@ -26,7 +26,7 @@ import uuid
 from pathlib import Path
 
 from agent.api import (AgentError, SESSION_CFG_VIEW, Services, SessionIdError,
-                       StateKeys, make_identity)
+                       StateKeys, make_identity, set_current_session_key)
 from agent.profiles import BASE_AGENT_CONFIG, build_agent
 from agent.run.config_store import ConfigStore
 from agent.sys.progress import tap_progress
@@ -505,6 +505,12 @@ async def _serve(args: argparse.Namespace) -> int:
     # session 来自请求头 ``X-Session-Id``（无隔离语义，伪造只影响伪造者自己）。
     # 键构造/净化的唯一真源是 ``core/session.py``——任何非法标识在此 fail-fast（400），
     # 不静默回退（否则用户以为在私密会话，实则落进共享桶 / 前缀扫描越权命中他人）。
+    #
+    # R1（2026-10-02）：本函数据此成为**请求作用域绑定的单一漏斗**——解析成功即把会话键
+    # 绑到 ContextVar（按 asyncio task 隔离 ⇒ 每请求独立）。消费方多为**无 ctx 入参**的事件
+    # 回调（approval/guard）或装配期捕获 ctx 的服务（budget/router），它们读不到请求参数，
+    # 只能靠该通道；``ctx.state`` 仍照写（兼容既有测试写法），但不再是读取主通道。
+    # ⇒ 新增端点若需要会话归属，**必须经本函数**解析身份（勿自己读头）。
 
     def _session_cfg() -> dict:
         return ((c.root.config or {}).get("agent") or {}).get("session") or {}
@@ -517,10 +523,12 @@ async def _serve(args: argparse.Namespace) -> int:
         if not raw and isinstance(body, dict):
             raw = str(body.get("session") or "")
         try:
-            return make_identity(tenant=cfg.get("tenant"), user=cfg.get("user"),
-                                 session=raw)
+            ident = make_identity(tenant=cfg.get("tenant"), user=cfg.get("user"),
+                                  session=raw)
         except SessionIdError as exc:
             raise HTTPException(status_code=400, detail=f"非法会话标识：{exc}")
+        set_current_session_key(ident.session_key)
+        return ident
 
     def _sse(event: str, payload: dict) -> str:
         """一帧 SSE（data: {...}\\n\\n）。帧类型见设计方案 §4.5。"""

@@ -34,7 +34,9 @@ from agent.core.scope_config import (DEFAULT_SESSION_LIMIT, evict_lru,
 from agent.core.services_catalog import ALL as SERVICE_KEYS, Services
 from agent.core.session import (DEFAULT_SESSION, DEFAULT_TENANT, DEFAULT_USER,
                                 SessionIdError, SessionIdentity, build_task_id,
-                                coerce_identity, make_identity, parse_task_id)
+                                coerce_identity, current_run_id,
+                                current_session_key, make_identity, parse_task_id,
+                                set_current_run_id, set_current_session_key)
 from agent.core.state_keys import StateKeys
 from agent.core.tokens import (clip_json, clip_text, clip_text_hard, estimate_tokens,
                                guard_source)
@@ -106,6 +108,12 @@ __all__ = [
     "DEFAULT_TENANT",
     "DEFAULT_USER",
     "DEFAULT_SESSION",
+    # R1（请求作用域绑定）：旁路会话键/归组键的强隔离原语。消费点多为**无 ctx 入参**
+    # 的事件回调或装配期捕获的 ctx，故必须有一处公共原语可读（实现位于 core/session）。
+    "set_current_session_key",
+    "current_session_key",
+    "set_current_run_id",
+    "current_run_id",
     # G2（会话级）：配置视图接缝名（适配层注入 / 插件软取）
     "SESSION_CFG_VIEW",
     # G2（会话级）：作用域配置**纯规则**（实现位于 core/scope_config；适配层经本出口取用，
