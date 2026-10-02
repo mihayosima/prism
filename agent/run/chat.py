@@ -542,6 +542,27 @@ async def _serve(args: argparse.Namespace) -> int:
 
     app = FastAPI(title="Agent Harness", docs_url=None, redoc_url=None)
 
+    # ---- R3：全局异常兜底（此前完全缺失）-----------------------------------
+    # 此前未注册任何 exception_handler ⇒ 非 HTTPException 的未捕获异常落到
+    # Starlette 默认处理器，返回 **HTML** 500：前端 `res.json()` 直接解析失败，
+    # 且不留统一日志。这里统一转成 JSON 错误体（形状沿用 /api/chat 的既有兜底
+    # `{"error": ...}`，前端零改动），并记一条带路径的 error 日志。
+    # 注意：HTTPException 不在此接管——Starlette 默认已返回 JSON `{"detail": ...}`，
+    # 覆盖它会改变 400/404 的既有响应体形状，属于无收益的行为变更。
+    _err_log = logging.getLogger("agent.chat")
+
+    @app.exception_handler(AgentError)
+    async def _on_agent_error(request: Request, exc: AgentError) -> JSONResponse:
+        _err_log.error("AgentError @ %s: %s", request.url.path, exc)
+        return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
+                            status_code=500)
+
+    @app.exception_handler(Exception)
+    async def _on_unhandled(request: Request, exc: Exception) -> JSONResponse:
+        _err_log.exception("未捕获异常 @ %s", request.url.path)
+        return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
+                            status_code=500)
+
     # ---- B3.1 跨域（opt-in）------------------------------------------------
     # 默认「不启用」：沿用 dev 下的 Vite proxy（同源），零行为变化。
     # 前后端**直连**部署（前端静态托管在别的源）时显式传 --cors-origin 打开。

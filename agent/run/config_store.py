@@ -19,11 +19,14 @@ v2（本次）：``{version: 2, container: {<v1 形状>}, sessions: {<sk>: {<v1 
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from pathlib import Path
 
 from agent.api import (DEFAULT_SESSION_LIMIT, evict_lru, merge_overrides,
                        section_of, touch)
+
+logger = logging.getLogger("agent.config_store")
 
 V1 = 1
 V2 = 2
@@ -46,9 +49,11 @@ class ConfigStore:
             return {"version": V2, "container": {}, "sessions": {}}
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8")) or {}
-        except Exception:                       # noqa: BLE001 —— 损坏按空处理
+        except Exception as exc:                # noqa: BLE001 —— 损坏按空处理（但须留证）
+            self._quarantine(f"JSON 解析失败: {exc}")
             return {"version": V2, "container": {}, "sessions": {}}
         if not isinstance(raw, dict):
+            self._quarantine(f"顶层结构非法: {type(raw).__name__}")
             return {"version": V2, "container": {}, "sessions": {}}
         ver = raw.get("version")
         if ver == V2:
@@ -60,6 +65,22 @@ class ConfigStore:
                      if isinstance(k, str) and k.startswith("plugins.")
                      and isinstance(v, dict)}
         return {"version": V1, "container": container, "sessions": {}}
+
+    def _quarantine(self, reason: str) -> None:
+        """损坏隔离（R2 修复）：告警 + 备份为 ``*.corrupt``，绝不静默丢数据。
+
+        为什么必须做：损坏时按空配置处理，而 ``_save`` 的备份只覆盖 v1 分支——
+        文件是 v2 时 ``is_v1`` 为 False ⇒ **不备份就被空数据覆盖**，用户全部
+        会话级覆盖不可恢复。本方法与 ``plugin_manager._read_state`` 的 S7 口径对齐
+        （同一类风险，同一套处置：告警 + 坏文件转存 + 不阻断启动）。
+        """
+        backup = self.path.with_suffix(".corrupt")
+        logger.error("配置覆盖文件 %s 损坏（%s）；已转存为 %s，本次按空配置处理",
+                     self.path, reason, backup.name)
+        try:
+            self.path.replace(backup)
+        except OSError:                         # noqa: BLE001 —— 备份失败不阻断启动
+            pass
 
     @property
     def is_v1(self) -> bool:
