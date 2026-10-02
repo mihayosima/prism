@@ -20,8 +20,10 @@ local_secrets.json
 # runtime log
 agent_chat_server.log
 # 本地起服务时的重定向日志（后端 8720 / 前端 5174）
-.backend-*.log
-.frontend-*.log
+# 用 `*.log` 通配而非 `-*.log`：实际落盘名有时是 `.frontend.log`（点号分隔），
+# 旧的 `.frontend-*.log` 只覆盖短横线形式，导致点号形式一直漏网、干扰 git status。
+.backend*.log
+.frontend*.log
 
 # 诊断件的**生成物**（脚本本身入库，产物不入库）
 _diag_final2/
