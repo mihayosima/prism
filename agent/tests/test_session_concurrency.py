@@ -22,8 +22,10 @@ import asyncio
 import re
 from pathlib import Path
 
-from agent.api import (Services, StateKeys, current_run_id,
-                       current_session_key, set_current_run_id,
+import pytest
+
+from agent.api import (Services, State, StateKeys, bind_request_id,
+                       current_run_id, current_session_key, set_current_run_id,
                        set_current_session_key)
 from agent.profiles import build_agent
 from agent.sys.budget import _run_id as budget_run_id
@@ -61,6 +63,54 @@ def _readers(c) -> tuple[str, str, str]:
     return (budget_session_key(c.root),
             c.root.get(Services.CONTEXT)._session_key(),
             c.root.get(Services.APPROVAL)._skey())
+
+
+@pytest.fixture(autouse=True)
+def _isolate_request_scope():
+    """每个用例前后**解除**请求作用域绑定（会话键 / 归组键 / 请求标识）。
+
+    ContextVar 绑定在**当前线程**的上下文里 ⇒ 不复位就会顺着 ``asyncio.run`` 的上下文
+    复制**泄漏到后续用例**（本项目真踩过：别的文件里出现「未绑定却读到上一个用例的会话
+    键」）。``None`` = 解除绑定，回到「未绑定 ⇒ 回退 ``ctx.state``」。
+    """
+    set_current_session_key(None)
+    set_current_run_id(None)
+    bind_request_id("")
+    yield
+    set_current_session_key(None)
+    set_current_run_id(None)
+    bind_request_id("")
+
+
+def test_binding_emptiness_and_unbinding_are_three_distinct_states():
+    """三态必须严格区分，否则收尾置空会被回退分支读回上一轮的值。
+
+    1) **未绑定** ⇒ 回退 ``ctx.state``；
+    2) **绑定空串** ⇒ 权威空值，**不回退**（run 收尾走的正是这条）；
+    3) **解除绑定**（传 ``None``）⇒ 回到回退。
+    """
+    class _Ctx:
+        def __init__(self):
+            self.state = State({"session_key": "u:from-state",
+                                "react_run_id": "u:from-state:r0"})
+
+    ctx = _Ctx()
+    try:
+        assert current_session_key(ctx) == "u:from-state", "未绑定时应回退 state"
+        assert current_run_id(ctx) == "u:from-state:r0"
+
+        set_current_session_key("")
+        set_current_run_id("")
+        assert current_session_key(ctx) == "", "绑定空串是权威空值，不该回退"
+        assert current_run_id(ctx) == ""
+
+        set_current_session_key(None)
+        set_current_run_id(None)
+        assert current_session_key(ctx) == "u:from-state", "解除绑定后应恢复回退"
+        assert current_run_id(ctx) == "u:from-state:r0"
+    finally:
+        set_current_session_key(None)
+        set_current_run_id(None)
 
 
 # ---------------------------------------------------------------------------

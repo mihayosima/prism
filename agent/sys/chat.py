@@ -32,6 +32,7 @@ from agent.api import (
     StateKeys,
     coerce_identity,
     durable,
+    ensure_request_id,
     estimate_request_cost,
     estimate_tokens,
     now_iso,
@@ -201,6 +202,9 @@ class ChatDriver:
         # ``current_session_key()``（ContextVar 优先、未绑定才回退 state）。
         set_current_session_key(ident.session_key)
         ctx.state[StateKeys.SESSION_KEY] = ident.session_key
+        # #5 可观测性：HTTP 入口已由中间件绑定请求标识；此处兜底**无 HTTP 入口**的路径
+        # （如 ``--once``、离线调用），使账本与日志里的 request_id 不为空（可串联）。
+        ensure_request_id()
         if not message or not message.strip():
             return ChatReply(text="请输入一条消息。", plan={"intent": "chat"},
                              evidence={}, tokens_in=0, tokens_out=0, ok=True,

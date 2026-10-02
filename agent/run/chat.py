@@ -22,11 +22,14 @@ import logging
 import os
 import signal
 import sys
+import time
 import uuid
 from pathlib import Path
 
 from agent.api import (AgentError, SESSION_CFG_VIEW, Services, SessionIdError,
-                       StateKeys, make_identity, set_current_session_key)
+                       StateKeys, bind_request_id, configure_logging,
+                       counters_snapshot, inc_counter, make_identity,
+                       set_current_session_key)
 from agent.profiles import BASE_AGENT_CONFIG, build_agent
 from agent.run.config_store import ConfigStore
 from agent.sys.progress import tap_progress
@@ -64,6 +67,12 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--hardened", action="store_true",
                    help="生产加固画像：权限 deny-by-default（task_allow=[]）+ 强制要求 --token；"
                         "默认不开启（本地 dev 与既有测试零影响）。")
+    # ---- #5 可观测性（**默认开启**；不改功能行为，只新增日志输出——此前全仓无 handler，
+    #      INFO 级日志被静默丢弃，运维等于瞎的） --------------------------------
+    p.add_argument("--log-level", default="INFO",
+                   help="日志级别（DEBUG/INFO/WARNING/ERROR；默认 INFO）")
+    p.add_argument("--log-format", default="text", choices=("text", "json"),
+                   help="text=人读（行内含 rid/session/run）；json=单行 JSON 供采集侧解析")
     return p.parse_args(argv)
 
 
@@ -466,10 +475,58 @@ async def _context_view_payload(root, *, limit: int = 60) -> dict:
         return {"available": False, "reason": "render_failed", "stages": [], "text": ""}
 
 
+async def _obs_middleware(request, call_next):
+    """#5 可观测性中间件：给**每个** HTTP 请求绑定 request id、回带响应头、打访问日志。
+
+    刻意做成模块级函数（而非 ``create_app`` 内的闭包）：``_serve`` 返回时容器已
+    teardown ⇒ 单测无法在进程内对真实 app 发请求；抽出来才能被测试**直接调用**，
+    测的是生产实现本身而不是复刻品。
+
+    - 绑定发生在 ``call_next`` **之前** ⇒ 下游（路由处理器、其派生 task、
+      ``emit`` 的异步监听器）都能通过 ContextVar 读到同一个 id；
+    - 计数：请求数 + 5xx/异常数（``/metrics`` 导出，**无标签**）；
+    - 访问日志：每请求一行（method/path/status/耗时），字段由 record factory 自动
+      带上 rid/session/run ⇒ **排查时先 grep  rid，再看这一行**。
+      嫌吵可把 ``--log-level`` 提到 WARNING。
+
+    ⚠️ **访问日志里的 ``session`` 恒为空**（如实登记）：会话键由下游路由任务绑定
+    （``_identity``），而 ``BaseHTTPMiddleware`` 会把下游跑在**另一个 task** ⇒ 绑定
+    不回流到本层。``rid`` 在本层绑定、对下游可见 ⇒ **关联键是 rid**；
+    要看该请求的会话，查 ``/api/events?request_id=<rid>`` 的 ``session`` 列。
+    """
+    rid = bind_request_id()
+    inc_counter("agent_requests_total")
+    log = logging.getLogger("agent.access")
+    started = time.perf_counter()
+    try:
+        resp = await call_next(request)
+    except BaseException:
+        inc_counter("agent_request_errors_total")
+        log.error("%s %s -> 未完成（%.1fms） rid=%s",
+                  getattr(request, "method", "?"),
+                  getattr(getattr(request, "url", None), "path", "?"),
+                  (time.perf_counter() - started) * 1000, rid)
+        raise
+    if resp.status_code >= 500:
+        # 已注册的异常处理器在路由层内兜住 ⇒ 多数 5xx 不会走到上面的 except
+        inc_counter("agent_request_errors_total")
+    resp.headers["X-Request-Id"] = rid
+    log.info("%s %s -> %s (%.1fms)",
+             getattr(request, "method", "?"),
+             getattr(getattr(request, "url", None), "path", "?"),
+             resp.status_code, (time.perf_counter() - started) * 1000)
+    return resp
+
+
 async def _serve(args: argparse.Namespace) -> int:
     import uvicorn
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+
+    # ---- #5 可观测性：**最先**装日志（此前全仓无任何 handler，INFO 级静默丢弃）----
+    # 放在这里（而非 uvicorn.Config 之前）是为了让 ``create_app`` 内部的所有日志
+    # ——含前端产物提示、重建失败——也走同一套 handler 与字段。
+    configure_logging(level=args.log_level, fmt=args.log_format)
 
     c, pm = await _boot(args)
 
@@ -570,6 +627,16 @@ async def _serve(args: argparse.Namespace) -> int:
         _err_log.exception("未捕获异常 @ %s", request.url.path)
         return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
                             status_code=500)
+
+    # ---- #5 可观测性：每请求绑定 request id ---------------------------------
+    # 装在**所有路由之外**的中间件里 ⇒ 无论端点是否经 ``_identity`` 解析身份
+    # （``/health``、``/metrics``、``/api/events``…）都能拿到本次请求的 id。
+    # 账本（``agent_events`` 的三列）与日志（record factory 注入 rid/session/run）
+    # 都从这一处绑定取值 ⇒ **一次请求的痕迹可按同一 id 串起来**。
+    # 响应头回带 ``X-Request-Id``：用户报障时可直接给出该值定位到那一轮。
+    # 实现见模块级 ``_obs_middleware``（抽成模块级函数才能被单测直接调用——
+    # ``_serve`` 返回时容器已 teardown，无法在进程内对其发真实请求）。
+    app.middleware("http")(_obs_middleware)
 
     # ---- B3.1 跨域（opt-in）------------------------------------------------
     # 默认「不启用」：沿用 dev 下的 Vite proxy（同源），零行为变化。
@@ -699,6 +766,12 @@ async def _serve(args: argparse.Namespace) -> int:
             "# TYPE agent_tools_total gauge",
             f"agent_tools_total {tool_total}",
         ]
+        # ---- #5 可观测性：请求/事件计数（**无标签**，刻意不做 per-request/per-session
+        # label——基数无界会撑爆 Prometheus；要按请求排查请用 rid 过滤 /api/events）----
+        for name, value in sorted(counters_snapshot().items()):
+            lines += [f"# HELP {name} 进程内累计计数",
+                      f"# TYPE {name} counter",
+                      f"{name} {value:g}"]
         for owner, n in sorted(owners.items()):
             if owner:
                 lines.append(f'agent_tools_by_owner{{owner="{owner}"}} {n}')
@@ -918,10 +991,24 @@ async def _serve(args: argparse.Namespace) -> int:
                 "budget": _budget_view(c.root, ident, budget_cfg)}
 
     @app.get("/api/events")
-    async def _events() -> dict:
-        rows = await c.root.db.query(
-            c.root, "SELECT seq, event, payload, at FROM agent_events ORDER BY seq DESC LIMIT 120")
-        return {"rows": rows}
+    async def _events(request_id: str = "", limit: int = 120) -> dict:
+        """durable 事件账本（倒序）。
+
+        #5：``request_id`` 非空时**只回该请求的痕迹**——这就是"可排查、可串联"的落点：
+        拿到响应头 ``X-Request-Id``（或用户报障给的 id）即可拉出那一轮的全部事件。
+        ``limit`` 上限 500（防一次拉爆；``agent_events`` 无 per-request 索引退化保护）。
+        """
+        cap = max(1, min(500, int(limit)))
+        if request_id:
+            rows = await c.root.db.query(
+                c.root, "SELECT seq, event, payload, at, request_id, run_id, session"
+                        " FROM agent_events WHERE request_id=? ORDER BY seq LIMIT ?",
+                (request_id, cap))
+        else:
+            rows = await c.root.db.query(
+                c.root, "SELECT seq, event, payload, at, request_id, run_id, session"
+                        " FROM agent_events ORDER BY seq DESC LIMIT ?", (cap,))
+        return {"rows": rows, "request_id": request_id or None}
 
     # ---- G2.0（P3-1）：Inspector ``/context`` 视图（纯只读旁路，不 import 插件内部）----
 
@@ -1072,8 +1159,9 @@ async def _serve(args: argparse.Namespace) -> int:
         try:
             await _apply_rebuild()
         except Exception as exc:  # noqa: BLE001
-            print(f"[rebuild] 后台重建失败（期望态已保存，实际装配可能需重启）：{exc}",
-                  file=sys.stderr)
+            # #5：改走 logger（此前 print ⇒ 无级别控制、无请求标识，且与日志不同流）
+            logging.getLogger("agent.chat").error(
+                "后台重建失败（期望态已保存，实际装配可能需重启）：%s", exc)
 
     async def _mutate_then_fetch(background: bool = False) -> dict:
         # 先返回期望态已更新的当前快照（desired 已写入 state.json）。
@@ -1238,7 +1326,7 @@ async def _serve(args: argparse.Namespace) -> int:
                 return resp
 
         app.mount("/", _SPAStaticFiles(directory=str(_DIST), html=True), name="web")
-        print(f"[web] 托管前端产物：{_DIST}", file=sys.stderr)
+        logging.getLogger("agent.chat").info("托管前端产物：%s", _DIST)
     else:
         @app.get("/")
         async def _home_missing():
@@ -1251,8 +1339,8 @@ async def _serve(args: argparse.Namespace) -> int:
                 "它经 proxy 转发 <code>/api</code> 到本服务。</p>",
                 status_code=503)
 
-        print(f"[web] 未找到前端产物 {_DIST} —— 首页将返回 503 与构建指引",
-              file=sys.stderr)
+        logging.getLogger("agent.chat").warning(
+            "未找到前端产物 %s —— 首页将返回 503 与构建指引", _DIST)
 
     # ---- 生产改造 #4：安全姿态告警 ----
     # 无论是否 hardened，只要「无 token 且权限开放」即打印醒目 WARNING（部署风险）。
@@ -1274,8 +1362,11 @@ async def _serve(args: argparse.Namespace) -> int:
             "（包括 chat）。请务必同时提供 --token。")
 
     url = f"http://{args.host}:{args.port}"
-    print(f"Agent Harness 就绪: {url}   （Ctrl+C 退出）", file=sys.stderr)
-    config = uvicorn.Config(app, host=args.host, port=args.port, log_level="warning")
+    # #5：走 logger（级别由 --log-level 决定；设为 WARNING 及以上时不再打印此行）
+    logging.getLogger("agent.chat").info("Agent Harness 就绪: %s   （Ctrl+C 退出）", url)
+    # ---- #5 可观测性：uvicorn 日志级别跟随（此前硬编码 "warning" ⇒ 访问日志近乎关闭）----
+    config = uvicorn.Config(app, host=args.host, port=args.port,
+                            log_level=str(args.log_level).lower())
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None  # 禁用 uvicorn 自带信号处理器，下面自己接管
     task = asyncio.create_task(server.serve())

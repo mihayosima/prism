@@ -15,8 +15,10 @@ def _per(dialect: str, *stmts: str) -> dict:
 
 _EVENTS = [
     "CREATE TABLE IF NOT EXISTS agent_events ("
-    " seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT, payload TEXT, at TEXT)",
+    " seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT, payload TEXT, at TEXT,"
+    " request_id TEXT, run_id TEXT, session TEXT)",
     "CREATE INDEX IF NOT EXISTS idx_agent_events_event ON agent_events(event)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_events_request ON agent_events(request_id)",
 ]
 _BUDGET = [
     "CREATE TABLE IF NOT EXISTS agent_budget_log ("
@@ -109,4 +111,28 @@ MIGRATIONS = [
     ("agent_012_message_fields", _per("sqlite", *_MSG_FIELDS), "agent_messages 扩 token_count + compressed_into（兼容旧库 ALTER）"),
 ]
 
-__all__ = ["MIGRATIONS", "BUDGET_LOG_FIELDS"]
+# ``agent_events`` 的补列（路线图 #5 可观测性：让一次请求的痕迹可串联）
+# 增三列：``request_id``（一次 HTTP 请求 = 一个 id，跨 react/llm/tasks/MCP 全链一致）、
+# ``run_id``（账单/快照归组键，与 ``REACT_RUN_ID`` 同源）、``session``（会话键）。
+#
+# **为什么是「DDL + 容错 ALTER」而不是一条迁移**（取舍记此备查）：
+# - 走迁移的话，**新库会先由 _EVENTS 的 DDL 建出带列的表**，紧接着那条 ALTER 再加一次
+#   ⇒ duplicate column ⇒ MigrationRegistry 整组回滚 ⇒ **服务起不来**。要走迁移就必须
+#   **同时把列从 _EVENTS 里删掉**（让两条路径互斥）——那样可行，但一旦出现
+#   「列已存在、迁移未登记」的库（如有人手工加过列），同样会炸。
+# - 现在的做法：DDL 给新库、容错 ALTER 补旧库，**两条路径都声明在本文件**（真相源仍
+#   归一），且 ALTER 逐列独立容错 ⇒ **任何状态下都不会因重复列而启动失败**。
+#   代价：同一张表有两条到达同一结构的路径（与 agent_budget_log 的处理同款）。
+EVENTS_EXTRA_COLUMNS = [
+    ("request_id", "TEXT"),
+    ("run_id", "TEXT"),
+    ("session", "TEXT"),
+]
+
+# 补列之后建索引（存量库走这条；新库已由 _EVENTS 建好，IF NOT EXISTS 保证幂等）。
+EVENTS_REQUEST_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_agent_events_request ON agent_events(request_id)"
+)
+
+__all__ = ["MIGRATIONS", "BUDGET_LOG_FIELDS", "EVENTS_EXTRA_COLUMNS",
+           "EVENTS_REQUEST_INDEX"]

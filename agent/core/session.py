@@ -190,8 +190,13 @@ def _state_value(ctx, key: str) -> str:
 
 
 def set_current_session_key(session_key: object) -> None:
-    """绑定当前请求的会话键 ``{user}:{session}``（请求入口调用）。"""
-    _SESSION_KEY_VAR.set(str(session_key or ""))
+    """绑定当前请求的会话键 ``{user}:{session}``（请求入口调用）。
+
+    传 ``None`` = **解除绑定**（回到「未绑定」⇒ 读取回退 ``ctx.state``）——与
+    ``bind_request_id`` 的语义对齐；收尾与测试隔离靠它复位（否则绑定会顺着 ContextVar
+    泄漏到后续任务/用例，表现为"未绑定却读到上一个请求的值"这类**跨任务串扰**）。
+    """
+    _SESSION_KEY_VAR.set(None if session_key is None else str(session_key or ""))
 
 
 def current_session_key(ctx=None) -> str:
@@ -201,8 +206,8 @@ def current_session_key(ctx=None) -> str:
 
 
 def set_current_run_id(run_id: object) -> None:
-    """绑定当前 run 的归组键（``task_id``）；run 收尾显式置空。"""
-    _RUN_ID_VAR.set(str(run_id or ""))
+    """绑定当前 run 的归组键（``task_id``）；run 收尾显式置空；``None`` = 解除绑定。"""
+    _RUN_ID_VAR.set(None if run_id is None else str(run_id or ""))
 
 
 def current_run_id(ctx=None) -> str:

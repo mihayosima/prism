@@ -16,6 +16,7 @@ import json
 from datetime import datetime
 from typing import Any
 
+from agent.core.obs import inc_counter, trace_fields
 from agent.core.services_catalog import Services
 
 
@@ -25,16 +26,29 @@ def now_iso() -> str:
 
 
 async def durable(ctx: Any, event: str, payload: dict) -> None:
-    """写一条 durable 事件。无 db（纯内存装配）→ 不落盘也不假装（诚实）。"""
+    """写一条 durable 事件。无 db（纯内存装配）→ 不落盘也不假装（诚实）。
+
+    **#5 可观测性**：除事件本身，还落三列关联标识（``request_id`` / ``run_id`` /
+    ``session``）⇒ 一次请求在 react→llm→tasks→MCP 各处留下的痕迹**可按同一 id 串起来**
+    （``SELECT … WHERE request_id=?``）。三者取自请求作用域通道（``core/obs.trace_fields``），
+    未绑定时写空串（不编造）。**本函数是 ``agent_events`` 的唯一写入点**（有守卫测试断言），
+    否则旁路写入会丢掉关联标识。
+    """
     db = ctx.get(Services.DB)
     if db is None:
         return
+    fields = trace_fields(ctx)
     try:
         await db.execute(
-            ctx, "INSERT INTO agent_events(event, payload, at) VALUES (?,?,?)",
-            (event, json.dumps(payload, ensure_ascii=False), now_iso()),
+            ctx,
+            "INSERT INTO agent_events(event, payload, at, request_id, run_id, session)"
+            " VALUES (?,?,?,?,?,?)",
+            (event, json.dumps(payload, ensure_ascii=False), now_iso(),
+             fields["rid"], fields["run"], fields["session"]),
         )
+        inc_counter("agent_events_total")
     except Exception as exc:  # noqa: BLE001 —— 审计写失败不阻断主流程（记入日志）
+        inc_counter("agent_event_write_errors_total")
         import logging
         logging.getLogger("agent.audit").warning("durable event %r 落盘失败: %s", event, exc)
 

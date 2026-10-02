@@ -27,6 +27,9 @@ from agent.core.events import EventBus
 from agent.core.events_catalog import Events, all_events, EVENT_MODE, REQUIRED_SUBSCRIBER_EVENTS
 from agent.core.mcp_client import McpStdioClient, build_task_schema
 from agent.core.config_schema import coerce_config, validate_config
+from agent.core.obs import (bind_request_id, configure_logging, counters_snapshot,
+                            current_request_id, ensure_request_id, inc_counter,
+                            new_request_id, trace_fields)
 from agent.core.request_cost import (estimate_request_cost, wire_messages,
                                      wire_tools)
 from agent.core.scope_config import (DEFAULT_SESSION_LIMIT, evict_lru,
@@ -172,6 +175,15 @@ __all__ = [
     # 审计公共面（D4 转正；实现位于 core/audit）
     "durable",
     "now_iso",
+    # 可观测性（路线图 #5；实现位于 core/obs）：请求标识贯穿 + 结构化日志 + 进程计数器
+    "bind_request_id",
+    "ensure_request_id",
+    "current_request_id",
+    "new_request_id",
+    "trace_fields",
+    "configure_logging",
+    "inc_counter",
+    "counters_snapshot",
     # F1：口径校准因子（budget 维护 / 消费方经 api 只读）
     "cost_factor",
     # 权限档位的形状容错读写（approval 与 react 两个消费方共用，避免形状判断分叉）

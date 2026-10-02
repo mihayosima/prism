@@ -10,7 +10,7 @@ import asyncio
 import logging
 
 from agent.api import AgentError, Services, now_iso, plugin
-from agent.tables import MIGRATIONS
+from agent.tables import EVENTS_EXTRA_COLUMNS, EVENTS_REQUEST_INDEX, MIGRATIONS
 
 logger = logging.getLogger("agent.storage")
 
@@ -144,6 +144,32 @@ class Storage:
         ctx.provide("migrations", MigrationRegistry(db))
         ctx.effect(lambda: db.close())
         await ctx.migrations.apply(ctx, MIGRATIONS, "sqlite", namespace="agent")
+        await self._ensure_events_columns(ctx, db)
+
+    async def _ensure_events_columns(self, ctx, db: "SqliteDb") -> None:
+        """#5 可观测性：给**存量库**的 ``agent_events`` 容错补三列并建索引。
+
+        新建库由 ``_EVENTS`` 的 DDL 直接带上；存量库走这里。**刻意不用迁移**：
+        ``MigrationRegistry.apply`` 无容错、失败整组回滚，而这三列在"已补过的库"上
+        会报 duplicate column ⇒ 整组回滚 ⇒ **服务起不来**（详见 ``agent/tables.py``
+        中 ``EVENTS_EXTRA_COLUMNS`` 的说明）。逐列独立容错 ⇒ 单列失败不影响其余；
+        全失败也只意味着这批账本缺列（``durable`` 会记 warning，不崩主链路）。
+        """
+        added = 0
+        for col, decl in EVENTS_EXTRA_COLUMNS:
+            try:
+                await db.execute(
+                    ctx, f"ALTER TABLE agent_events ADD COLUMN {col} {decl}", ())
+                added += 1
+            except Exception:                 # noqa: BLE001 —— 列已存在/表未建 ⇒ 跳过
+                continue
+        try:
+            await db.execute(ctx, EVENTS_REQUEST_INDEX, ())
+        except Exception:                     # noqa: BLE001 —— 索引失败不影响记账
+            pass
+        if added:
+            logger.info("agent_events 已补可观测列 %s/%s + request_id 索引",
+                        added, len(EVENTS_EXTRA_COLUMNS))
 
 
 __all__ = ["SqliteDb", "MigrationRegistry"]
