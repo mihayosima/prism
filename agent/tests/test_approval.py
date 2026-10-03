@@ -424,10 +424,15 @@ def test_web_provider_reject_then_timeout_failsafe(tmp_path):
         except Exception as exc:
             assert "未获批准" in str(exc)
         timeout_inv = asyncio.ensure_future(c.root.tasks.invoke(c.root, "t.write", caller="t"))
-        await asyncio.sleep(0.3)                    # > timeout_s=0.1
+        # ★ 原来 `await asyncio.sleep(0.3)`（> timeout_s=0.1）—— **墙钟等待是 flaky 源**：
+        #   慢机器上 0.3s 可能不够、快机器上又白等。改为**等 future 真的了结**：
+        #   `asyncio.wait_for` 一旦超时就会 resolve，故给它一个远大于 timeout_s 的上限即可，
+        #   语义仍是"等到超时发生"，但不再依赖机器速度。
         try:
-            await timeout_inv
+            await asyncio.wait_for(asyncio.shield(timeout_inv), timeout=5.0)
             raise AssertionError("超时应默认拒绝")
+        except asyncio.TimeoutError:
+            raise AssertionError("审批超时未在 5s 内了结（远超 timeout_s=0.1，属真实故障）")
         except Exception as exc:
             assert "未获批准" in str(exc)
         timeouts = await _events(c, "agent/approval/timeout")

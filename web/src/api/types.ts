@@ -262,8 +262,26 @@ export interface SettingsResponse {
   domains?: SettingsDomainOption[]
   context_plugin_enabled?: boolean
   approval_enabled?: boolean
-  /** G7：外部工具准入沙箱（plugins.sandbox）是否启用（目录插件默认关） */
+  /** G7：外部工具**隔离档位**插件（plugins.sandbox）是否启用（目录插件默认关） */
   sandbox_enabled?: boolean
+  /**
+   * ★ 沙箱自报的**声明档位**（`none` / `read-only` / `workspace-write`）。
+   * 声明 ≠ 兑现 —— 要看 `sandbox_enforcement`。
+   */
+  sandbox_mode?: string
+  /**
+   * ★ 沙箱自报的**实际隔离强度**（`full` / `partial` / `none`）。
+   * **当前后端无进程级隔离实现 ⇒ 恒为 `none`**。这不是缺陷陈述，是事实陈述 ——
+   * 但绝不是"受保护"。缺这个字段时前端只能猜"正常"，那正是此前的误导源，
+   * 所以它必须由后端**自报**而非前端推断（对齐 DeepSeek Harness 的 `SandboxEnforcement`）。
+   */
+  sandbox_enforcement?: string
+  /** 声明了档位但兑现不了（当前仅 mode≠none 时为 true） */
+  sandbox_gap?: boolean
+  /** 沙箱自述覆盖的工具名模式（隔离按桥配置，固定 mcp.* 域） */
+  sandbox_targets?: string[]
+  /** 自述理由（人类可读，排查"为什么没保护"的唯一线索） */
+  sandbox_reason?: string
   /** 当前请求落在哪个会话键（`{user}:{session}`） */
   session_id?: string
   /** 允许写到「本会话」层的设置键白名单（G2 会话级化） */

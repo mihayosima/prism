@@ -1,58 +1,76 @@
-"""插件包：sandbox —— 外部工具（默认 MCP）的**准入网关 + 审计**（路线图 #7 的「沙箱」一半）。
+"""插件包：sandbox —— 外部工具（默认 MCP）的**隔离档位提供方 + 隔离自述**。
 
-为什么需要它（核实过的缺口，不是推测）
+定位（2026-10-03 转型后）
 ----------------------------------------
-- guard 的权限矩阵只做**精确名匹配**（``agent/sys/guard.py``：``target in task_deny`` /
-  ``target in task_allow``），而 MCP 的工具名是**运行时发现**的（``mcp.<bridge>.<tool>``，
-  随桥升级新增）⇒ 配置里既写不出 ``mcp.*`` 这种模式，也挡不住事后新增的工具。
-  这是"权限机制明明在、却管不到外部工具"的根因。
-- 另有一个**已核实的事实**决定了本插件的形态边界：``Task.risk`` 默认 ``"write"``，而两个
-  MCP 插件注册时都**没传 risk** ⇒ **全部 MCP 工具都是 write 档**。所以按风险级分级对
-  MCP 只能整体生效，**要按工具细分只能靠名称模式**（本插件的主手段）。
+本插件**不再做准入判定**。它只回答一个问题：
 
-**沙箱在这里的定位**：不是进程隔离（那与"操作本机的助手"这一定位冲突，且平台相关），
-而是**准入 + 可审计**——谁、在哪个会话、调用了哪个外部工具，逐次留痕、按模式可控。
-本模块**不承诺**任何进程级隔离；真要进程隔离应另立议题（见路线图 #7 的另半）。
+    这次外部工具调用，**声明在什么隔离档位下跑、实际强度是多少**。
 
-与既有权限体系的关系（**不重复造轮子**）
+三件套分工（此前本插件越界做了第一件，已收口）：
+
+    ==========  ==================================  ==========================
+    插件        判什么                                报什么
+    ==========  ==================================  ==========================
+    ``sys.guard``      谁能调什么（allow/deny/risk/targets）  策略矩阵（``status()``）
+    ``plugins.approval``  **唯一真问人**（provider + 弹窗）   审批结果
+    ``plugins.sandbox``  **不判准入**                      **隔离档位与强度**
+    ==========  ==================================  ==========================
+
+**为什么要转**：此前本插件同时持有一份 allow/deny/risk 名单，与 ``sys/guard.py``
+**功能重叠** —— 两份配置并存、互相打洞、无单一真相。核定过程见
+``docs/reform of production line/沙箱与权限管理器重叠核定-2026-10-03.md``。
+名字匹配（尾部 ``*``）与域限定（``targets``）已迁入 guard（guard 是 ``LLM_PRE_CALL``
+的**唯一**挂载者，也是唯一覆盖非 MCP 内置工具的裁决者）。
+
+两根正交的轴（**不可压成一维阶梯** —— 压扁会逼你撒谎）
 ----------------------------------------
-- 挂**同一个** waterfall：``agent/tasks/pre-execute``，``prepend=True`` ⇒ **最先裁决**
-  （``core/events.py`` 的 ``prepend`` 是 ``insert(0, …)``，与注册顺序无关）。理由有二：
-  ① 沙箱是"能不能进"的前置门；② 载荷带 ``kwargs`` 且 waterfall 支持**参数改写**
-  （``tasks.invoke`` 比较 ``decision["kwargs"] != kwargs``）⇒ 将来做路径重定向必须
-  在 guard/approval 看到参数**之前**完成。
-- 放行 ⇒ ``next()``；拒绝 ⇒ 不带 ``next`` 短路，``tasks.invoke`` 转成
-  ``CapabilityNotImplemented(denied_by="sandbox")``（与 guard 同款）。
-- 每次裁决落 ``agent/sandbox/decision``（durable 直写，**刻意另立**事件——用户裁定）⇒
-  「权限」视图的"最近裁决"保持只装 guard 的判据（权限矩阵），沙箱轨迹改由「事件」视图的
-  ``agent/sandbox`` 过滤项查看（两者判据不同：名称模式+会话 vs 权限矩阵，混在一起就分不清
-  是谁拒的）。#5 之后该账本带 ``request_id``/``session`` ⇒ 可按一次请求把外部工具轨迹串起来查。
-- 已知代价：沙箱拒绝时 guard 的审计行不会产生（链被短路）——**沙箱自己落审计**，不丢。
+- ``mode``        = 承诺**限制到什么**（文件效应；``none`` / ``read-only`` / ``workspace-write``）
+- ``enforcement`` = 实际**做到了多少**（``full`` / ``partial`` / ``none``）
+
+例：Windows 受限 token 能兑现 ``workspace-write`` 的**写限制**，但读/网络不隔离
+⇒ ``mode=workspace-write`` + ``enforcement=partial``。这不是"低一档"，
+而是"同一语义、不同强度"。对齐 DeepSeek Harness 的 ``SandboxMode`` / ``SandboxEnforcement``。
+
+★ 现状：**无任何进程级隔离实现** ⇒ 所有档位的实际强度都是 ``none``。
+这不是缺陷陈述，是**事实陈述** —— 把它报成 ``full`` 才是缺陷。
+插件页此前显示 ``enabled · assembled`` + ``error: null`` 看起来健康，是本项目最大的误导源之一。
+
+fail-closed 纪律（对齐 DSH）
+----------------------------------------
+- 无可��后端时**不静默降级**：``enforcement`` 如实为 ``none``，并有 ``gap`` 标记落差。
+- ``enforced_by`` 区分"沙箱正常评估"（当前恒 ``none``）与"沙箱自身故障"（``backend-error``）——
+  对应 DSH 的 ``denialSignatures`` vs ``runnerFailureRules``。**不把基础设施故障误报成策略结果**，
+  否则会触发本项目既有的 hang 自愈把工具故障当策略故障重启桥。
 
 配置
 ----------------------------------------
-容器级 ``config["agent"]["sandbox"]``（已在 ``core/config_schema.py`` 登记**逐键严格**
-schema，否则写了配置就装配失败）；会话级覆盖走既有 ``plugins.sandbox`` 节
+容器级 ``config["agent"]["sandbox"]``（``core/config_schema.py`` 登记**逐键严格** schema，
+否则写了配置就装配失败）；会话级覆盖走既有 ``plugins.sandbox`` 节
 （``SESSION_CFG_VIEW`` + ``section_of``，与 G2 同构 ⇒ 天然按会话隔离）：
 
-    targets   受本插件管辖的**工具名模式**（默认 ``["mcp.*"]`` ⇒ 默认只管 MCP）
-    default   未命中任何名单时的裁决：allow（默认，保持现状）/ ask / deny
-    allow     白名单模式（先判 deny，故白名单**不能**穿透黑名单）
-    deny      黑名单模式
-    risk      按风险级覆盖：``{"write": "ask", "danger": "deny"}``（**仅配置文件**，
-              不进设置页——见上文 F9：对 MCP 全是 write 档，放上去是个无效旋钮）
+    mode     声明的隔离档位：none（默认，当前唯一能兑现的）/ read-only / workspace-write
+    targets  受本插件管辖的**工具名模式**（默认 ``["mcp.*"]`` ⇒ 默认只管 MCP）
+    default/allow/deny/risk   **已废弃**（准入判定归 guard，问人归 approval）
+
+★ **四键为何不删**：`sandbox` 节是**严格键集**，删键会让写了这些键的用户配置在装配期
+抛 ``ConfigError`` ⇒ **服务起不来**。故保留（无裁决效果），并由 ``describe()`` 检出
+``deprecated_used`` 并计数 —— 迁移期**可见**，不静默。
 
 模式语法：仅支持**尾部** ``*``（``mcp.*`` / ``*``），其余按精确名。刻意**不用正则**：
 这份配置是运维手写的，语义越简单越不会错配。
 
-设置页
+waterfall 位置（★ 与文档旧说法相反，此处是更准的版本）
 ----------------------------------------
-``targets`` / ``default`` / ``allow`` / ``deny`` 四项已接入设置页（容器级与会话级均可写，
-受 schema 校验 ⇒ 键名拼错会被拒绝而非静默失效）。
+挂 ``agent/tasks/pre-execute`` 且 ``prepend=True``。但 ``core/events.py`` 的 ``prepend``
+是 ``insert(0, …)`` ⇒ **后注册者排前面**。装配序是 ``profiles.py:137`` 先装
+``SYS_PLUGINS``（guard）、``:145`` 再装目录插件（本插件）⇒ **实际顺序 sandbox → guard → approval**。
+本插件**恒放行**，所以顺序不再影响裁决结果——这正是转型顺带消解掉的一处隐患。
 
-``ask`` 的诚实说明：waterfall 里"要问人"必须由**下游** approval 裁决，而 guard 的 prepend
-已先短路，因此本插件的 ``ask`` 与 guard 同款——**拒绝并在理由里点名**（"要放行请加入
-allow 白名单，或改由审批插件裁决"）。真 ask 需把该裁决权交给 approval，属后续项。
+审计
+----------------------------------------
+每次调用落 ``agent/sandbox/confinement``（durable 直写，**另立**事件——用户 2026-10-03 裁定）。
+载荷含 ``mode``/``enforcement``/``ceiling``/``gap``/``enforced_by``/``bridge``/``session``。
+事件名由 ``agent/sandbox/decision`` 改名而来：留着 "decision" 会让读者误以为它仍在做准入决策。
 """
 
 from __future__ import annotations
@@ -60,9 +78,16 @@ from __future__ import annotations
 from agent.api import (SESSION_CFG_VIEW, Events, Services, current_session_key,
                        durable, inc_counter, now_iso, plugin)
 
-# 未命中名单时的兜底裁决 = 放行（与实施前行为一致：启用本插件只增加可观测性）。
+# 兜底档位 = ``none``（**无隔离**，是当前唯一诚实可报的强度）。
+# ★ 与 guard 的 ``DEFAULT_POLICY["targets"]`` 同源（都是 ``["*"]``/``["mcp.*"]`` 口径的等价物：
+# 本插件只看 MCP 域，guard 看全域）。
 DEFAULT_POLICY: dict = {
-    "targets": ["mcp.*"],
+    "mode": "none",        # 声明的隔离档位（none/read-only/workspace-write）
+    "targets": ["mcp.*"],  # 受本插件管辖的工具名模式（默认只管 MCP）
+    # ---- 以下四键**已废弃**（2026-10-03 策略收口）：准入判定归 guard，问人归 approval。
+    # **保留是为了向后兼容既有配置文件**——`core/config_schema.py` 的 `sandbox` 节是**严格键集**，
+    # 直接删键会让写了这些键的用户配置在装配期抛 ``ConfigError`` ⇒ 服务起不来。
+    # 它们**不再有任何裁决效果**，但会被 ``describe()`` 检出并计数（迁移期可见，不静默）。
     "default": "allow",
     "allow": [],
     "deny": [],
@@ -72,8 +97,6 @@ DEFAULT_POLICY: dict = {
 # 插件自管默认（与 core/config_schema.py 登记的键集一致）。
 DEFAULT_CONFIG: dict = {k: (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v)
                        for k, v in DEFAULT_POLICY.items()}
-
-_DECISIONS = ("allow", "ask", "deny")
 
 
 def match(pattern: str, target: str) -> bool:
@@ -91,29 +114,73 @@ def match(pattern: str, target: str) -> bool:
     return p == target
 
 
-def decide(policy: dict, *, target: str, risk: str = "") -> tuple[str, str]:
-    """裁决（纯函数，便于穷举单测）：``(裁决, 命中理由)``。
+def _bridge_of(target: str) -> str:
+    """从工具名推出**桥名**（``mcp.<bridge>.<tool>`` → ``<bridge>``）；非 MCP 形态返回空。
 
-    顺序固定为 **deny 名单 → allow 名单 → risk 覆盖 → default**：显式黑名单是"硬"的，
-    白名单**不能**穿透它（与 guard 的"deny 名单优先"同向，避免两份配置互相打洞）。
-    非法裁决值一律回落 ``allow``（fail-open：配置写错不该把工具全锁死）。
+    隔离档位是**按桥**配置的（每个 MCP 桥一个子进程 ⇒ 一份 confinement），
+    所以审计里必须带桥名才追得到"是哪个桥没隔离"。
     """
-    for pat in (policy.get("deny") or []):
-        if match(pat, target):
-            return "deny", f"命中拒绝名单 {str(pat)!r}"
-    for pat in (policy.get("allow") or []):
-        if match(pat, target):
-            return "allow", f"命中放行名单 {str(pat)!r}"
-    rv = str((policy.get("risk") or {}).get(risk) or "").strip()
-    if rv in _DECISIONS:
-        return rv, f"风险级 {risk!r} 覆盖为 {rv!r}"
-    dv = str(policy.get("default") or "allow").strip()
-    return (dv if dv in _DECISIONS else "allow"), "默认裁决"
+    parts = str(target or "").split(".")
+    return parts[1] if len(parts) >= 3 and parts[0] == "mcp" else ""
+
 
 
 def in_scope(policy: dict, target: str) -> bool:
     """该工具是否在本插件管辖范围内（不在 ⇒ 完全不过问，避免变成"第二个 guard"）。"""
     return any(match(p, target) for p in (policy.get("targets") or []))
+
+
+# ---------------------------------------------------------------------------
+# 隔离档位与强度（2026-10-03 转型：停止策略判定，改做 confinement）
+# ---------------------------------------------------------------------------
+# 两根**正交**轴（不可压成一维阶梯——压扁会逼你撒谎）：
+#   mode        = 承诺**限制到什么**（文件效应，对齐 DSH 的 read-only/workspace-write）
+#   enforcement = 实际**做到了多少**（full/partial/none）
+# 例：Windows 受限 token 能做到 workspace-write 的**写限制**，但读/网络不隔离 ⇒ mode=workspace-write
+# + enforcement=partial。这不是"低一档"，而是"同一语义、不同强度"。
+MODES = ("none", "read-only", "workspace-write")
+ENFORCEMENTS = ("full", "partial", "none")
+
+# 能力矩阵：mode ⇒ 能给出的最大强度。**诚实的一侧是下限**：
+# 当前无任何进程级隔离实现 ⇒ 所有 mode 的实际强度都是 ``none``。
+# 未来落地 restricted token 后才可变，且**必须由实测决定**（DSH 的 Windows 后端恒 partial：
+# Everyone SID 必须在 keep-alive 组 + NTFS 硬链接能跨路径别名）。
+_ENFORCEMENT_CEILING: dict[str, str] = {
+    "none": "none",
+    "read-only": "none",          # 尚无进程级隔离可兑现只读承诺
+    "workspace-write": "none",
+}
+
+_DEPRECATED_KEYS = ("default", "allow", "deny", "risk")
+
+
+def describe(policy: dict, target: str = "") -> dict:
+    """该工具本次调用的**隔离自述**（纯函数，便于穷举单测）。
+
+    返回 ``{mode, enforcement, ceiling, gap, reason, deprecated_used}``：
+
+    - ``mode``        配置声明的档位
+    - ``enforcement`` **实际**能达到的强度（当前恒 ``none`` —— 无进程级隔离）
+    - ``ceiling``     该 mode 在当前平台的能力上限
+    - ``gap``         ``mode`` 与 ``enforcement`` 的落差（配置了但兑现不了 ⇒ 必须可见）
+    - ``deprecated_used`` 仍在用已废弃的旧裁决键（迁移期提示，不静默）
+
+    ★ 宁可 ``enforcement="none"`` 也不谎报 —— 插件页显示"看起来健康"比显示"无隔离"危险。
+    """
+    mode = str(policy.get("mode") or "none").strip()
+    if mode not in MODES:
+        mode = "none"
+    ceiling = _ENFORCEMENT_CEILING.get(mode, "none")
+    used = [k for k in _DEPRECATED_KEYS if policy.get(k) not in (None, [], {}, "allow", "open")]
+    if mode == "none":
+        reason = "未配置隔离档位"
+    elif ceiling == "none":
+        reason = f"档位 {mode!r} 已声明，但本插件**未实现任何进程级隔离** ⇒ 实际无隔离"
+    else:
+        reason = f"档位 {mode!r} 生效（强度 {ceiling}）"
+    return {"mode": mode, "enforcement": ceiling, "ceiling": ceiling,
+            "gap": mode != "none" and ceiling == "none",
+            "reason": reason, "deprecated_used": used}
 
 
 def _config(ctx) -> dict:
@@ -141,7 +208,24 @@ def _config(ctx) -> dict:
 
 @plugin
 class Sandbox:
-    """外部工具准入网关（``agent/tasks/pre-execute`` 最先裁决 + 逐次审计）。"""
+    """外部工具**隔离档位提供方**（不再裁决准入——那是 guard / approval 的活）。
+
+    2026-10-03 转型（依据 ``docs/reform of production line/沙箱与权限管理器重叠核定-2026-10-03.md``）：
+    本插件曾同时做"策略判定"与"审计"，而策略判定与 ``sys/guard.py`` **功能重叠**（两份名单
+    并存、互相打洞、无单一真相）。现按下述分工收敛：
+
+    ==========  ==================================  ==========================
+    插件        判什么                                不判什么
+    ==========  ==================================  ==========================
+    guard       谁能调什么（allow/deny/risk/targets）  不管隔离强度
+    approval    唯一真问人（provider + 弹窗）          不判 allow/deny
+    sandbox     **在什么隔离档位下跑 / 强度多少**      **不判 allow/deny**
+    ==========  ==================================  ==========================
+
+    因此本插件**永远放行**（`return await next()`），只落一条 ``agent/sandbox/confinement``
+    审计。**"未实现隔离"这件事现在是可见的一等事实**（``enforcement="none"``），
+    而不是"看起来健康"——后者是插件页此前最大的误导源。
+    """
 
     name = "plugins.sandbox"
     layer = "system"
@@ -154,23 +238,30 @@ class Sandbox:
             policy = _config(ctx)
             if not in_scope(policy, target):
                 return await next()          # 不在作用域：完全不过问
-            risk = str(payload.get("risk") or "")
-            decision, why = decide(policy, target=target, risk=risk)
-            await durable(ctx, Events.SANDBOX_DECISION, {
+            info = describe(policy, target)
+            if info["deprecated_used"]:
+                # 迁移期提示：**不静默**（旧键仍在生效会让用户以为改了新键就生效了）
+                inc_counter("agent_sandbox_deprecated_keys_total")
+            await durable(ctx, Events.SANDBOX_CONFINEMENT, {
                 "who": str(payload.get("caller") or "unknown"), "level": "task",
-                "target": target, "risk": risk, "decision": decision,
+                "target": target, "risk": str(payload.get("risk") or ""),
+                "bridge": _bridge_of(target),
+                "mode": info["mode"], "enforcement": info["enforcement"],
+                "ceiling": info["ceiling"], "gap": info["gap"],
+                # ★ enforced_by 区分"沙箱正常评估"与"沙箱自身故障"（DSH 的
+                # denialSignatures vs runnerFailureRules）。当前后端恒 "none"；
+                # 未来落地后填真实后端名，失败时填 "backend-error"。
+                "enforced_by": "none",
+                # 迁移期可见性：仍在用已废弃的裁决键 ⇒ 审计里能查到（不静默）
+                "deprecated_used": list(info["deprecated_used"]),
                 "by": "sandbox", "session": current_session_key(ctx),
-                "reason": why, "at": now_iso(),
+                "reason": info["reason"], "at": now_iso(),
             })
-            inc_counter("agent_sandbox_decisions_total")
-            if decision == "allow":
-                inc_counter("agent_sandbox_allowed_total")
-                return await next()
-            inc_counter("agent_sandbox_denied_total")
-            hint = ("（要放行请加入 allow 白名单，或改由审批插件裁决）"
-                    if decision == "ask" else "")
-            return {"denied": True, "denied_by": "sandbox",
-                    "reason": f"sandbox: {target} {why} —— 未授权{hint}"}
+            inc_counter("agent_sandbox_confinement_total")
+            if info["gap"]:
+                inc_counter("agent_sandbox_enforcement_gap_total")
+            # ★ 恒放行：本插件不再拥有准入裁决权。
+            return await next()
 
         ctx.on(Events.TASKS_PRE_EXECUTE, _pre_task, prepend=True)
 
@@ -178,5 +269,26 @@ class Sandbox:
         """当前生效配置副本（诊断用，与 guard 的 ``policy()`` 同形状）。"""
         return _config(ctx)
 
+    async def status(self, ctx) -> dict:
+        """运行态摘要（``Container.plugin_statuses`` 消费）⇒ 插件页展示真实隔离状态。
 
-__all__ = ["Sandbox", "decide", "match", "in_scope", "DEFAULT_CONFIG", "DEFAULT_POLICY"]
+        ★ 策略（谁能调什么）由 guard 的 ``status()`` 报；本条**只报隔离**，两者不互相代答。
+        """
+        policy = _config(ctx)
+        info = describe(policy)
+        return {
+            "mode": info["mode"],
+            "enforcement": info["enforcement"],
+            "ceiling": info["ceiling"],
+            "gap": info["gap"],
+            "reason": info["reason"],
+            "targets": list(policy.get("targets") or []),
+            "session": current_session_key(ctx) or "container",
+            "deprecated_used": list(info["deprecated_used"]),
+            "decides_admission": False,      # 恒 False：准入不归本插件
+        }
+
+
+__all__ = ["Sandbox", "describe", "match", "in_scope", "MODES", "ENFORCEMENTS",
+           "DEFAULT_CONFIG", "DEFAULT_POLICY"]
+

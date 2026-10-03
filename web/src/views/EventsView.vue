@@ -32,9 +32,10 @@ import type { Row, EventsResponse } from '../api/types'
 const FILTERS = [
   { value: 'all', label: '全部' },
   { value: 'agent/permission/decision', label: '权限' },
-  // G7 外部工具准入（plugins.sandbox）：**另立事件**，故「权限」视图不收它，
-  // 在此单列一个过滤项（filterEvents 用 startsWith 匹配，前缀即可）。
-  { value: 'agent/sandbox', label: '沙箱' },
+  // 外部工具**隔离档位自述**（plugins.sandbox）：**另立事件**（2026-10-03 由
+  // `agent/sandbox/decision` 改名为 `agent/sandbox/confinement` —— 沙箱已不再做准入裁决，
+  // 名字里留着 "decision" 会让人误判）。用前缀 `agent/sandbox` 匹配，两名都覆盖。
+  { value: 'agent/sandbox', label: '隔离' },
   { value: 'agent/chat', label: '会话' },
   { value: 'agent/turn', label: '运行' },
 ] as const

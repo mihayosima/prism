@@ -58,19 +58,49 @@ export const APPROVAL_PROVIDER_LABELS: Record<string, string> = {
   cli: '终端问答（y=批 / a=本会话总是允许）',
 }
 
-/** G7 沙箱裁决档位（与后端 `_SETTING_META` 里 `default` 键的 choice 集合一致） */
-export const SANDBOX_DECISIONS = ['allow', 'ask', 'deny'] as const
-export const SANDBOX_DECISION_LABELS: Record<string, string> = {
-  allow: '放行（只记审计，行为与未启用沙箱一致）',
-  ask: '拒绝并在理由里点名（要放行请加入 allow 白名单）',
-  deny: '拒绝（兜底裁决）',
+/**
+ * 沙箱**隔离档位**（2026-03 收口后沙箱只做 confinement，不再判准入）。
+ * 取值域与后端 `agent/plugins/sandbox/__init__.py::MODES` 逐字一致 —— 改一处必须改两处。
+ */
+export const SANDBOX_MODES = ['none', 'read-only', 'workspace-write'] as const
+export const SANDBOX_MODE_LABELS: Record<string, string> = {
+  none: '不启用隔离（当前唯一能兑现的档位）',
+  'read-only': '声明只读（⚠ 当前无进程级隔离可兑现）',
+  'workspace-write': '声明工作区可写（⚠ 当前无进程级隔离可兑现）',
 }
 
-/** G7 沙箱三项名单键的中文标签（渲染用；键名与后端设置键一致） */
-export const SANDBOX_FIELD_LABELS: Record<string, string> = {
+/**
+ * 隔离**强度**自述徽标（对齐 DeepSeek Harness 的 `SandboxEnforcement`）。
+ * ★ 关键：`none` 必须**显式显示为警告**，不能显示成"正常"——
+ * 插件页此前显示 `enabled · assembled` + `error: null` 看起来健康，是本项目最大的误导源。
+ */
+export const ENFORCEMENT_BADGES: Record<string, { text: string; color: string; title: string }> = {
+  full: { text: '完整隔离', color: 'var(--ok, #16a34a)', title: '后端完整实现了该档位承诺的所有文件隔离' },
+  partial: {
+    text: '部分隔离',
+    color: 'var(--warn, #d97706)',
+    title: '因操作系统或内核版本限制只能做到部分隔离（例：Windows ACL 边界）。不可当作 full 使用。',
+  },
+  none: {
+    text: '⚠ 无隔离',
+    color: 'var(--danger, #dc2626)',
+    title: '无任何进程级隔离。这是事实陈述，不是缺陷陈述 —— 但绝不是"受保护"。',
+  },
+}
+
+/** 准入名单四键的中文标签（归属已改 guard：sys/guard.py 是策略唯一持有者） */
+export const GUARD_FIELD_LABELS: Record<string, string> = {
   targets: '管辖范围 targets（工具名模式，逗号分隔）',
+  default: '兜底策略 default（open=不先限制 / closed=白名单制）',
   allow: '放行名单 allow（工具名模式，逗号分隔）',
   deny: '拒绝名单 deny（工具名模式，逗号分隔）',
+}
+
+/** 准入兜底取值（与后端 `_SETTING_META` 里 `default` 键的 choice 集合一致） */
+export const GUARD_DECISIONS = ['open', 'closed'] as const
+export const GUARD_DECISION_LABELS: Record<string, string> = {
+  open: '不先限制能力（未命中名单一律放行）',
+  closed: '白名单制（未列入 allow 即拒）',
 }
 
 /** 保存时收集的数值键顺序（legacy app.js:552，原样） */
@@ -407,17 +437,16 @@ export function renderSettingsHtml(j: SettingsResponse, scope: SettingsScope = '
       '">命中名单的工具执行前必问人；配合对话页「审批」档可让所有非只读工具都问</div></label></div>'
   }
 
-  // ---- G7 外部工具准入沙箱（plugins.sandbox）----
-  // 目录插件默认关 ⇒ 未启用时明确提示"不受本层管辖"，避免"以为受保护"的错觉。
-  if (j.sandbox_enabled === false) {
-    h +=
-      '<div class="card muted" style="margin-top:16px">外部工具准入沙箱（plugins.sandbox）未启用 —— 在「插件」页点「启用」后，可在此调整。启用前外部工具不受本层管辖，行为与现在一致。</div>'
-  } else {
+  // ---- 准入名单（sys.guard：策略唯一持有者）----
+  // 2026-03 收口：四键从 plugins.sandbox 改挂 guard（它是 LLM_PRE_CALL 的唯一挂载者，
+  // 也是唯一覆盖非 MCP 内置工具的裁决者）。经 `run/chat.py::_SECTION_ALIAS` 落到
+  // `agent.permissions`（guard 的矩阵 SSOT 节）。
+  {
     const listInp = (k: string, ph: string, hint: string): string =>
       '<label style="' +
       LABEL +
       '"><div style="font-weight:600;margin-bottom:3px">' +
-      esc(SANDBOX_FIELD_LABELS[k]) +
+      esc(GUARD_FIELD_LABELS[k]) +
       sessTag(k) +
       '</div>' +
       '<input id="set_' +
@@ -435,12 +464,21 @@ export function renderSettingsHtml(j: SettingsResponse, scope: SettingsScope = '
       esc(hint) +
       '</div></label>'
     h +=
-      '<div class="card" style="margin-top:16px"><h3 style="margin-top:0">外部工具准入 · 沙箱（plugins.sandbox）</h3>' +
-      '<div class="muted" style="margin-bottom:10px">按<b>工具名模式</b>决定哪些外部工具（默认 mcp.*）可被调用，每次裁决都落审计账本（见「事件」视图的「沙箱」过滤项）。<b>启用 ≠ 已收紧</b>：默认档位是「放行」，本层目前只增加可追溯性；黑名单命中才拒，拒因会写进审计与报错文本。</div>' +
-      listInp('targets', 'mcp.*, *', '受本层管辖的工具名模式（逗号分隔）。尾部 * 通配；不在此列表的工具完全不受影响。') +
+      '<div class="card" style="margin-top:16px"><h3 style="margin-top:0">准入名单（sys.guard）</h3>' +
+      '<div class="muted" style="margin-bottom:10px">决定<b>谁能调什么</b>。白名单模式（<code>default=closed</code>）下未列入 allow 的调用一律拒；黑名单优先，白名单不能穿透。每次裁决落审计账本（见「权限」视图的「最近裁决」）。<b>启用 ≠ 已收紧</b>：默认 <code>open</code>，本层不先限制能力。</div>' +
+      // ⚠️ 高危开关告知：llm 闸不在设置页可写（见 _SETTING_META），但运维可能手改配置文件，
+      // 所以必须在界面上讲清后果 + 收紧后的行为（2026-10-03：取值域收为 open/deny，
+      // 误配回落 open 并计入 agent_guard_llm_mode_invalid_total）。
+      '<div style="margin-bottom:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px">' +
+      '<b>⚠️ 高危开关：<code>permissions.llm</code>（本设置页<b>不可写</b>，仅配置文件）</b>' +
+      '<div class="muted" style="margin-top:4px">配成 <code>deny</code> 会拒掉<b>全部</b>模型调用 —— ' +
+      '记忆提取 / 结果解说 / 反思都在内，等于让服务失去大部分能力。合法取值只有 <code>open</code>（默认）与 <code>deny</code>；' +
+      '其他任何值（<code>true</code> / <code>1</code> / 乱写）会被视为 <code>open</code> 放行并计入告警计数，' +
+      '不会再"误配即锁死"。</div></div>' +
+      listInp('targets', '*, mcp.*, plugins.*', '受管辖的工具名模式（逗号分隔）。尾部 * 通配；不在此列表的调用完全不过问。<b>默认 * = 全部</b>。') +
       '<label style="' +
       LABEL +
-      '"><div style="font-weight:600;margin-bottom:3px">兜底裁决 default' +
+      '"><div style="font-weight:600;margin-bottom:3px">兜底策略 default' +
       sessTag('default') +
       '</div>' +
       '<select id="set_default" style="' +
@@ -448,7 +486,7 @@ export function renderSettingsHtml(j: SettingsResponse, scope: SettingsScope = '
       '"' +
       dis('default') +
       '>' +
-      SANDBOX_DECISIONS.map(
+      GUARD_DECISIONS.map(
         (o) =>
           '<option value="' +
           o +
@@ -457,14 +495,76 @@ export function renderSettingsHtml(j: SettingsResponse, scope: SettingsScope = '
           '>' +
           o +
           '（' +
-          SANDBOX_DECISION_LABELS[o] +
+          GUARD_DECISION_LABELS[o] +
           '）</option>',
       ).join('') +
       '</select><div class="muted" style="' +
       HINT +
-      '">未命中任何名单时的裁决。<b>allow</b> = 与未启用沙箱行为一致（只记审计）。</div></label>' +
-      listInp('allow', 'mcp.playwright.*', '白名单模式；<b>不能穿透黑名单</b>（deny 优先判定）。') +
+      '"><b>open</b> = 未命中名单一律放行（默认，不先限制能力）；<b>closed</b> = 白名单制，未列入 allow 即拒。</div></label>' +
+      listInp('allow', 'agent.ping, mcp.playwright.*', '白名单模式（<code>default=closed</code> 时才生效）。<b>不能穿透黑名单</b>（deny 优先判定）。') +
       listInp('deny', 'mcp.windows.*', '黑名单模式；命中即拒，审计与报错都会写明命中的是哪一条。') +
+      '</div>'
+  }
+
+  // ---- 隔离档位（plugins.sandbox：confinement 提供方）----
+  // 目录插件默认关 ⇒ 未启用时明确提示"不受本层管辖"，避免"以为受保护"的错觉。
+  if (j.sandbox_enabled === false) {
+    h +=
+      '<div class="card muted" style="margin-top:16px">外部工具隔离档位（plugins.sandbox）未启用 —— 在「插件」页点「启用」后，可在此调整。<b>启用 ≠ 有隔离</b>：当前后端无任何进程级隔离实现，启用只增加可追溯性。</div>'
+  } else {
+    const enf = (j.sandbox_enforcement || 'none') as string
+    const badge = ENFORCEMENT_BADGES[enf] || ENFORCEMENT_BADGES.none
+    h +=
+      '<div class="card" style="margin-top:16px"><h3 style="margin-top:0">外部工具隔离 · 沙箱（plugins.sandbox）</h3>' +
+      '<div class="muted" style="margin-bottom:10px">回答<b>「这次调用在什么隔离档位下跑、实际强度多少」</b>，<b>不判准入</b>（准入见上一张卡）。每次调用落 <code>agent/sandbox/confinement</code> 审计（见「事件」视图的「沙箱」过滤项）。</div>' +
+      '<div style="margin-bottom:12px;padding:10px 12px;border:1px solid var(--line);border-radius:8px">' +
+      '<span style="font-weight:600">当前实际强度：</span>' +
+      '<span title="' +
+      esc(badge.title) +
+      '" style="margin-left:8px;padding:2px 8px;border-radius:999px;background:' +
+      badge.color +
+      ';color:#fff;font-weight:600">' +
+      esc(badge.text) +
+      '</span>' +
+      '<div class="muted" style="margin-top:8px">' +
+      esc(badge.title) +
+      '</div></div>' +
+      '<label style="' +
+      LABEL +
+      '"><div style="font-weight:600;margin-bottom:3px">声明档位 mode' +
+      sessTag('mode') +
+      '</div>' +
+      '<select id="set_mode" style="' +
+      SEL +
+      '"' +
+      dis('mode') +
+      '>' +
+      SANDBOX_MODES.map(
+        (o) =>
+          '<option value="' +
+          o +
+          '"' +
+          (v.mode === o ? ' selected' : '') +
+          '>' +
+          o +
+          '（' +
+          SANDBOX_MODE_LABELS[o] +
+          '）</option>',
+      ).join('') +
+      '</select><div class="muted" style="' +
+      HINT +
+      '">声明<b>想</b>限制到什么。<b>当前后端无进程级隔离实现 ⇒ 声明了也兑现不了</b>（审计里会记 <code>gap=true</code>）。这比"看起来受保护"诚实。</div></label>' +
+      '<label style="' +
+      LABEL +
+      '"><div style="font-weight:600;margin-bottom:3px">自述范围 targets' +
+      sessTag('targets') +
+      '</div>' +
+      '<input id="set_sb_targets" type="text" value="' +
+      esc(((j.sandbox_targets || ['mcp.*']) as string[]).join(', ')) +
+      '" disabled style="width:360px;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font:inherit;opacity:.6">' +
+      '<div class="muted" style="' +
+      HINT +
+      '">本层只自述 <code>mcp.*</code> 域（隔离是<b>按桥</b>配置的：每个 MCP 桥一个子进程）。改管辖范围请用上一张卡的 <code>targets</code>。</div></label>' +
       '</div>'
   }
 

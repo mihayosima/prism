@@ -38,12 +38,16 @@ class Events:
     # 权限决策（guard 落审计；前端「权限」过滤用同名）
     PERMISSION_DECISION = "agent/permission/decision"
 
-    # 外部工具准入（plugins.sandbox）：durable 直写（不经总线）。
-    # **刻意另立**而非复用 PERMISSION_DECISION（用户裁定）：沙箱的裁决依据是
-    # "名称模式 + 会话"，与权限矩阵（guard）是**两套判据**，混在一张事件里会让
-    # 「最近裁决」无法区分是谁拒的。代价：前端「权限」视图的"最近裁决"不再包含
-    # 沙箱行；改由「事件」视图的 `agent/sandbox` 过滤项查看。
-    SANDBOX_DECISION = "agent/sandbox/decision"
+    # 外部工具隔离档位自述（plugins.sandbox）：durable 直写（不经总线）。
+    # 2026-10-03 转型：事件名由 ``agent/sandbox/decision`` 改为 ``agent/sandbox/confinement``——
+    # 沙箱**不再拥有准入裁决权**（那份判定与 guard 重叠，已收口），它现在只回答一个问题：
+    # "这次调用**在什么隔离档位下跑、实际强度多少**"。名字里留着 "decision" 会让读者
+    # 误以为它仍在做准入决策。
+    # 载荷：``{mode, enforcement, ceiling, gap, enforced_by, bridge, targets…}``。
+    # ★ ``enforcement`` 是**自报的实际强度**（当前恒 ``none``）——"未实现隔离"必须可见，
+    # 否则插件页显示"一切正常"就是误导（对齐 DeepSeek Harness 的 ``SandboxEnforcement``）。
+    # 代价：前端「事件」视图的 ``agent/sandbox`` 过滤项与旧名不匹配，需同步更新。
+    SANDBOX_CONFINEMENT = "agent/sandbox/confinement"
 
     # 审批插件（plugins.approval）：asked/answered/timeout/mode_changed 由 durable
     # 直写 agent_events（不经总线）；PENDING 为 live emit（第 2 期前端弹窗消费）
@@ -116,7 +120,7 @@ EVENT_MODE: dict[str, str] = {
     Events.CHAT_DONE: "emit",
     Events.CHAT_RESET: "emit",
     Events.PERMISSION_DECISION: "emit",   # durable 落盘（审计脊柱）
-    Events.SANDBOX_DECISION: "emit",     # 同上（plugins.sandbox 准入裁决，另立事件）
+    Events.SANDBOX_CONFINEMENT: "emit",   # 同上（plugins.sandbox 隔离档位自述，另立事件）
     Events.APPROVAL_ASKED: "emit",        # durable 直写（审计脊柱）；bus 无监听者
     Events.APPROVAL_ANSWERED: "emit",     # 同上
     Events.APPROVAL_TIMEOUT: "emit",      # 同上
@@ -145,8 +149,14 @@ EVENT_MODE: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # capability 接缝：必须有 ≥ 1 个实时监听（安全闸门）
 # ---------------------------------------------------------------------------
-# LLM_PRE_CALL：guard（prepend 先裁决）+ budget（后裁决）→ 期望 2 方
-# TASKS_PRE_EXECUTE：仅 guard 裁决 → 期望 1 方
+# LLM_PRE_CALL：guard（prepend）+ budget（append）→ 期望 2 方。**guard 是唯一挂载者**
+#   （``plugins.sandbox`` 完全不挂该 seam ⇒ 它管不到模型调用）。
+# TASKS_PRE_EXECUTE：期望 ≥ 1 方。**实际有三方**（2026-10-03 更正）：
+#   guard（prepend）+ plugins.sandbox（prepend）+ plugins.approval（append）。
+#   ⚠️ 两个 prepend 争同一位置，而 ``prepend`` 是 ``insert(0, …)`` ⇒ **后注册者在前**。
+#   装配序：``profiles.py:137`` 先装 SYS_PLUGINS（guard）→ ``:145`` 再装目录插件（sandbox）
+#   ⇒ **实际执行顺序 sandbox → guard → approval**。改装配顺序会改变裁决优先级。
+#   本常量只表达"期望谁挂"（用于 fail-fast 报错文案），**不表达执行顺序**，勿据它推断。
 REQUIRED_SUBSCRIBER_EVENTS: frozenset[str] = frozenset({
     Events.LLM_PRE_CALL,
     Events.TASKS_PRE_EXECUTE,
@@ -154,6 +164,7 @@ REQUIRED_SUBSCRIBER_EVENTS: frozenset[str] = frozenset({
 
 # 每个 required seam 期望由哪些内核插件挂监听（仅用于 fail-fast 报错信息，
 # 便于"当前挂了谁 / 期望谁挂"对照；不用于断言强制，避免与运行期裁剪冲突）。
+# ⚠️ 目录插件（``plugins.*``）不进此表——它们可被用户停用，列进来会让报错文案撒谎。
 SEAM_SUBSCRIBERS: dict[str, list[str]] = {
     Events.LLM_PRE_CALL: ["agent.guard", "agent.budget"],
     Events.TASKS_PRE_EXECUTE: ["agent.guard"],

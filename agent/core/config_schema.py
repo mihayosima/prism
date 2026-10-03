@@ -26,8 +26,15 @@ _SCHEMA: dict[str, Any] = {
         "budget": {"max_tokens_per_run": int, "reset_on_new_session": bool,
                    "finalize_reserve_tokens": int, "warning_ratio": (int, float),
                    "cost_calibration": bool},   # 方案A：收尾预留额度
+        # 准入矩阵的唯一持有者 = guard（2026-10-03 收口：模式匹配与域限定从 sandbox 迁入）。
+        # ``targets`` 默认 ``["*"]`` = 全部（等价于收窄前的行为），支持尾部 ``*`` 通配。
+        # ⚠️ ``llm`` 声明为 ``str`` 而**不是**枚举——``core`` 层的 ``_matches`` 只支持类型规约
+        # （枚举校验的既有先例在 ``run/chat.py::_coerce_setting`` 的 choice 分支，属设置层）。
+        # 取值域由 ``sys/guard.py::_LLM_MODES``（``open``/``deny``）在**代码层**收：
+        # 未知值回落 open 并计数，不再"任何非 open 值都锁死全部模型调用"。
         "permissions": {"default": str, "task_allow": list, "task_deny": list, "llm": str,
-                        "risk": dict},   # S5：按风险级裁决 {"read":"allow","danger":"deny",...}
+                        "risk": dict,          # S5：按风险级裁决 {"read":"allow","danger":"deny",...}
+                        "targets": list},      # 域限定；不在此列表的工具完全不过问
         "loop": {"deadline_s": (int, float)},
         # 阶段 2（2.2）：会话/租户身份的服务端配置面（session 另从请求头取，不在此配置）。
         # 严格校验（非 _any）：拼错键（如 ``tennat``）在装配期即 fail-fast。
@@ -56,13 +63,15 @@ _SCHEMA: dict[str, Any] = {
         "system_memory": "_any",
         "work_memory": "_any",
         "short_term": "_any",
-        # G7（外部工具准入沙箱）：**逐键严格**而非 "_any"（沿用 context/budget 的纪律：
+        # G7 外部工具隔离（plugins.sandbox）：**逐键严格**而非 "_any"（沿用 context/budget 的纪律：
         # 拼错键在装配期即 fail-fast）。登记这一节是**硬前提**——``_merge_cfg`` 把容器级
         # 覆盖按 ``plugins.<名>`` → ``agent.<名>`` 映射进来，而 ``validate_config`` 在每次
         # 装配都跑；不登记 ⇒ 用户一写 sandbox 配置就是 ``ConfigError`` ⇒ 服务起不来。
-        # 注：``allow``/``deny``/``default`` 是扁平设置键的通用名（approval 已有
-        # ``ask``/``provider`` 同款），由 ``_SETTING_META`` 的单值映射保证不歧义。
-        "sandbox": {"targets": list, "default": str, "allow": list,
+        # ``mode`` = 声明的隔离档位（2026-10-03 新增，收口时登记）。
+        # ``default``/``allow``/``deny``/``risk`` 四键**已废弃**（准入判定归 guard，
+        # 问人归 approval）⇒ 保留仅为兼容既有配置，**不再有裁决效果**。
+        # ⚠️ 删键会让写了这些键的用户配置在装配期抛 ``ConfigError`` ⇒ 服务起不来，故不删。
+        "sandbox": {"mode": str, "targets": list, "default": str, "allow": list,
                     "deny": list, "risk": dict},
     },
     # 插件自管顶层节

@@ -114,10 +114,21 @@ def _save_overrides(data: dict) -> None:
     _store().replace_container(data)
 
 
-def _merge_cfg(args: argparse.Namespace) -> dict:
-    """基础 config（_cfg）+ 用户覆盖，注入 build_agent。
+# 覆盖节名 → ``config["agent"]`` 下的**实际配置节**的特例表。
+# 通用规则是同名（``plugins.<名>`` → ``agent.<名>``），但 ``plugins.guard`` 是例外：
+# guard 是**系统层硬装配**插件（不在目录插件之列），其矩阵的 SSOT 节叫 ``permissions``
+# （``core/config_schema.py`` 的严格键集节，见 ``sys/guard.py::_matrix``）。
+# 2026-10-03 策略收口后设置页的 ``targets``/``default``/``allow``/``deny`` 改挂 ``plugins.guard``，
+# 若无此特例它们会落到不存在的 ``agent.guard`` ⇒ 静默失效（已实测：会抛 ConfigError）。
+# ⚠️ 这条特例是**显式**的：通用规则保持干净，不让任何插件去猜自己的节名。
+_SECTION_ALIAS: dict[str, str] = {"plugins.guard": "permissions"}
 
-    覆盖按 ``plugins.<名>`` → ``agent.<名>`` 映射并入对应插件配置节（均为 _any，免改 schema）。
+
+def _merge_cfg(args: argparse.Namespace) -> dict:
+    """基础 config（``_cfg``）+ 用户覆盖，注入 build_agent。
+
+    覆盖按 ``plugins.<名>`` → ``agent.<名>`` 映射并入对应插件配置节（均为 ``_any``，
+    免改 schema）；``_SECTION_ALIAS`` 里的节名走特例（见其 docstring）。
     """
     cfg = _cfg(args)
     ov = _load_overrides()
@@ -127,7 +138,7 @@ def _merge_cfg(args: argparse.Namespace) -> dict:
             continue
         if not isinstance(pconf, dict):
             continue
-        base = pid[len("plugins."):]
+        base = _SECTION_ALIAS.get(pid, pid[len("plugins."):])
         node = agent.setdefault(base, {})
         node.update(pconf)
     if getattr(args, "hardened", False):
@@ -274,22 +285,36 @@ _SETTING_META: dict[str, dict] = {
         "spec": ("bool",), "plugin": "plugins.react",
         "default": _REACT_DEFAULTS.get("alignment_enabled", True),
         "scope": "container"},
-    # ---- G7 外部工具准入沙箱（plugins.sandbox）----
+    # ---- 准入名单四键（2026-10-03 策略收口：plugins.sandbox → plugins.guard）----
     # 键名取**裸名**（与 approval 的 ask/provider 同款）：设置层是扁平单值命名空间，
     # 由 _PLUGIN_OF_KEY 保证不歧义。``risk`` 刻意**不进设置页**——已核实 MCP 工具
     # 全部是 write 档（两处 register 都没传 risk），放上去是个无效旋钮，只走配置文件。
+    #
+    # ⚠️ 归属改为 ``plugins.guard``：准入策略的**唯一持有者**是 guard（``sys/guard.py``，
+    # 它同时是 ``LLM_PRE_CALL`` 的唯一挂载者）。此前挂 ``plugins.sandbox`` 造成两份名单
+    # 并存、互相打洞（见 docs/…/沙箱与权限管理器重叠核定-2026-10-03.md）。
+    # 落到 ``agent.permissions`` 靠 ``_SECTION_ALIAS`` 特例（见其 docstring）。
+    # ``targets`` 默认从 ``["mcp.*"]`` 改为 ``["*"]``：与 ``sys.guard.DEFAULT_POLICY``
+    # 同源（收口前 guard 管辖全部工具 ⇒ 行为逐位不变）。
     "targets": {
-        "spec": ("list",), "plugin": "plugins.sandbox",
-        "default": ["mcp.*"], "scope": "session"},
+        "spec": ("list",), "plugin": "plugins.guard",
+        "default": ["*"], "scope": "session"},
     "default": {
-        "spec": ("choice", ["allow", "ask", "deny"]), "plugin": "plugins.sandbox",
-        "default": "allow", "scope": "session"},
+        "spec": ("choice", ["open", "closed"]), "plugin": "plugins.guard",
+        "default": "open", "scope": "session"},
     "allow": {
-        "spec": ("list",), "plugin": "plugins.sandbox",
+        "spec": ("list",), "plugin": "plugins.guard",
         "default": [], "scope": "session"},
     "deny": {
-        "spec": ("list",), "plugin": "plugins.sandbox",
+        "spec": ("list",), "plugin": "plugins.guard",
         "default": [], "scope": "session"},
+    # ---- 隔离档位（2026-10-03 B1：沙箱转 confinement 提供方后新增）----
+    # 归属 ``plugins.sandbox``（沙箱**自己**的配置节）⇒ 经 ``_SECTION_ALIAS`` 同名映射到
+    # ``agent.sandbox``，正是 ``sys`` 侧 ``_config()`` 读的那一节（**不是**特例）。
+    # 取值域与 ``agent/plugins/sandbox/__init__.py::MODES`` 逐字一致（改一处必须改两处）。
+    "mode": {
+        "spec": ("choice", ["none", "read-only", "workspace-write"]),
+        "plugin": "plugins.sandbox", "default": "none", "scope": "session"},
 }
 
 # 以下三张表为**派生视图**（保留旧名：既有测试与调用点零改动）——单一真相源是 _SETTING_META。
@@ -533,185 +558,13 @@ async def _obs_middleware(request, call_next):
              resp.status_code, (time.perf_counter() - started) * 1000)
     return resp
 
+def _register_probes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse,
+                    _session_cfg, JSONResponse, Request, StreamingResponse):
+    """★ 探针 + 会话流路由（/health /ready /metrics /api/chat*）。
 
-async def _serve(args: argparse.Namespace) -> int:
-    import uvicorn
-    from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-
-    # ---- #5 可观测性：**最先**装日志（此前全仓无任何 handler，INFO 级静默丢弃）----
-    # 放在这里（而非 uvicorn.Config 之前）是为了让 ``create_app`` 内部的所有日志
-    # ——含前端产物提示、重建失败——也走同一套 handler 与字段。
-    configure_logging(level=args.log_level, fmt=args.log_format)
-
-    c, pm = await _boot(args)
-
-    class _Box:
-        """可换容器的句柄：handlers 引用 c.root 不受「重建容器」影响。"""
-
-        def __init__(self, c):
-            self.set(c)
-
-        def set(self, c):
-            self._c = c
-
-        @property
-        def root(self):
-            return self._c.root
-
-        @property
-        def container(self):
-            return self._c
-
-        async def teardown(self):
-            await self._c.teardown()
-
-    c = _Box(c)
-    # 2.2：**不再有「进程级全局会话」**——原 ``session_id = uuid4().hex[:8]`` 是启动时生成
-    # 一次的闭包常量，所有请求共用（多会话下即串数据）。现改为每请求经 ``_identity()`` 解析。
-    # B6/B5 共用：run_id -> (在跑的任务, 归属会话键)。取消端点据此 cancel **并校验归属**
-    # （H4：否则任一会话都能取消别人的 run）；断连时清理，防孤儿任务。
-    active_runs: dict[str, tuple[asyncio.Task, str]] = {}
-
-    # ---- 阶段 2（2.2）：请求级身份解析 -----------------------------------------
-    # 信任边界：**tenant/user 只来自服务端配置**（客户端可伪造 ⇒ 不下放）；
-    # session 来自请求头 ``X-Session-Id``（无隔离语义，伪造只影响伪造者自己）。
-    # 键构造/净化的唯一真源是 ``core/session.py``——任何非法标识在此 fail-fast（400），
-    # 不静默回退（否则用户以为在私密会话，实则落进共享桶 / 前缀扫描越权命中他人）。
-    #
-    # R1（2026-10-02）：本函数据此成为**请求作用域绑定的单一漏斗**——解析成功即把会话键
-    # 绑到 ContextVar（按 asyncio task 隔离 ⇒ 每请求独立）。消费方多为**无 ctx 入参**的事件
-    # 回调（approval/guard）或装配期捕获 ctx 的服务（budget/router），它们读不到请求参数，
-    # 只能靠该通道；``ctx.state`` 仍照写（兼容既有测试写法），但不再是读取主通道。
-    # ⇒ 新增端点若需要会话归属，**必须经本函数**解析身份（勿自己读头）。
-
-    def _session_cfg() -> dict:
-        return ((c.root.config or {}).get("agent") or {}).get("session") or {}
-
-    def _identity(request: Request | None = None, body: dict | None = None):
-        cfg = _session_cfg()
-        raw = ""
-        if request is not None:
-            raw = str(request.headers.get("x-session-id") or "")
-        if not raw and isinstance(body, dict):
-            raw = str(body.get("session") or "")
-        try:
-            ident = make_identity(tenant=cfg.get("tenant"), user=cfg.get("user"),
-                                  session=raw)
-        except SessionIdError as exc:
-            raise HTTPException(status_code=400, detail=f"非法会话标识：{exc}")
-        set_current_session_key(ident.session_key)
-        return ident
-
-    def _sse(event: str, payload: dict) -> str:
-        """一帧 SSE（data: {...}\\n\\n）。帧类型见设计方案 §4.5。"""
-        return "data: " + json.dumps({"event": event, "payload": payload or {}},
-                                     ensure_ascii=False) + "\n\n"
-
-    async def _apply_rebuild() -> None:
-        """按当前 config（含用户覆盖）+ 当前插件期望态重建容器（管理操作即时生效）。"""
-        old = c._c
-        c2 = build_agent(config=_merge_cfg(args), plugin_mgr=pm)
-        await c2.assemble()
-        await c2.start()
-        try:
-            await old.teardown()
-        except Exception:  # noqa: BLE001
-            pass
-        c.set(c2)
-        _attach_session_cfg_view(c2.root)     # 新容器 ⇒ 重新挂接缝
-
-    app = FastAPI(title="Agent Harness", docs_url=None, redoc_url=None)
-
-    # ---- R3：全局异常兜底（此前完全缺失）-----------------------------------
-    # 此前未注册任何 exception_handler ⇒ 非 HTTPException 的未捕获异常落到
-    # Starlette 默认处理器，返回 **HTML** 500：前端 `res.json()` 直接解析失败，
-    # 且不留统一日志。这里统一转成 JSON 错误体（形状沿用 /api/chat 的既有兜底
-    # `{"error": ...}`，前端零改动），并记一条带路径的 error 日志。
-    # 注意：HTTPException 不在此接管——Starlette 默认已返回 JSON `{"detail": ...}`，
-    # 覆盖它会改变 400/404 的既有响应体形状，属于无收益的行为变更。
-    _err_log = logging.getLogger("agent.chat")
-
-    @app.exception_handler(AgentError)
-    async def _on_agent_error(request: Request, exc: AgentError) -> JSONResponse:
-        _err_log.error("AgentError @ %s: %s", request.url.path, exc)
-        return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
-                            status_code=500)
-
-    @app.exception_handler(Exception)
-    async def _on_unhandled(request: Request, exc: Exception) -> JSONResponse:
-        _err_log.exception("未捕获异常 @ %s", request.url.path)
-        return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
-                            status_code=500)
-
-    # ---- #5 可观测性：每请求绑定 request id ---------------------------------
-    # 装在**所有路由之外**的中间件里 ⇒ 无论端点是否经 ``_identity`` 解析身份
-    # （``/health``、``/metrics``、``/api/events``…）都能拿到本次请求的 id。
-    # 账本（``agent_events`` 的三列）与日志（record factory 注入 rid/session/run）
-    # 都从这一处绑定取值 ⇒ **一次请求的痕迹可按同一 id 串起来**。
-    # 响应头回带 ``X-Request-Id``：用户报障时可直接给出该值定位到那一轮。
-    # 实现见模块级 ``_obs_middleware``（抽成模块级函数才能被单测直接调用——
-    # ``_serve`` 返回时容器已 teardown，无法在进程内对其发真实请求）。
-    app.middleware("http")(_obs_middleware)
-
-    # ---- B3.1 跨域（opt-in）------------------------------------------------
-    # 默认「不启用」：沿用 dev 下的 Vite proxy（同源），零行为变化。
-    # 前后端**直连**部署（前端静态托管在别的源）时显式传 --cors-origin 打开。
-    # 注意：allow_credentials=True 时 **不可** 用 "*"（浏览器会拒绝），
-    #       故此处按实际来源逐一回显——这也是「默认空 = 不启用」的另一层理由。
-    if args.cors_origin:
-        from fastapi.middleware.cors import CORSMiddleware
-
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=list(args.cors_origin),
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
-            # SSE：浏览器 fetch 流读不暴露这些头也能用，但显式登记便于前端读取
-            expose_headers=["Cache-Control", "X-Accel-Buffering"],
-        )
-
-    # ---- B3.2 访问令牌（opt-in）--------------------------------------------
-    # 默认「不鉴权」：本地 dev 与既有测试零影响。
-    # 启用后支持两种携带方式（**两种都要**：EventSource 无法自定义请求头，
-    # SSE / 静态资源走 `?token=`；其余 fetch 走 `Authorization`）。
-    _AUTH_EXEMPT = {"/", "/api/status"}       # 健康探针：首页与状态接口始终放行
-    _token = str(args.token or "")
-
-    def _extract_token(request) -> str:
-        """按 `Authorization: Bearer x` → `?token=x` 顺序取令牌（headers 优先）。"""
-        h = request.headers.get("authorization") or ""
-        if h[:7].lower() == "bearer ":
-            return h[7:].strip()
-        return str(request.query_params.get("token") or "")
-
-    if _token:
-        import hmac
-
-        from fastapi import Request
-        from fastapi.responses import JSONResponse as _JSONResponse
-
-        @app.middleware("http")
-        async def _auth_mw(request: Request, call_next):
-            path = request.url.path
-            # 三类放行：
-            #   1) OPTIONS 预检 —— CORS 预检不带 Authorization（浏览器规范），拦了 CORS 全废；
-            #   2) 显式豁免的探针 —— `/` 首页与 `/api/status`；
-            #   3) **非 `/api/` 路径** —— B4 起这些是前端静态产物（index.html / assets/*）。
-            #      浏览器用 <script>/<link> 加载它们时**无法携带 token**，若拦则整页白屏；
-            #      且静态产物本就是发给浏览器的公开资源，不构成额外信息泄露。
-            #      真正的数据面（/api/*）一律照旧校验，安全强度不变。
-            if (request.method == "OPTIONS"
-                    or path in _AUTH_EXEMPT
-                    or not path.startswith("/api/")):
-                return await call_next(request)
-            # 常量时间比较：避免按字符计时侧信道（本地/内网场景亦无理由削弱）
-            if not hmac.compare_digest(_extract_token(request), _token):
-                return _JSONResponse({"error": "未授权：缺少或无效的 token"},
-                                     status_code=401)
-            return await call_next(request)
-
+    从 ``_register_routes`` 拆出（2026-10-04，机械搬移）。调用顺序由
+    ``_register_routes`` 固定：**探针 → 会话流 → approval → 资源**。
+    """
     # ---- 生产改造 #2：健康/就绪/指标探针（顶层路径，免 /api/ 鉴权）----
     # 必须在 SPA mount("/")（约 904 行）之前注册，否则被 catch-all 吞成 index.html。
     # 顶层路径（非 /api/）即便启用 --token 也由中间件豁免（见 _AUTH_EXEMPT：非 /api/ 直接放行）。
@@ -898,14 +751,22 @@ async def _serve(args: argparse.Namespace) -> int:
         task.cancel()
         return JSONResponse({"ok": True, "run_id": rid})
 
-    # ---- 审批（人在环中，第 2 期）：入站应答 + 在途快照 + 会话档位 ----
-    # 解耦纪律：只经 Services.APPROVAL 门面（ctx.approval），不 import 插件内部模块。
 
-    def _approval_or_none():
-        if not c.root.has(Services.APPROVAL):
-            return None
-        return c.root.get(Services.APPROVAL)
+def _register_approval(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse,
+                       _session_cfg, _approval_or_none, JSONResponse, Request):
+    """★ 审批 + 只读状态路由（11 条）。
 
+    含 ``/api/approval/*``（answer/pending/mode）与**只读**状态端点
+    ``/api/status`` ``events`` ``context`` ``perms`` ``session``
+    ``session/reset`` ``tools`` ``memory``。
+
+    划分依据：这三个域都是"读状态 / 走审批"，与 ``_register_probes``
+    （健康探针 + 会话流）和 ``_register_resources``（插件与设置的**写操作**）区分。
+
+    从 ``_register_routes`` 拆出（2026-10-04，机械搬移）。调用顺序由
+    ``_register_routes`` 固定：**probes → approval(本函数) → resources**。
+    ⚠️ 本函数必须在 ``mount("/")`` 之前调用（Starlette 按注册顺序匹配）。
+    """
     @app.post("/api/approval/answer")
     async def _approval_answer(body: dict, request: Request):
         """人对在途请求的应答：审批（批/驳）与澄清问询（choice/text）共用。
@@ -1142,6 +1003,21 @@ async def _serve(args: argparse.Namespace) -> int:
 
     # ---- 插件管理（引擎式：desired/actual/delta；改动即时重建生效） ----
 
+
+def _register_resources(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse,
+                       _session_cfg, JSONResponse, Request):
+    """★ 插件与设置路由（6 条，写操作域）。
+
+    ``/api/plugins``（列表）、``/api/plugins/{enable,scaffold,remove}``、
+    ``/api/settings``（GET 读 + POST 写）。
+
+    与 ``_register_approval`` 的分界：那边是**审批 + 只读状态**，这边是
+    **会触发插件重建的配置写入**（``_apply_rebuild``）。
+
+    从 ``_register_routes`` 拆出（2026-10-04，机械搬移）。调用顺序由
+    ``_register_routes`` 固定：**probes → approval → resources(本函数)**。
+    ⚠️ 本函数必须在 ``mount("/")`` 之前调用（Starlette 按注册顺序匹配）。
+    """
     @app.get("/api/plugins")
     async def _plugins() -> dict:
         manifest = c.container.plugin_manifest()
@@ -1251,8 +1127,32 @@ async def _serve(args: argparse.Namespace) -> int:
         ap_enabled = "plugins.approval" in set(pm.enabled())
         # G7：沙箱插件默认关（目录插件惯例）⇒ 设置页据此提示"未启用"，与 context/approval 同款
         sb_enabled = "plugins.sandbox" in set(pm.enabled())
+        # ★ 沙箱**隔离档位与强度**（2026-10-03 B1 转型后）。前端必须拿到**自报的实际强度**
+        # 才能渲染徽标 —— 缺这个字段时前端只能猜"正常"，那正是此前最大的误导源。
+        # 经 ``container.plugin_statuses()``（公开 API，自带"单插件失败不拖垮"语义）取，
+        # 插件未启用时如实报 ``none``（不谎报），前端据此显示「⚠ 无隔离」。
+        sb_status: dict = {"mode": "none", "enforcement": "none", "gap": False,
+                           "targets": ["mcp.*"], "reason": "沙箱插件未启用"}
+        if sb_enabled:
+            try:
+                for row in await c.container.plugin_statuses():
+                    if row.get("id") != "plugins.sandbox":
+                        continue
+                    st = row.get("status")
+                    if isinstance(st, dict) and "error" not in st:
+                        sb_status = {**sb_status, **st}
+                    elif isinstance(st, dict):
+                        sb_status["reason"] = f"读取沙箱状态失败: {st['error']}"
+                    break
+            except Exception as exc:  # noqa: BLE001 —— 自述失败不得拖垮设置页
+                sb_status["reason"] = f"读取沙箱状态失败: {exc}"
         return {"context_plugin_enabled": ctx_enabled,
                 "approval_enabled": ap_enabled, "sandbox_enabled": sb_enabled,
+                "sandbox_mode": sb_status.get("mode", "none"),
+                "sandbox_enforcement": sb_status.get("enforcement", "none"),
+                "sandbox_gap": bool(sb_status.get("gap")),
+                "sandbox_targets": sb_status.get("targets") or ["mcp.*"],
+                "sandbox_reason": sb_status.get("reason", ""),
                 "values": values,
                 "session_id": sk,
                 "scopable": sorted(_SETTING_SCOPABLE),
@@ -1317,6 +1217,228 @@ async def _serve(args: argparse.Namespace) -> int:
         except (ValueError, TypeError) as exc:
             return JSONResponse({"ok": False, "error": f"参数错误: {exc}"}, status_code=400)
 
+
+def _register_routes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse,
+                    _session_cfg, _approval_or_none, JSONResponse, Request,
+                    StreamingResponse):
+    """★ 注册全部 HTTP 路由（2026-10-04 从 ``_serve`` 机械搬移）。
+
+    本函数只做**编排**：按固定顺序调用三个域函数。
+    ① 探针/会话流 → ② approval → ③ 资源（``/api/settings`` 等）。
+    ④ 静态托管 ``mount("/")`` 由 ``_serve`` 在**本函数之后**追加
+       （Starlette 按注册顺序匹配，Mount 会捕获其后一切 ⇒ 必须最后）。
+
+    等价性守卫：``.workbuddy/verify_serve_split_equiv.py``
+    （真跑一次 ``_serve``，与基线**逐字段比对有序路由表** + 断言 Mount 最后）。
+    ★ 参数只有 `app`/`c` 是位置参数，其余必须**关键字传**（签名里有 `*`）。
+    """
+    _kw = dict(active_runs=active_runs, pm=pm, _identity=_identity,
+               _apply_rebuild=_apply_rebuild, _sse=_sse, _session_cfg=_session_cfg)
+    # ★ 每个注册函数需要的**全部**来自 `_serve` 的闭包项都在此显式转发。
+    #   少转发一个 ⇒ 该名字在函数体内未定义 ⇒ 调用即 NameError ⇒ 该端点 500
+    #   （曾真实发生：`/api/approval/pending`）。守卫 verify_serve_split_equiv.py 的
+    #   check_missing_names() 会静态抓出这类漏项。
+    _register_probes(app, c, JSONResponse=JSONResponse, Request=Request,
+                     StreamingResponse=StreamingResponse, **_kw)
+    _register_approval(app, c, _approval_or_none=_approval_or_none,
+                       JSONResponse=JSONResponse, Request=Request, **_kw)
+    _register_resources(app, c, JSONResponse=JSONResponse, Request=Request, **_kw)
+
+async def _serve(args: argparse.Namespace) -> int:
+    import uvicorn
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+
+    # ---- #5 可观测性：**最先**装日志（此前全仓无任何 handler，INFO 级静默丢弃）----
+    # 放在这里（而非 uvicorn.Config 之前）是为了让 ``create_app`` 内部的所有日志
+    # ——含前端产物提示、重建失败——也走同一套 handler 与字段。
+    configure_logging(level=args.log_level, fmt=args.log_format)
+
+    c, pm = await _boot(args)
+
+    class _Box:
+        """可换容器的句柄：handlers 引用 c.root 不受「重建容器」影响。"""
+
+        def __init__(self, c):
+            self.set(c)
+
+        def set(self, c):
+            self._c = c
+
+        @property
+        def root(self):
+            return self._c.root
+
+        @property
+        def container(self):
+            return self._c
+
+        async def teardown(self):
+            await self._c.teardown()
+
+    c = _Box(c)
+    # 2.2：**不再有「进程级全局会话」**——原 ``session_id = uuid4().hex[:8]`` 是启动时生成
+    # 一次的闭包常量，所有请求共用（多会话下即串数据）。现改为每请求经 ``_identity()`` 解析。
+    # B6/B5 共用：run_id -> (在跑的任务, 归属会话键)。取消端点据此 cancel **并校验归属**
+    # （H4：否则任一会话都能取消别人的 run）；断连时清理，防孤儿任务。
+    active_runs: dict[str, tuple[asyncio.Task, str]] = {}
+
+    # ---- 阶段 2（2.2）：请求级身份解析 -----------------------------------------
+    # 信任边界：**tenant/user 只来自服务端配置**（客户端可伪造 ⇒ 不下放）；
+    # session 来自请求头 ``X-Session-Id``（无隔离语义，伪造只影响伪造者自己）。
+    # 键构造/净化的唯一真源是 ``core/session.py``——任何非法标识在此 fail-fast（400），
+    # 不静默回退（否则用户以为在私密会话，实则落进共享桶 / 前缀扫描越权命中他人）。
+    #
+    # R1（2026-10-02）：本函数据此成为**请求作用域绑定的单一漏斗**——解析成功即把会话键
+    # 绑到 ContextVar（按 asyncio task 隔离 ⇒ 每请求独立）。消费方多为**无 ctx 入参**的事件
+    # 回调（approval/guard）或装配期捕获 ctx 的服务（budget/router），它们读不到请求参数，
+    # 只能靠该通道；``ctx.state`` 仍照写（兼容既有测试写法），但不再是读取主通道。
+    # ⇒ 新增端点若需要会话归属，**必须经本函数**解析身份（勿自己读头）。
+
+    def _session_cfg() -> dict:
+        return ((c.root.config or {}).get("agent") or {}).get("session") or {}
+
+    def _identity(request: Request | None = None, body: dict | None = None):
+        cfg = _session_cfg()
+        raw = ""
+        if request is not None:
+            raw = str(request.headers.get("x-session-id") or "")
+        if not raw and isinstance(body, dict):
+            raw = str(body.get("session") or "")
+        try:
+            ident = make_identity(tenant=cfg.get("tenant"), user=cfg.get("user"),
+                                  session=raw)
+        except SessionIdError as exc:
+            raise HTTPException(status_code=400, detail=f"非法会话标识：{exc}")
+        set_current_session_key(ident.session_key)
+        return ident
+
+    def _sse(event: str, payload: dict) -> str:
+        """一帧 SSE（data: {...}\\n\\n）。帧类型见设计方案 §4.5。"""
+        return "data: " + json.dumps({"event": event, "payload": payload or {}},
+                                     ensure_ascii=False) + "\n\n"
+
+    async def _apply_rebuild() -> None:
+        """按当前 config（含用户覆盖）+ 当前插件期望态重建容器（管理操作即时生效）。"""
+        old = c._c
+        c2 = build_agent(config=_merge_cfg(args), plugin_mgr=pm)
+        await c2.assemble()
+        await c2.start()
+        try:
+            await old.teardown()
+        except Exception:  # noqa: BLE001
+            pass
+        c.set(c2)
+        _attach_session_cfg_view(c2.root)     # 新容器 ⇒ 重新挂接缝
+
+    # ---- 审批（人在环中，第 2 期）：入站应答 + 在途快照 + 会话档位 ----
+    # 解耦纪律：只经 Services.APPROVAL 门面（ctx.approval），不 import 插件内部模块。
+    # ★ 定义在**这里**（_serve 内）而非 `_register_approval` 内 —— 因为 `c` 是 `_Box`，
+    #   插件重建后 `c.root` 会变；放模块级会捕获旧容器。三个注册函数都靠参数拿到它。
+    def _approval_or_none():
+        if not c.root.has(Services.APPROVAL):
+            return None
+        return c.root.get(Services.APPROVAL)
+
+    app = FastAPI(title="Agent Harness", docs_url=None, redoc_url=None)
+
+    # ---- R3：全局异常兜底（此前完全缺失）-----------------------------------
+    # 此前未注册任何 exception_handler ⇒ 非 HTTPException 的未捕获异常落到
+    # Starlette 默认处理器，返回 **HTML** 500：前端 `res.json()` 直接解析失败，
+    # 且不留统一日志。这里统一转成 JSON 错误体（形状沿用 /api/chat 的既有兜底
+    # `{"error": ...}`，前端零改动），并记一条带路径的 error 日志。
+    # 注意：HTTPException 不在此接管——Starlette 默认已返回 JSON `{"detail": ...}`，
+    # 覆盖它会改变 400/404 的既有响应体形状，属于无收益的行为变更。
+    _err_log = logging.getLogger("agent.chat")
+
+    @app.exception_handler(AgentError)
+    async def _on_agent_error(request: Request, exc: AgentError) -> JSONResponse:
+        _err_log.error("AgentError @ %s: %s", request.url.path, exc)
+        return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
+                            status_code=500)
+
+    @app.exception_handler(Exception)
+    async def _on_unhandled(request: Request, exc: Exception) -> JSONResponse:
+        _err_log.exception("未捕获异常 @ %s", request.url.path)
+        return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
+                            status_code=500)
+
+    # ---- #5 可观测性：每请求绑定 request id ---------------------------------
+    # 装在**所有路由之外**的中间件里 ⇒ 无论端点是否经 ``_identity`` 解析身份
+    # （``/health``、``/metrics``、``/api/events``…）都能拿到本次请求的 id。
+    # 账本（``agent_events`` 的三列）与日志（record factory 注入 rid/session/run）
+    # 都从这一处绑定取值 ⇒ **一次请求的痕迹可按同一 id 串起来**。
+    # 响应头回带 ``X-Request-Id``：用户报障时可直接给出该值定位到那一轮。
+    # 实现见模块级 ``_obs_middleware``（抽成模块级函数才能被单测直接调用——
+    # ``_serve`` 返回时容器已 teardown，无法在进程内对其发真实请求）。
+    app.middleware("http")(_obs_middleware)
+
+    # ---- B3.1 跨域（opt-in）------------------------------------------------
+    # 默认「不启用」：沿用 dev 下的 Vite proxy（同源），零行为变化。
+    # 前后端**直连**部署（前端静态托管在别的源）时显式传 --cors-origin 打开。
+    # 注意：allow_credentials=True 时 **不可** 用 "*"（浏览器会拒绝），
+    #       故此处按实际来源逐一回显——这也是「默认空 = 不启用」的另一层理由。
+    if args.cors_origin:
+        from fastapi.middleware.cors import CORSMiddleware
+
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(args.cors_origin),
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            # SSE：浏览器 fetch 流读不暴露这些头也能用，但显式登记便于前端读取
+            expose_headers=["Cache-Control", "X-Accel-Buffering"],
+        )
+
+    # ---- B3.2 访问令牌（opt-in）--------------------------------------------
+    # 默认「不鉴权」：本地 dev 与既有测试零影响。
+    # 启用后支持两种携带方式（**两种都要**：EventSource 无法自定义请求头，
+    # SSE / 静态资源走 `?token=`；其余 fetch 走 `Authorization`）。
+    _AUTH_EXEMPT = {"/", "/api/status"}       # 健康探针：首页与状态接口始终放行
+    _token = str(args.token or "")
+
+    def _extract_token(request) -> str:
+        """按 `Authorization: Bearer x` → `?token=x` 顺序取令牌（headers 优先）。"""
+        h = request.headers.get("authorization") or ""
+        if h[:7].lower() == "bearer ":
+            return h[7:].strip()
+        return str(request.query_params.get("token") or "")
+
+    if _token:
+        import hmac
+
+        from fastapi import Request
+        from fastapi.responses import JSONResponse as _JSONResponse
+
+        @app.middleware("http")
+        async def _auth_mw(request: Request, call_next):
+            path = request.url.path
+            # 三类放行：
+            #   1) OPTIONS 预检 —— CORS 预检不带 Authorization（浏览器规范），拦了 CORS 全废；
+            #   2) 显式豁免的探针 —— `/` 首页与 `/api/status`；
+            #   3) **非 `/api/` 路径** —— B4 起这些是前端静态产物（index.html / assets/*）。
+            #      浏览器用 <script>/<link> 加载它们时**无法携带 token**，若拦则整页白屏；
+            #      且静态产物本就是发给浏览器的公开资源，不构成额外信息泄露。
+            #      真正的数据面（/api/*）一律照旧校验，安全强度不变。
+            if (request.method == "OPTIONS"
+                    or path in _AUTH_EXEMPT
+                    or not path.startswith("/api/")):
+                return await call_next(request)
+            # 常量时间比较：避免按字符计时侧信道（本地/内网场景亦无理由削弱）
+            if not hmac.compare_digest(_extract_token(request), _token):
+                return _JSONResponse({"error": "未授权：缺少或无效的 token"},
+                                     status_code=401)
+            return await call_next(request)
+
+    # ★ 路由注册已抽到模块级 `_register_routes`（2026-10-04，纯机械搬移）。
+    #   等价性守卫：`.workbuddy/verify_serve_split_equiv.py`（比对有序路由表 + Mount 必须在最后）。
+    _register_routes(
+        app, c, active_runs=active_runs, pm=pm,
+        _identity=_identity, _apply_rebuild=_apply_rebuild,
+        _sse=_sse, _session_cfg=_session_cfg,
+        _approval_or_none=_approval_or_none, JSONResponse=JSONResponse,
+        Request=Request, StreamingResponse=StreamingResponse)
     # ---- B4：单端口托管前端产物（web/dist） ------------------------------------
     # 放在**全部 /api/* 路由注册之后**：Starlette 按注册顺序匹配，先注册者优先。
     # 故 `/api/*` 照旧命中上面的路由，只有剩余路径落到这里。

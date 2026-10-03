@@ -1,18 +1,22 @@
-"""G7 外部工具准入沙箱（plugins.sandbox）—— 方案《MCP沙箱准入插件-方案-2026-10-03》§6。
+"""G7 外部工具隔离档位自述（plugins.sandbox）—— 2026-10-03 转型后的行为契约。
 
-覆盖 11 组：
-1. 默认放行 + 落审计（真容器 + 真 ``tasks.invoke``，走真实 waterfall）
+转型前本插件是「准入网关 + 审计」，转型后**只做隔离档位自述**（准入判定归 guard，
+问人归 approval）。详见 ``docs/reform of production line/沙箱与权限管理器重叠核定-2026-10-03.md``。
+
+覆盖 11 组（★ 标的都是转型后**新增或改写**的）：
+1. 恒放行 + 落 ``agent/sandbox/confinement`` 审计（真容器 + 真 ``tasks.invoke``，真实 waterfall）
 2. 作用域外不过问（不变成"第二个 guard"）
-3. 名称模式匹配（``mcp.windows.*`` 拒 / ``mcp.playwright.*`` 放行）
-4. 白名单**不穿透**黑名单
-5. risk 覆盖 + **F9 前提断言**（真实 MCP 工具全是 ``write`` 档）
-6. 会话级覆盖优先（按会话隔离）
-7. 纯函数穷举（``match`` / ``decide`` / ``in_scope``）
-8. 拒绝返回体是纯数据（过 ``_assert_pure_data`` 口径）
+3. ★ 模式匹配（``match`` 仍在本插件用于 ``targets``；**准入判定**已迁 guard）
+4. ★ 废弃键**不再有裁决效果**，但会被检出并计数（迁移期可见，不静默）
+5. ★ ``describe()`` 穷举：非法 mode 回落、``gap`` 标记落差、``enforcement`` **不谎报**
+6. 会话级覆盖优先（按会话隔离）+ ★ ``mode`` 可会话级切换
+7. 纯函数穷举（``match`` / ``describe`` / ``in_scope``）
+8. ★ 审计载荷是纯数据（过 ``_assert_pure_data``）且字段齐全
 9. 守卫：默认关 / 不改 MCP 桥与两个 MCP 插件
 10. **防"服务起不来"**：带 ``agent.sandbox`` 的配置能装配（schema 登记是硬前提）
 11. **严格键集**：``sandbox`` 节写入未知键 ⇒ ``ConfigError``（fail-fast）
 
+★ **本插件恒放行**（转型后不再拥有准入裁决权）—— 用例 ① 直接断言这一点。
 ★ 第 6 例曾救下一个**会打断所有工具调用**的 bug：``SESSION_CFG_VIEW`` 接缝是
   **可调用对象** ``(section, sk) -> dict``，当字典用（多套一层 ``section_of``）会让
   每次 ``tasks.invoke`` 抛 ``AttributeError``。接入面（会话级覆盖）必须真跑。
@@ -31,7 +35,8 @@ import pytest
 from agent.api import (CapabilityNotImplemented, ConfigError, SESSION_CFG_VIEW,
                        coerce_config, set_current_session_key,
                        validate_config)
-from agent.plugins.sandbox import DEFAULT_CONFIG, decide, in_scope, match
+from agent.plugins.sandbox import (DEFAULT_CONFIG, ENFORCEMENTS, MODES, describe,
+                                in_scope, match)
 from agent.profiles import BASE_AGENT_CONFIG, build_agent
 from agent.sys.plugin_manager import PluginManager
 
@@ -77,10 +82,10 @@ def _attach_view(c, sessions: dict) -> None:
 
 
 async def _sandbox_rows(c):
-    """沙箱审计行（须在事件循环内 await —— db 是异步接口）。"""
+    """沙箱隔离自述行（须在事件循环内 await —— db 是异步接口）。"""
     return await c.root.db.query(
         c.root, "SELECT payload FROM agent_events"
-                " WHERE event='agent/sandbox/decision' ORDER BY seq")
+                " WHERE event='agent/sandbox/confinement' ORDER BY seq")
 
 
 @pytest.fixture(autouse=True)
@@ -95,8 +100,12 @@ def _isolate_session_scope():
 # ① 默认放行 + 审计
 # ---------------------------------------------------------------------------
 
-def test_default_allows_and_audits(tmp_path):
-    """默认姿态（allow + 审计）：MCP 工具照常通过，但每次裁决都留痕。"""
+def test_always_allows_and_reports_confinement(tmp_path):
+    """★ 转型核心契约：本插件**恒放行**，只落隔离自述行。
+
+    转型前这里断言 ``decision == "allow"``；转型后本插件**不再有准入裁决权**，
+    所以断言对象换成"调用成功 + 审计记录档位与强度"。
+    """
     c = _container(tmp_path)
     result = {}
 
@@ -111,11 +120,18 @@ def test_default_allows_and_audits(tmp_path):
 
     _run(s())
     assert all(v == {"ok": True} for k, v in result.items() if k.startswith("mcp")), result
-    assert len(result["rows"]) == 2, "每个在作用域内的调用都应留一行审计"
+    assert len(result["rows"]) == 2, "每个在作用域内的调用都应留一行隔离自述"
     first = result["rows"][0]
-    for key in ("who", "target", "risk", "decision", "by", "session", "reason"):
-        assert key in first, f"审计缺字段 {key}: {first}"
-    assert first["by"] == "sandbox" and first["decision"] == "allow"
+    for key in ("who", "target", "risk", "by", "session", "reason",
+                "mode", "enforcement", "ceiling", "gap", "enforced_by", "bridge",
+                "deprecated_used"):
+        assert key in first, f"隔离自述缺字段 {key}: {first}"
+    assert first["by"] == "sandbox"
+    # 默认档位 none ⇒ 强度 none（**不谎报**）
+    assert first["mode"] == "none" and first["enforcement"] == "none"
+    assert first["gap"] is False, "mode=none 时不该报落差"
+    # 审计里**不再有** decision 字段（裁决权已交还 guard）
+    assert "decision" not in first, "本插件不该再产裁决结果"
 
 
 # ---------------------------------------------------------------------------
@@ -142,79 +158,91 @@ def test_out_of_scope_is_untouched(tmp_path):
 # ③ 名称模式匹配
 # ---------------------------------------------------------------------------
 
-def test_pattern_match_denies_only_matching_prefix(tmp_path):
-    """``deny: ["mcp.windows.*"]`` 只拦该前缀；同前缀之外的桥不受影响。"""
-    c = _container(tmp_path, config_agent={"sandbox": {"deny": ["mcp.windows.*"]}})
+def test_targets_narrows_which_bridges_are_reported(tmp_path):
+    """★ ``targets`` 收窄后，只有命中的桥产生隔离自述行（域外连审计都不落）。
+
+    转型前这里断言"``deny: mcp.windows.*`` 只拦该前缀"；转型后**准入判定归 guard**，
+    本插件只管"自述哪些桥"。模式匹配能力本身（``match``）仍在本插件用于 ``targets``。
+    """
+    c = _container(tmp_path, config_agent={
+        "sandbox": {"targets": ["mcp.windows.*"]}})
     got = {}
 
     async def s():
         await c.assemble()
         _register(c)
         for n in MCP_TOOLS:
-            try:
-                await c.root.tasks.invoke(c.root, n, caller="test")
-                got[n] = "allow"
-            except CapabilityNotImplemented as exc:
-                got[n] = (exc.denied_by, str(exc))
+            got[n] = await c.root.tasks.invoke(c.root, n, caller="test")
+        rows = [json.loads(r["payload"]) for r in await _sandbox_rows(c)]
         await c.teardown()
+        return rows
 
-    _run(s())
-    assert got["mcp.windows.open"] != "allow", "命中黑名单的工具未被拒"
-    assert got["mcp.windows.open"][0] == "sandbox",         f"拒绝者应为 sandbox（denied_by 属性）：{got['mcp.windows.open']}"
-    assert "mcp.windows.*" in got["mcp.windows.open"][1],         f"拒绝理由应点名命中的模式：{got}"
-    assert got["mcp.playwright.nav"] == "allow", "非命中前缀被误拒"
+    rows = _run(s())
+    assert all(v == {"ok": True} for v in got.values()), "本插件恒放行"
+    assert [r["target"] for r in rows] == ["mcp.windows.open"], rows
+    assert rows[0]["bridge"] == "windows", "审计须带桥名才追得到是哪个桥没隔离"
 
 
 # ---------------------------------------------------------------------------
 # ④ 白名单不穿透黑名单
 # ---------------------------------------------------------------------------
 
-def test_allow_cannot_punch_through_deny(tmp_path):
-    """``deny:["mcp.*"] + allow:["mcp.windows.*"]`` ⇒ 仍拒（避免两份配置互相打洞）。"""
+def test_deprecated_keys_have_no_decision_effect(tmp_path):
+    """★ 迁移期语义：旧四键（``deny``/``allow``/``default``/``risk``）**不再有任何裁决效果**。
+
+    这条替代转型前的"白名单不穿透黑名单"用例。契约从"黑名单优先"变成
+    "**这两个键在准入上完全无效**"—— 准入归 ``sys/guard.py``。
+    但它们**仍会被检出**（``deprecated_used``）⇒ 迁移期可见，不静默。
+    """
     c = _container(tmp_path, config_agent={
-        "sandbox": {"deny": ["mcp.*"], "allow": ["mcp.windows.*"]}})
+        "sandbox": {"deny": ["mcp.*"], "allow": ["mcp.*"], "default": "deny"}})
 
     async def s():
         await c.assemble()
         _register(c, names=("mcp.windows.open",))
-        with pytest.raises(Exception) as ei:
-            await c.root.tasks.invoke(c.root, "mcp.windows.open", caller="test")
+        out = await c.root.tasks.invoke(c.root, "mcp.windows.open", caller="test")
+        rows = [json.loads(r["payload"]) for r in await _sandbox_rows(c)]
         await c.teardown()
-        return str(ei.value)
+        return out, rows
 
-    msg = _run(s())
-    assert "拒绝名单" in msg, msg
+    out, rows = _run(s())
+    assert out == {"ok": True}, "废弃键不得再有裁决效果（deny 不该拦得住）"
+    assert rows and set(rows[0]["deprecated_used"]) == {"deny", "allow", "default"}, (
+        f"废弃键未被检出，迁移期不可见：{rows[0]}")
 
 
 # ---------------------------------------------------------------------------
 # ⑤ risk 覆盖 + F9 前提断言
 # ---------------------------------------------------------------------------
 
-def test_risk_override_and_the_mcp_write_premise(tmp_path):
-    """risk 覆盖按档位生效；**并把 F9 钉成断言**：真实 MCP 工具全是 ``write`` 档。
+def test_describe_truth_table_and_f9_premise():
+    """★ ``describe()`` 穷举：非法 mode 回落、``gap`` 标记落差、``enforcement`` **不谎报**。
 
-    F9：``Task.risk`` 默认 ``"write"``，而两个 MCP 插件注册时都没传 risk ⇒ 按风险级
-    分级对 MCP 只能整体生效。谁将来给 MCP 补了 risk 标注，本例会提醒同步方案文档。
+    这条替代转型前的 ``risk`` 覆盖用例（risk 裁决已归 guard）。核心断言是
+    **"配置了档位但兑现不了"必须被标成落差** —— 报成 ``full`` 才是缺陷。
     """
-    c = _container(tmp_path, config_agent={
-        "sandbox": {"risk": {"write": "deny", "read": "allow"}}})
-    got = {}
+    # 默认：无档位 ⇒ 无落差
+    d = describe(DEFAULT_CONFIG)
+    assert d["mode"] == "none" and d["enforcement"] == "none" and d["gap"] is False
 
-    async def s():
-        await c.assemble()
-        _register(c, names=("mcp.windows.open",), risk="write")
-        _register(c, names=("mcp.nav",), risk="read")
-        for n in ("mcp.windows.open", "mcp.nav"):
-            try:
-                await c.root.tasks.invoke(c.root, n, caller="test")
-                got[n] = "allow"
-            except Exception:                            # noqa: BLE001
-                got[n] = "deny"
-        await c.teardown()
+    # 声明了档位但**本插件无任何进程级隔离** ⇒ enforcement 必须是 none + gap=True
+    for m in ("read-only", "workspace-write"):
+        d = describe({**DEFAULT_CONFIG, "mode": m})
+        assert d["mode"] == m
+        assert d["enforcement"] == "none", f"{m} 谎报了隔离强度（当前无隔离实现）"
+        assert d["ceiling"] == "none"
+        assert d["gap"] is True, f"{m} 配置了却兑现不了 ⇒ 落差必须可见"
+        assert "未实现" in d["reason"], d["reason"]
 
-    _run(s())
-    assert got == {"mcp.windows.open": "deny", "mcp.nav": "allow"}, got
+    # 非法 mode 回落 none（配置写错不该让服务起不来）
+    assert describe({**DEFAULT_CONFIG, "mode": "乱写"})["mode"] == "none"
 
+    # 取值域固化：强度只能是声明的三个值
+    for m in MODES:
+        assert describe({**DEFAULT_CONFIG, "mode": m})["enforcement"] in ENFORCEMENTS
+
+    # ★ F9 前提断言（保留）：真实 MCP 工具全是 ``write`` 档。
+    # 这条前提是"按 risk 分级对 MCP 无效"的根因，仍需钉住。
     for rel in ("plugins/playwright_mcp/__init__.py", "plugins/windows_mcp/__init__.py"):
         src = (AGENT_DIR / rel).read_text(encoding="utf-8")
         calls = re.findall(r"tasks\.register\((?:[^()]|\([^()]*\))*\)", src, re.S)
@@ -229,28 +257,28 @@ def test_risk_override_and_the_mcp_write_premise(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_session_scope_overrides_container(tmp_path):
-    """会话级覆盖只作用于**该会话**（本例同时是接缝形状的回归：接缝是可调用对象）。"""
+    """★ 会话级 ``mode`` 覆盖只作用于**该会话**（本例同时是接缝形状的回归：接缝是可调用对象）。
+
+    转型后本插件恒放行，所以"覆盖生效"体现在**审计行里的 mode**，
+    而不再是"放行/拒绝"—— 这也更贴近 DSH（档位是逐调用解析的，不是进程级一次性设置）。
+    """
     c = _container(tmp_path)
     got = {}
 
     async def s():
         await c.assemble()
-        _register(c)
-        _attach_view(c, {"u:A": {"deny": ["mcp.windows.*"]}})
+        _register(c, names=("mcp.windows.open",))
+        _attach_view(c, {"u:A": {"mode": "workspace-write"}})
         for sk in ("u:A", "u:B"):
             set_current_session_key(sk)
-            for n in MCP_TOOLS:
-                try:
-                    await c.root.tasks.invoke(c.root, n, caller="test")
-                    got[(sk, n)] = "allow"
-                except Exception:                        # noqa: BLE001
-                    got[(sk, n)] = "deny"
+            await c.root.tasks.invoke(c.root, "mcp.windows.open", caller="test")
+            rows = [json.loads(r["payload"]) for r in await _sandbox_rows(c)]
+            got[sk] = [r["mode"] for r in rows if r["session"] == sk]
         await c.teardown()
 
     _run(s())
-    assert got[("u:A", "mcp.windows.open")] == "deny", "会话 A 的拒绝名单未生效"
-    assert got[("u:A", "mcp.playwright.nav")] == "allow"
-    assert got[("u:B", "mcp.windows.open")] == "allow", "会话 B 被 A 的覆盖牵连了"
+    assert got["u:A"] == ["workspace-write"], f"会话 A 的档位未生效：{got}"
+    assert got["u:B"] == ["none"], f"会话 B 被 A 的覆盖牵连了：{got}"
 
 
 def test_view_seam_must_be_called_not_indexed(tmp_path):
@@ -289,22 +317,32 @@ def test_match_truth_table():
     assert match("   ", "a") is False
 
 
-def test_decide_precedence_and_fail_open():
-    # deny 名单优先于 allow（白名单不能穿透黑名单）
-    assert decide({"deny": ["mcp.*"], "allow": ["mcp.*"]},
-                  target="mcp.x")[0] == "deny"
-    # allow 名单优先于 risk 覆盖
-    assert decide({"allow": ["mcp.*"], "risk": {"write": "deny"}},
-                  target="mcp.x", risk="write")[0] == "allow"
-    # risk 覆盖优先于 default
-    assert decide({"risk": {"write": "ask"}}, target="mcp.x", risk="write")[0] == "ask"
-    # 非法值一律 fail-open（配置写错不该把工具全锁死）
-    assert decide({"default": "乱写"}, target="mcp.x")[0] == "allow"
-    assert decide({"risk": {"write": "乱写"}}, target="mcp.x", risk="write")[0] == "allow"
-    assert decide({}, target="mcp.x") == ("allow", "默认裁决")
-    # 理由必须点名命中的模式（排查"为什么被拦"的唯一线索）
-    assert "mcp.windows.*" in decide({"deny": ["mcp.windows.*"]},
-                                    target="mcp.windows.open")[1]
+def test_describe_never_claims_unearned_isolation():
+    """★ ``describe()`` 的**诚实性**契约（转型后最关键的一条）。
+
+    这条替代转型前的 ``decide`` 优先级穷举：裁决优先级不再属于本插件，
+    但"绝不谎报隔离强度"成了本插件**唯一的核心义务**。
+    """
+    # 逐档穷举：声明了什么，都不能报出兑现不了的强度
+    for m in MODES:
+        d = describe({**DEFAULT_CONFIG, "mode": m})
+        if m == "none":
+            assert d["enforcement"] == "none" and d["gap"] is False
+        else:
+            # 声明了但无实现 ⇒ 强度必须为 none 且落差可见
+            assert d["enforcement"] == "none", f"{m} 谎报强度"
+            assert d["gap"] is True, f"{m} 的落差被隐藏了"
+
+    # 理由必须能解释"为什么没隔离"（排查"为什么没保护"的唯一线索）
+    d = describe({**DEFAULT_CONFIG, "mode": "workspace-write"})
+    # 理由必须**同时**说清"声明了什么"与"实际是什么"（排查"为什么没保护"的唯一线索）
+    assert "workspace-write" in d["reason"], d["reason"]
+    assert "未实现" in d["reason"] and "无隔离" in d["reason"], d["reason"]
+
+    # 废弃键检出：空/默认值不算"在用"，非空才算
+    assert describe(DEFAULT_CONFIG)["deprecated_used"] == []
+    assert describe({**DEFAULT_CONFIG, "deny": []})["deprecated_used"] == []
+    assert describe({**DEFAULT_CONFIG, "deny": ["mcp.*"]})["deprecated_used"] == ["deny"]
 
 
 def test_in_scope_default_targets_only_mcp():
@@ -318,25 +356,32 @@ def test_in_scope_default_targets_only_mcp():
 # ⑧ 拒绝返回体是纯数据
 # ---------------------------------------------------------------------------
 
-def test_denial_payload_is_pure_data(tmp_path):
-    """拒绝返回体必须过纯数据校验（总线对 payload 有 strict 约束）。"""
+def test_confinement_payload_is_pure_data(tmp_path):
+    """★ 隔离自述载荷必须过纯数据校验（durable 写入 ``agent_events``，有 strict 约束）。
+
+    这条替代转型前的"拒绝体纯数据"：转型后本插件不再短路，
+    但审计载荷**更值得守** —— 它是插件页与事件视图的唯一数据源，
+    混进不可序列化对象会直接让整条审计落库失败。
+    """
     from agent.core.events import _assert_pure_data
 
-    c = _container(tmp_path, config_agent={"sandbox": {"deny": ["mcp.*"]}})
+    c = _container(tmp_path, config_agent={
+        "sandbox": {"mode": "workspace-write", "targets": ["mcp.*"]}})
 
     async def s():
         await c.assemble()
         _register(c, names=("mcp.windows.open",))
-        with pytest.raises(Exception) as ei:
-            await c.root.tasks.invoke(c.root, "mcp.windows.open", caller="test")
+        await c.root.tasks.invoke(c.root, "mcp.windows.open", caller="test")
+        rows = await _sandbox_rows(c)
         await c.teardown()
-        return str(ei.value)
+        return [json.loads(r["payload"]) for r in rows]
 
-    msg = _run(s())
-    # 还原 tasks.invoke 传给 CapabilityNotImplemented 的那个体做纯数据校验
-    body = {"denied": True, "denied_by": "sandbox", "reason": msg}
-    _assert_pure_data(body, "sandbox 拒绝体")   # 不抛即通过
-    assert body["denied_by"] == "sandbox"
+    rows = _run(s())
+    assert rows, "隔离自述行未产生"
+    _assert_pure_data(rows[0], "sandbox 隔离自述体")   # 不抛即通过
+    # 布尔字段必须是真 bool（JSON 往返后仍是 bool，不是 "true" 字符串）
+    assert isinstance(rows[0]["gap"], bool)
+    assert isinstance(rows[0]["enforcement"], str)
 
 
 # ---------------------------------------------------------------------------
@@ -405,10 +450,24 @@ def test_sandbox_section_is_strict_not_any():
 
 
 def test_plugin_defaults_match_settings_defaults():
-    """设置页展示的默认值必须与插件的 ``DEFAULT_POLICY`` 一致（两处默认值不许漂移）。"""
-    from agent.run.chat import _PLUGIN_OF_KEY, _SETTING_DEFAULTS
+    """设置页展示的默认值必须与**策略唯一持有者**的默认值一致（两处默认值不许漂移）。
 
+    ★ 2026-10-03 策略收口后，这四个键的归属插件从 ``plugins.sandbox`` 改为
+    ``plugins.guard``（``run/chat.py::_PLUGIN_OF_KEY``）—— 因此**同源对象也换了**：
+    现在必须对齐 ``sys.guard.DEFAULT_POLICY``，而不是本插件的 ``DEFAULT_CONFIG``。
+
+    沙箱侧仍保留同名四键（``DEFAULT_CONFIG``）是为了**向后兼容既有配置**，它们已标废弃；
+    但设置页不再展示沙箱的默认值 ⇒ 本用例断言"设置页 ↔ guard"，不是"设置页 ↔ 沙箱"。
+    """
+    from agent.run.chat import _PLUGIN_OF_KEY, _SETTING_DEFAULTS
+    from agent.sys.guard import DEFAULT_POLICY as GUARD_POLICY
+
+    # 设置页归属已是 guard
     for k in ("targets", "default", "allow", "deny"):
-        assert _SETTING_DEFAULTS[k] == DEFAULT_CONFIG[k], (
-            f"设置页默认 {_SETTING_DEFAULTS[k]!r} 与插件默认 {DEFAULT_CONFIG[k]!r} 不一致（键 {k}）")
-        assert _PLUGIN_OF_KEY[k] == "plugins.sandbox", f"键 {k} 的归属插件不对"
+        assert _PLUGIN_OF_KEY[k] == "plugins.guard", f"键 {k} 的归属插件不对"
+
+    # 设置页默认值与 guard 的 SSOT 同源（防两处漂移）
+    assert _SETTING_DEFAULTS["targets"] == GUARD_POLICY["targets"]
+    assert _SETTING_DEFAULTS["default"] == GUARD_POLICY["default"]
+    assert _SETTING_DEFAULTS["allow"] == GUARD_POLICY["task_allow"]
+    assert _SETTING_DEFAULTS["deny"] == GUARD_POLICY["task_deny"]

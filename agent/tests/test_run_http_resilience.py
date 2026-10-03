@@ -124,6 +124,32 @@ def served_app(tmp_path_factory):
     return _serve_app(tmp_path_factory.mktemp("r3"))
 
 
+def _add_route_before_mount(app, path: str, handler):
+    """★ 在 ``Mount("/")`` **之前**插入路由。
+
+    为什么不能用 ``@app.get(...)`` 事后追加：``_serve`` 末尾用
+    ``app.mount("/", _SPAStaticFiles(...))`` 托管前端（``chat.py:1396``），
+    而 **Starlette 的路由匹配按注册顺序，``Mount`` 会捕获其后一切** ——
+    事后追加的路由一律落进静态文件处理器，返回 **404 而不是被测的 500**。
+
+    这就是本用例此前长期红灯的根因（**不是生产缺陷**：生产把 mount 放最后是对的）。
+
+    ⚠️ 插入点的判定条件：``Mount("/")`` 实例的 ``path`` 属性是**空字符串**
+    （实测 ``app.mount("/")`` → ``Mount.path == ""``），**不是 ``"/"``**。
+    写成 ``r.path == "/"`` 会永远匹配不到 ⇒ 静默退化成"没插入"。
+    """
+    from starlette.routing import Route
+
+    route = Route(path, handler, methods=["GET"])
+    routes = app.router.routes
+    # 第一个 Mount 之前插入（用类型判，不靠 path —— Mount.path 是 ""）
+    idx = next((i for i, r in enumerate(routes)
+                if type(r).__name__ == "Mount"), len(routes))
+    assert idx < len(routes), "没找到 Mount —— 生产若不再托管静态文件，本helper需更新"
+    routes.insert(idx, route)
+    return route
+
+
 def test_global_handlers_are_registered(served_app):
     """两个 handler 必须真的挂在 app 上（这是 R3 的「数量塌缩」断言）。"""
     handlers = {getattr(k, "__name__", k) for k in served_app.exception_handlers}
@@ -135,9 +161,10 @@ def test_unhandled_exception_returns_json_500(served_app):
     """未捕获异常 → 500 + application/json（旧行为是 HTML，前端解析失败）。"""
     from starlette.testclient import TestClient
 
-    @served_app.get("/__boom_for_test")
-    async def _boom():
+    async def _boom(request):        # noqa: ARG001 —— 裸 Route 不会像 APIRoute 那样注入
         raise RuntimeError("boom-for-verification")
+
+    _add_route_before_mount(served_app, "/__boom_for_test", _boom)
 
     with TestClient(served_app, raise_server_exceptions=False) as cl:
         r = cl.get("/__boom_for_test")

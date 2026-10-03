@@ -70,8 +70,10 @@ function collectPatch(): Record<string, unknown> {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean)
-  // G7 沙箱三项名单（逗号分隔 → 字符串数组；后端 list 分支会再规整一遍）。
-  // 注意：只提交**控件确实渲染**的键 —— 插件未启用时整段不渲染，若此时提交空数组
+  // 准入名单三项（逗号分隔 → 字符串数组；后端 list 分支会再规整一遍）。
+  // ★ 2026-10-03 收口：这三项 + default 的归属从 plugins.sandbox 改到 **plugins.guard**
+  // （sys/guard.py 是策略唯一持有者，也是 LLM_PRE_CALL 的唯一挂载者）。
+  // 注意：只提交**控件确实渲染**的键 —— 对应插件未启用时整段不渲染，若此时提交空数组
   // 会把用户已有的配置静默清空（与 tool_domains 同款陷阱，故此处逐个判存在）。
   for (const k of ['targets', 'allow', 'deny']) {
     const el = host.value?.querySelector<HTMLInputElement>('#set_' + k)
@@ -83,6 +85,10 @@ function collectPatch(): Record<string, unknown> {
   }
   const sdv = host.value?.querySelector<HTMLSelectElement>('#set_default')
   if (sdv && allow('default')) patch.default = sdv.value
+  // 沙箱**隔离档位**（2026-10-03 B1：沙箱只做 confinement，不再判准入）。
+  // 同样只在控件渲染时提交 —— 未启用时提交会清掉已有档位。
+  const smv = host.value?.querySelector<HTMLSelectElement>('#set_mode')
+  if (smv && allow('mode')) patch.mode = smv.value
   return patch
 }
 
