@@ -106,3 +106,85 @@ def test_memory_protocols_cover_driver_consumed_surface():
             assert callable(getattr(impl, name, None)), \
                 f"{impl.__name__} 缺少 {proto.__name__} 契约成员 {name!r}"
     assert MemoryDriver is not None
+
+
+# ---------------------------------------------------------------------------
+# 实体/关系（2026-10-04）：从「提取了就丢」改成**可选接缝**
+# ---------------------------------------------------------------------------
+# 修复前：提示词**总是**要求模型输出 entities/relations，而 ``remember`` 只遍历
+# facts/intentions ⇒ 输出被原样丢弃（两张表全仓零 INSERT），等于每轮白付 token。
+
+class FakeSink:
+    """注入用假 sink：记录落库调用（证明接缝真的被消费）。"""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    async def write(self, ctx, entities: list, relations: list) -> int:
+        self.calls.append((list(entities), list(relations)))
+        return len(entities)
+
+
+class FakeEntityExtractor:
+    """返回**带实体**的提取结果（fixture 默认返回空实体，测不出 sink 是否被调用）。"""
+
+    async def extract(self, ctx, payload: dict) -> dict:
+        return {"facts": ["带实体的事实"], "intentions": [],
+                "entities": [{"name": "Acme", "kind": "org"}],
+                "relations": [{"source": "Acme", "rel": "客户", "target": "我"}]}
+
+
+# ★ sink 必须是**模块级实例**：``@plugin`` 会把类包装成 ``Plugin`` 对象，
+#   类属性（``FakeEntitySinkPlugin.sink``）从外部取不到。
+SINK = FakeSink()
+
+
+@plugin
+class FakeEntitySinkPlugin:
+    """同时预置 ``memory.entities`` 与 ``memory.extractor``（名字排在 memory 前）。"""
+
+    name = "aaa.fake_entity_sink"
+    layer = "business"
+    provides = []
+    inject = []
+
+    async def apply(self, ctx) -> None:
+        ctx.provide("memory.entities", SINK)
+        ctx.provide("memory.extractor", FakeEntityExtractor())
+
+
+def test_extract_prompt_omits_entities_unless_sink_attached():
+    """★ 默认**不**向模型要实体（省钱 + 不再产生被丢弃的输出）；挂了 sink 才要。"""
+    from agent.plugins.memory import (BASE_EXTRACT_SCHEMA, MemoryExtractor,
+                                      build_extract_system)
+
+    assert "entities" not in build_extract_system(False), \
+        "未挂 sink 却仍要求模型输出实体 ⇒ 白付 token"
+    assert "entities" in build_extract_system(True)
+
+    plain = MemoryExtractor()
+    assert set(plain.schema) == set(BASE_EXTRACT_SCHEMA), \
+        f"默认 schema 不应含实体项：{sorted(plain.schema)}"
+    assert "entities" in MemoryExtractor(want_entities=True).schema
+
+
+def test_entity_sink_is_consumed_when_attached(tmp_path):
+    """挂了 sink ⇒ 实体/关系真的交给它（不再丢弃）。"""
+    pm = PluginManager(plugin_dir=str(PLUGIN_DIR),
+                       state_file=str(tmp_path / "plugin_state.json"))
+    pm.set_enabled("plugins.memory", True)
+    c = build_agent(config={"db_path": str(tmp_path / "agent.db")},
+                    plugin_mgr=pm, extra_plugins=(FakeEntitySinkPlugin,))
+    SINK.calls.clear()
+
+    async def s():
+        await c.assemble()
+        await c.root.memory.remember(c.root, {"user": "Acme 是我们的客户"})
+        await c.teardown()
+
+    _run(s())
+    assert SINK.calls, \
+        "挂了 sink 但实体没交给它 ⇒ 仍是'提取了就丢'"
+    entities, relations = SINK.calls[0]
+    assert entities and entities[0]["name"] == "Acme"
+    assert relations

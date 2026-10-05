@@ -18,7 +18,11 @@
 
 from __future__ import annotations
 
-from agent.api import Services, plugin
+from agent.api import Services, inc_counter, plugin
+from agent.tables import MESSAGE_FIELDS
+import logging
+
+_logger = logging.getLogger("plugins.short_term")
 
 from .compactor import HistoryCompactor
 from .facade import ShortTermMemory
@@ -43,6 +47,37 @@ class ShortTerm:
         compactor = HistoryCompactor(store, cfg)
         # 门面：会话转写 + 摘要 + 压缩 统一出口（消费方零 SQL）
         ctx.provide(Services.SHORT_TERM, ShortTermMemory(store, compactor))
+        self._store = store
+        # 6.3（2026-10-04）：agent_messages 扩展列容错补建（与 BUDGET_LOG_FIELDS 同款）。
+        # 定义归口 agent/tables.py::MESSAGE_FIELDS；此处幂等 ALTER——列已存在即跳过。
+        # duplicate column 属正常幂等路径，不计失败；真失败必须可见（对齐自有纪律）。
+        for col, decl in MESSAGE_FIELDS:
+            try:
+                await ctx.db.execute(
+                    ctx, f"ALTER TABLE agent_messages ADD COLUMN {col} {decl}", ())
+            except Exception as exc:                     # noqa: BLE001 —— 列已存在/表未建等
+                if "duplicate column" not in str(exc).lower():
+                    inc_counter("agent_messages_column_backfill_failed_total")
+                    _logger.warning("agent_messages 补列 %s 失败 ⇒ 该列将缺失: %s", col, exc)
+
+    async def status(self, ctx) -> dict:
+        """运行态：转写与摘要各有多少条（此前本插件无 ``status()``，插件页一片空白）。
+
+        只报**总量**不带会话明细：``status`` 是插件级视角，会话级数字在
+        ``/api/context`` 与 SSE 帧里已经另有出口，这里不重复第二份真相。
+        """
+        store = getattr(self, "_store", None)
+        if store is None or not ctx.has(Services.DB):
+            return {"error": "未装配（db 或 store 缺失）"}
+        try:
+            msgs = await ctx.db.query(ctx, "SELECT COUNT(*) AS n FROM agent_messages")
+            sums = await ctx.db.query(ctx, "SELECT COUNT(*) AS n FROM agent_session_summaries")
+        except Exception as exc:                       # noqa: BLE001 —— 自述失败不拖垮整批
+            return {"error": str(exc)}
+        return {
+            "messages": int(msgs[0]["n"]) if msgs else 0,
+            "summaries": int(sums[0]["n"]) if sums else 0,
+        }
 
 
 __all__ = ["ShortTerm", "ShortTermMemory", "HistoryCompactor", "SessionSummaryStore"]

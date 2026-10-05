@@ -75,8 +75,15 @@ waterfall 位置（★ 与文档旧说法相反，此处是更准的版本）
 
 from __future__ import annotations
 
+import hashlib
+import logging
+import os
+import re
+
 from agent.api import (SESSION_CFG_VIEW, Events, Services, current_session_key,
                        durable, inc_counter, now_iso, plugin)
+
+logger = logging.getLogger("agent.plugins.sandbox")
 
 # 兜底档位 = ``none``（**无隔离**，是当前唯一诚实可报的强度）。
 # ★ 与 guard 的 ``DEFAULT_POLICY["targets"]`` 同源（都是 ``["*"]``/``["mcp.*"]`` 口径的等价物：
@@ -122,6 +129,67 @@ def _bridge_of(target: str) -> str:
     """
     parts = str(target or "").split(".")
     return parts[1] if len(parts) >= 3 and parts[0] == "mcp" else ""
+
+
+# ---------------------------------------------------------------------------
+# 落点收拢（2026-10-04）：把外部子进程的**写入落点**挪出项目根
+# ---------------------------------------------------------------------------
+# 为什么这一层值得做、以及它**不是**什么：
+#   - 现状（``core/mcp_client.py`` spawn 时不设 cwd）⇒ 子进程继承宿主 cwd = 项目根，
+#     而项目根有 ``local_secrets.json``（明文 API key）与 ``data/*.db``（全部转写/审计/记忆）。
+#     叠加 ``child_env`` 会剥掉宿主的安全删除守卫 ⇒ 第三方进程在项目根拥有
+#     **不受宿主约束**的读写删能力。这是 ``enforcement="none"`` 最具体的后果。
+#   - 本函数把它收拢到 ``<root>/<session>`` 私有目录（cwd + 已知缓存/临时目录变量）。
+#   - ★ **它不是强制**：绝对路径仍可写别处，故 ``enforcement`` **不得**因此抬成
+#     partial/full（那才是谎报）。它消灭的是相对路径误伤面——实践中更高频的一类。
+#     落点写进审计（``cwd`` / ``env_redirected``）⇒ 「东西落在哪」可查。
+#   - 它还是未来 restricted token 的**前置步骤**：先有"允许写的那一块"，才指得过去。
+
+#: 重定向环境变量名（**通用工具链约定**，非本项目业务概念）：
+#: 临时目录 + 各语言/工具的缓存家目录。把子进程能"按相对路径写"的地方尽量收进去。
+_REDIRECT_ENV_KEYS = (
+    "TMP", "TEMP", "TMPDIR",                       # 临时目录（POSIX/Windows）
+    "XDG_CACHE_HOME", "XDG_DATA_HOME",             # XDG
+    "npm_config_cache",                            # npm/npx（playwright 走 npx）
+    "PLAYWRIGHT_BROWSERS_PATH",                    # Playwright 浏览器下载
+    "PIP_CACHE_DIR",                               # pip
+    "UV_CACHE_DIR",                                # uv/uvx（windows_mcp 走 uvx）
+)
+
+#: cwd 与重定向的根目录（相对项目根；``data/`` 已被 .gitignore 忽略）。
+_WORKSPACE_ROOT = "data/sandbox"
+
+
+def _safe_seg(value: str) -> str:
+    """会话键 → 目录名（防路径穿越 + 防碰撞）。
+
+    两件事都必须成立，缺一不可：
+
+    1. **不能穿越**：``core/session.py`` 的字符集是 ``[A-Za-z0-9_.-]``，**含 ``.``**
+       ⇒ 会话键 ``..`` 会直接拼出 ``data/sandbox/..``，逃出根目录。故 ``.`` 与 ``:``
+       （Windows 非法目录字符）一律替换掉。
+    2. **不能碰撞**：净化**不可逆**（``a.b`` 与 ``a_b`` 都会变成 ``a_b``），只靠净化会
+       让两个不同会话落进同一目录 ⇒ 会话隔离失效。
+       ⇒ 追加 8 位哈希：可读前缀 + 哈希，**既唯一又安全**。
+    """
+    raw = str(value or "")
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", raw)[:32] or "default"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{safe}-{digest}"
+
+
+def workspace_for(policy: dict, session_key: str = "", root: str = _WORKSPACE_ROOT) -> dict | None:
+    """按隔离档位算出子进程的落点；``mode="none"`` ⇒ ``None``（**保持现状，不劣化**）。
+
+    返回 ``{"cwd": str, "env": {...}}``；``env`` 只含**要覆盖**的变量（调用方合并）。
+    纯函数 ⇒ 可穷举单测，且审计侧可复用同一函数算出同一个 cwd（两处不会漂移）。
+    """
+    mode = str(policy.get("mode") or "none").strip()
+    if mode not in MODES or mode == "none":
+        return None                      # 未声明隔离 ⇒ 不重定向（opt-in）
+    seg = _safe_seg(session_key or "container")
+    cwd = f"{root.rstrip('/')}/{seg}"
+    return {"cwd": cwd, "env": {k: cwd for k in _REDIRECT_ENV_KEYS}, "mode": mode}
 
 
 
@@ -233,6 +301,26 @@ class Sandbox:
     inject = [Services.EVENTS, Services.DB]
 
     async def apply(self, ctx) -> None:
+        # 落点接缝：**提供能力，不替调用方决定**。MCP 桥装配时取本函数算 cwd/env；
+        # 沙箱未装配 ⇒ 桥侧 ``ctx.get`` 返回 None ⇒ 行为与今天完全一致（不劣化）。
+        def _workspace(session_key: str = "") -> dict | None:
+            ws = workspace_for(_config(ctx), session_key)
+            if not ws:
+                return None
+            # ★ 目录**必须真的存在**：``create_subprocess_exec(cwd=...)`` 指向不存在的
+            # 目录会直接 ``FileNotFoundError`` ⇒ **桥起不来**。
+            # 创建失败（只读盘/权限）⇒ 退回 None（落点是增强维度，不是硬前提），
+            # 但**必须可见**（计数 + warning），不静默退化成"以为收拢了其实没有"。
+            try:
+                os.makedirs(ws["cwd"], exist_ok=True)
+            except Exception:                   # noqa: BLE001
+                inc_counter("agent_sandbox_workspace_failed_total")
+                logger.warning("沙箱落点目录创建失败 %s ⇒ 子进程沿用宿主 cwd", ws["cwd"])
+                return None
+            return ws
+
+        ctx.provide(Services.CHILD_SPAWN_OPTIONS, _workspace)
+
         async def _pre_task(payload: dict, next) -> dict:
             target = str(payload.get("task") or "")
             policy = _config(ctx)
@@ -242,19 +330,26 @@ class Sandbox:
             if info["deprecated_used"]:
                 # 迁移期提示：**不静默**（旧键仍在生效会让用户以为改了新键就生效了）
                 inc_counter("agent_sandbox_deprecated_keys_total")
+            sk = current_session_key(ctx)
+            ws = workspace_for(policy, sk)
             await durable(ctx, Events.SANDBOX_CONFINEMENT, {
                 "who": str(payload.get("caller") or "unknown"), "level": "task",
                 "target": target, "risk": str(payload.get("risk") or ""),
                 "bridge": _bridge_of(target),
                 "mode": info["mode"], "enforcement": info["enforcement"],
                 "ceiling": info["ceiling"], "gap": info["gap"],
+                # ★ 落点（2026-10-04）：声明了档位 ⇒ 子进程被挪到会话私有目录。
+                # 与桥侧**共用同一个纯函数** ⇒ 审计里的 cwd 就是实际生效的那个，不会漂移。
+                # 注意：这只说明"东西落在哪"，**不代表强制**（见 workspace_for 的说明）。
+                "cwd": (ws or {}).get("cwd", ""),
+                "env_redirected": bool(ws),
                 # ★ enforced_by 区分"沙箱正常评估"与"沙箱自身故障"（DSH 的
                 # denialSignatures vs runnerFailureRules）。当前后端恒 "none"；
                 # 未来落地后填真实后端名，失败时填 "backend-error"。
                 "enforced_by": "none",
                 # 迁移期可见性：仍在用已废弃的裁决键 ⇒ 审计里能查到（不静默）
                 "deprecated_used": list(info["deprecated_used"]),
-                "by": "sandbox", "session": current_session_key(ctx),
+                "by": "sandbox", "session": sk,
                 "reason": info["reason"], "at": now_iso(),
             })
             inc_counter("agent_sandbox_confinement_total")
@@ -276,12 +371,16 @@ class Sandbox:
         """
         policy = _config(ctx)
         info = describe(policy)
+        ws = workspace_for(policy, current_session_key(ctx))
         return {
             "mode": info["mode"],
             "enforcement": info["enforcement"],
             "ceiling": info["ceiling"],
             "gap": info["gap"],
             "reason": info["reason"],
+            # 落点（当前是否把子进程挪出项目根）——与审计同源，前端可直接展示
+            "workspace": (ws or {}).get("cwd", ""),
+            "env_redirected": bool(ws),
             "targets": list(policy.get("targets") or []),
             "session": current_session_key(ctx) or "container",
             "deprecated_used": list(info["deprecated_used"]),
@@ -290,5 +389,5 @@ class Sandbox:
 
 
 __all__ = ["Sandbox", "describe", "match", "in_scope", "MODES", "ENFORCEMENTS",
-           "DEFAULT_CONFIG", "DEFAULT_POLICY"]
+           "DEFAULT_CONFIG", "DEFAULT_POLICY", "workspace_for", "_REDIRECT_ENV_KEYS"]
 

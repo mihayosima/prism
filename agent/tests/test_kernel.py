@@ -414,3 +414,108 @@ def test_uninjected_read_in_apply_is_none():
 def test_capability_not_implemented_honest():
     with pytest.raises(CapabilityNotImplemented):
         raise CapabilityNotImplemented("agent.llm.complete", "插槽占位")
+
+# ---------------------------------------------------------------------------
+# D2（2026-10-04）：emit 的 fire-and-forget 在途任务有上限
+# ---------------------------------------------------------------------------
+# 此前只登记 ``_tasks`` 不设 cap ⇒ 高频事件遇到慢异步监听器时无界堆积。
+
+def test_emit_caps_inflight_and_counts_drops():
+    """超上限时**丢弃 + 计数**，且 emit 本身**不阻塞**（契约是"不 await"）。"""
+    import asyncio as _aio
+
+    from agent.core.context import Context
+    from agent.core.events import EventBus
+
+    async def s():
+        bus = EventBus(max_inflight=2)
+        ctx = Context(name="t")
+        release = _aio.Event()
+        started = []
+
+        async def _slow(*a):
+            started.append(1)
+            await release.wait()
+
+        for _ in range(5):
+            bus.on(ctx, "e/evt", _slow)
+        # ★ 只 emit **一次**：每次 emit 会遍历**全部**监听器，重复 emit 的丢弃数
+        #   是 3+5+5+5+5 这种难算的量；单次 ⇒ 期望值精确（cap=2 ⇒ 建 2 丢 3）。
+        await bus.emit("e/evt", {"x": 1})
+        assert bus.inflight == 2, f"在途数应被限住，实际 {bus.inflight}"
+        assert bus.dropped == 3, f"丢弃数不对：{bus.dropped}"
+        # ★ create_task 不会立刻跑 ⇒ 必须让出一次，否则监听器根本没被调用
+        #   （我第一版漏了这一步，断言 len(seen)==50 拿到 0）
+        await _aio.sleep(0)
+        assert len(started) == 2, f"实际启动的监听器数应等于上限：{len(started)}"
+        release.set()
+        await bus.aclose()
+        assert bus.inflight == 0
+
+    _aio.run(s())
+
+
+def test_emit_cap_is_not_hit_in_normal_shape():
+    """正常形态（少量监听器）**永不触发**丢弃——限流不是行为变更。"""
+    import asyncio as _aio
+
+    from agent.core.context import Context
+    from agent.core.events import EventBus
+
+    async def s():
+        bus = EventBus()
+        ctx = Context(name="t2")
+        seen = []
+
+        async def _h(*a):
+            seen.append(1)
+
+        bus.on(ctx, "e/x", _h)
+        for _ in range(50):
+            await bus.emit("e/x", {"k": 1})
+        await _aio.sleep(0)          # 让 fire-and-forget 任务真正跑起来
+        await bus.aclose()
+        assert bus.dropped == 0, f"正常形态不该丢帧：{bus.dropped}"
+        assert len(seen) == 50
+
+    _aio.run(s())
+
+
+def test_emit_cap_does_not_affect_waterfall():
+    """★ 限流**只作用于 emit**；waterfall 闸门链是 await 的，不受影响。
+
+    这是安全前提：若限流能作用到 waterfall，就会出现"闸门被悄悄打开"的路径。
+    """
+    import asyncio as _aio
+
+    from agent.core.context import Context
+    from agent.core.events import EventBus
+
+    async def s():
+        bus = EventBus(max_inflight=1)
+        ctx = Context(name="t3")
+
+        async def _async_noisy(*a):
+            await _aio.sleep(0.05)
+
+        for _ in range(4):
+            bus.on(ctx, "e/noisy", _async_noisy)
+
+        async def _gate(payload, nxt):
+            payload["seen"] = True
+            return await nxt()
+
+        bus.on(ctx, "w/fire", _gate)
+        for _ in range(10):
+            await bus.emit("e/noisy", {})
+        assert bus.dropped > 0, "前提不成立：本次没触发丢弃"
+        assert bus.inflight <= 1
+        # waterfall 链仍完整执行 10 次
+        got = []
+        for _ in range(10):
+            r = await bus.waterfall("w/fire", {})
+            got.append(r)
+        assert all(g.get("seen") for g in got), "waterfall 闸门被限流影响"
+        await bus.aclose()
+
+    _aio.run(s())

@@ -52,6 +52,7 @@ G2.0（P2：治理动词 + 收尾执行点）
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -62,7 +63,7 @@ from typing import Any
 
 from agent.api import (CapabilityNotImplemented, Events, Services, SessionIdentity,
                       StateKeys, coerce_identity, durable, estimate_request_cost,
-                      estimate_tokens, now_iso, current_permission_mode,
+                      estimate_tokens, inc_counter, now_iso, current_permission_mode,
                       set_current_run_id, set_current_session_key)
 
 logger = logging.getLogger("agent.react")
@@ -393,6 +394,65 @@ class ReactLoop:
                   prior: list[dict] | None = None, resume: bool = False,
                   resume_state: dict | None = None,
                   identity: SessionIdentity | None = None) -> ReactResult:
+        """公开入口：**唯一职责是给取消/异常路径兜住收尾**（H1）。
+
+        为什么单独一层而不把 330 行主体缩进进 try/finally：
+        主体已很长，整块重缩进会让 diff 变成"全文件重写"， review 失去焦点；
+        而且**成功与触顶两条路径各有自己的收尾**（存档/治理水位/置完成），
+        再套 finally 会**重复做一遍**（双份存档 + 二次 finish）。
+
+        ⇒ 这里只兜**异常/取消**：任何从主体逸出的异常（含 ``CancelledError``）
+        都会跳过正常收尾 ⇒ 快照停留在 ``status="running"`` ⇒ 下次请求
+        ``_probe_resume`` 把它当崩溃残留**自动续接**（静默错误状态延续）。
+        兜住后快照被标 ``cancelled``（不是 finished，见 backend 的说明），
+        ``_probe_resume`` 只认 ``running`` ⇒ 不再误续接。
+
+        ★ **绝不吞异常**：兜底只做"把状态挪走"，随后原样重抛。
+        """
+        box: dict = {}
+        try:
+            return await self._run_impl(ctx, prompt, box, session_id=session_id,
+                                        prior=prior, resume=resume,
+                                        resume_state=resume_state, identity=identity)
+        except BaseException as exc:
+            await self._abandon(ctx, box, exc)
+            raise
+
+    async def _abandon(self, ctx, box: dict, exc: BaseException) -> None:
+        """取消/异常路径的**最小收尾**：挪走快照状态 + 清 run 通道 + 落审计。
+
+        ★ 这里处在**取消上下文**中：任何 ``await`` 都可能立刻再抛 ``CancelledError``。
+        故每一步都独立吞掉全部异常（含 BaseException）——目标是"尽力而为"，
+        绝不能让收尾动作替掉**原始异常**（那才是真正要传给调用方的信息）。
+        """
+        task_id = box.get("task_id")
+        if not task_id:
+            return                                   # 还没跑到生成 task_id ⇒ 无状态可挪
+        cancelled = isinstance(exc, asyncio.CancelledError)
+        try:
+            await durable(ctx, Events.REACT_EXHAUSTED, {
+                "steps": box.get("steps", 0), "at": now_iso(),
+                "cancelled": cancelled, "abandoned": not cancelled,
+                "reason": f"{'已取消' if cancelled else '异常中断'}：{type(exc).__name__}",
+                "task_id": task_id})
+        except BaseException:                        # noqa: BLE001
+            pass
+        wm, ident = box.get("wm"), box.get("ident")
+        if wm is not None and ident is not None:
+            try:
+                await _snapshot_call(wm, "snapshot_mark_abandoned", ident.tenant, task_id)
+            except BaseException:                    # noqa: BLE001
+                inc_counter("agent_react_abandon_marks_failed_total")
+        try:
+            set_current_run_id("")                   # R1：两通道同步置空
+            ctx.state[StateKeys.REACT_RUN_ID] = ""
+        except BaseException:                        # noqa: BLE001
+            pass
+
+    async def _run_impl(self, ctx, prompt: str, box: dict, *, session_id: str = "default",
+                        prior: list[dict] | None = None, resume: bool = False,
+                        resume_state: dict | None = None,
+                        identity: SessionIdentity | None = None) -> ReactResult:
         """``identity``：2.2 会话/租户身份（由适配层解析后**显式线程化**传入）。
 
         为什么是显式参数而非 ``ctx.get(...)``：``ctx.state`` 与服务都是**容器级**且被并发
@@ -441,6 +501,8 @@ class ReactLoop:
         if wm is not None:
             await wm.begin(task_id, {"session_id": session_key, "tenant": ident.tenant,
                                      "run_id": run_id, "max_steps": cfg.max_steps})
+        # 异常/取消路径的收尾依据（H1）：外层 run() 的兜底据此挪走快照状态。
+        box.update(task_id=task_id, ident=ident, wm=wm, steps=0)
 
         # 任务级视图（S3）：prior = 入口已装配上下文（rigid，循环内不重裁）；
         # chain = **仅**循环产生的 Think/Act/Observe（草稿，循环结束即弃）。
@@ -629,7 +691,7 @@ class ReactLoop:
                     wm, task, out.tool_calls, tools)
             results = list(meta_results)
             if real_calls:
-                results.extend(await self._actor.act(ctx, real_calls))
+                results.extend(await self._act_with_budget(ctx, real_calls, started, cfg))
             stop_reason: str | None = None
             for r in results:
                 tool_trace.append(r.name)
@@ -721,6 +783,27 @@ class ReactLoop:
                            tools=tool_trace, observations=observed, summary=summary)
 
     # ---------- 循环内上下文（S3：块内准备 → 治理器装配） ----------
+
+    async def _act_with_budget(self, ctx, calls, started: float,
+                               cfg: "ReactConfig") -> list[ToolResult]:
+        """按**剩余 deadline** 执行本步工具调用（H3）。
+
+        为什么必须下压到单次调用：``deadline`` 只在循环顶检查，而一个卡死的工具
+        让 ``await`` 永不返回 ⇒ 永远到不了那个检查点（此前是真实的"run 永久挂住"）。
+        剩余时间下压 ⇒ 最坏情况下这次 act 一定在 deadline 内结束，循环顶随即触顶收尾。
+
+        注入的 ``Actor`` 可能不认 ``timeout_s``（旧实现）⇒ 逐级回退签名（与 ``_window``
+        的 ``tries`` 同款纪律）：不劣化，但也拿不到超时保护（如实）。
+        """
+        remaining = float(cfg.deadline_s) - (time.monotonic() - started)
+        if remaining <= 0:
+            remaining = None                     # 已超期：交给循环顶统一触顶，不额外收紧
+        for kwargs in ({"timeout_s": remaining}, {}):
+            try:
+                return await self._actor.act(ctx, calls, **kwargs)
+            except TypeError:                    # 注入实现不认该参数 → 退回旧签名
+                continue
+        return await self._actor.act(ctx, calls)
 
     def _prepare_chain(self, gov, chain: list[dict], keep_recent: int, *,
                        wm=None, task_id: str = "",

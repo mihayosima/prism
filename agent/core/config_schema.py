@@ -18,6 +18,20 @@ from typing import Any
 from .errors import ConfigError
 
 
+# SQLite 库路径的**唯一默认值真源**（2026-10-04 收口）。
+#
+# 此前 ``data/agent.db`` 在 ``profiles.py::BASE_AGENT_CONFIG`` 与 ``sys/storage.py``
+# 的兜底取值处**各硬编码一份**，两处漂移时表现为「配置改了但库没换」，排查需翻两处。
+# 现两处统一引用本常量。
+#
+# ⚠️ 与 ``run/chat.py`` 的 ``--db`` 默认（``data/agent_chat.db``）**刻意不同**，不是 bug：
+#   - 本常量服务于 ``build_agent()`` 的离线/嵌入式/测试用法；
+#   - 服务器入口（``python -m agent.run.chat``）用独立库，避免长驻进程与离线用法
+#     抢同一个文件（WAL 争用 + 测试写入污染服务端数据）。
+# 两个库 schema 完全相同（同一套 ``MIGRATIONS``），切换入口即可，不需要迁移。
+DEFAULT_DB_PATH = "data/agent.db"
+
+
 # 声明式 schema：节 -> {键: 期望类型}。``"_any"`` 表示该节/键由插件自管，宽松放行。
 _SCHEMA: dict[str, Any] = {
     "db_path": str,

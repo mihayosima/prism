@@ -71,7 +71,16 @@ class Plugin:
 
     @property
     def params_schema(self) -> dict:
-        """任务参数声明（类属性 `params_schema`，可选）。"""
+        """任务参数声明（类属性 `params_schema`，可选）。
+
+        ★ **当前无消费方**（2026-10-04 复核）：只透传到 :meth:`plugin_manifest`，
+        没有任何执行路径读它。**刻意保留**而非删除——它是 ``Plugin`` 的公开元数据面，
+        外部插件与控制台可能依赖；直接删会破坏兼容。
+        保留的同时把状态写清楚，免得后来人误以为"已经在生效"。
+
+        真正的参数校验走另一条已生效的路径：``tasks.register(schema=...)``
+        → ``sys/tasks.py::validate_kwargs``（那个是真在跑的）。
+        """
         f = getattr(self._raw, "params_schema", None)
         return dict(f) if isinstance(f, dict) else {}
 

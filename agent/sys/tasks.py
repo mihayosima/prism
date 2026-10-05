@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import time
@@ -22,6 +23,7 @@ from agent.api import (
     Services,
     current_plugin,
     guard_source,
+    inc_counter,
     now_iso,
     plugin,
 )
@@ -105,17 +107,20 @@ def validate_kwargs(schema: Mapping[str, dict] | None, kwargs: dict[str, Any], *
 
 
 class Task:
-    __slots__ = ("name", "schema", "handler", "owner", "description", "risk")
+    __slots__ = ("name", "schema", "handler", "owner", "description", "risk", "timeout_s")
 
     def __init__(self, name: str, schema: Mapping[str, dict] | None, handler: Callable,
                  *, owner: str | None = None, description: str = "",
-                 risk: str = "write"):
+                 risk: str = "write", timeout_s: float | None = None):
         self.name = name
         self.schema = schema
         self.handler = handler
         self.owner = owner
         self.description = description
         self.risk = risk
+        #: 注册级超时（秒）。``None`` = 不限（**默认保持既有行为**，不劣化）。
+        #: H3：react 会用「剩余 deadline」覆盖它，故默认不限不影响长任务。
+        self.timeout_s = timeout_s
 
     async def invoke(self, kwargs: dict[str, Any]) -> Any:
         clean = validate_kwargs(self.schema, kwargs, tool_name=self.name)
@@ -123,6 +128,14 @@ class Task:
         if inspect.isawaitable(result):
             return await result
         return result
+
+
+class TaskTimeout(AgentError):
+    """工具执行超时（H3）。
+
+    独立异常类型（而非复用 ``AgentError``）⇒ 调用方可**只对超时**做特殊处置
+    （如换策略重试），而不会把"超时"与"参数非法/任务不存在"混为一谈。
+    """
 
 
 class TaskRegistry:
@@ -133,14 +146,16 @@ class TaskRegistry:
 
     def register(self, ctx, name: str, *, schema: Mapping[str, dict] | None,
                  handler: Callable, owner: str | None = None,
-                 description: str = "", risk: str = "write") -> Callable[[], bool]:
+                 description: str = "", risk: str = "write",
+                 timeout_s: float | None = None) -> Callable[[], bool]:
         if name in self._tasks:
             raise AgentError(f"任务重复注册（名称唯一，D-3）: {name}")
         if risk not in RISKS:
             raise AgentError(f"risk 须 ∈ {RISKS}，得到 {risk!r}")
         owner = owner if owner is not None else current_plugin()
         self._tasks[name] = Task(name, schema, handler, owner=owner,
-                                 description=description, risk=risk)
+                                 description=description, risk=risk,
+                                 timeout_s=timeout_s)
 
         def dispose() -> bool:
             if name in self._tasks:
@@ -154,7 +169,8 @@ class TaskRegistry:
     def has(self, name: str) -> bool:
         return name in self._tasks
 
-    async def invoke(self, ctx, name: str, *, caller: str | None = None, **kwargs: Any) -> Any:
+    async def invoke(self, ctx, name: str, *, caller: str | None = None,
+                     timeout_s: float | None = None, **kwargs: Any) -> Any:
         cmd = self._tasks.get(name)
         if cmd is None:
             raise AgentError(f"任务不存在: {name!r}")
@@ -179,10 +195,22 @@ class TaskRegistry:
         started = time.monotonic()
         ok, error = True, None
         clipped, omitted, limit = False, 0, None
+        # H3：单次执行**必须有上限**。此前 `await cmd.invoke(...)` 裸 await，
+        # 一个卡死的非 MCP 工具会让 run 永久挂住 —— 而 deadline 只在**循环顶**检查，
+        # 永远到不了那个检查点。超时来源优先级：调用方显式 > 注册时声明 > 不限。
+        budget = timeout_s if timeout_s is not None else cmd.timeout_s
         try:
-            result = await cmd.invoke(effective)
+            if budget and budget > 0:
+                result = await asyncio.wait_for(cmd.invoke(effective), timeout=budget)
+            else:
+                result = await cmd.invoke(effective)
             # S4 源头护栏：在 emit 之前净化，使事件能带上裁剪遥测（异常由 _guard_result 内部兜住）
             result, (clipped, omitted, limit) = _guard_result(ctx, result)
+        except asyncio.TimeoutError as exc:
+            ok, error = False, f"工具执行超时（>{budget:.1f}s）"
+            inc_counter("agent_tasks_timeout_total")
+            logger.warning("工具 %s 执行超时（>%ss），已中断", name, budget)
+            raise TaskTimeout(f"agent.tasks.{name}", error) from exc
         except Exception as exc:
             ok, error = False, str(exc)     # S7：失败也发 post 事件（审计不缺失败样本）
             raise
@@ -192,6 +220,7 @@ class TaskRegistry:
                 "task": name, "caller": caller,
                 "ok": ok, "span_ms": span_ms, "error": error,
                 "clipped": clipped, "omitted_tokens": omitted, "limit_tokens": limit,
+                "timed_out": bool(ok is False and error and "超时" in error),
             })
         return result
 
@@ -246,4 +275,4 @@ class TasksPlugin:
                           handler=_ping, owner=None)
 
 
-__all__ = ["TaskRegistry", "TasksPlugin", "validate_kwargs", "RISKS"]
+__all__ = ["TaskRegistry", "TasksPlugin", "validate_kwargs", "RISKS", "TaskTimeout"]

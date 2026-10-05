@@ -34,12 +34,16 @@ G2（会话级，本次改造）：
 
 from __future__ import annotations
 
+import logging
+
 from agent.api import (Events, Services, SESSION_CFG_VIEW, StateKeys, cost_factor,
                        current_run_id, current_session_key, durable,
-                       estimate_request_cost, now_iso, plugin)
+                       estimate_request_cost, inc_counter, now_iso, plugin)
 # 账单表的补列定义归口 agent/tables.py（表结构真相源），此处只负责**执行**。
 # 沿用 sys → agent.tables 的既有导入方向（先例：sys/storage.py 导入 MIGRATIONS）。
 from agent.tables import BUDGET_LOG_FIELDS
+
+logger = logging.getLogger("agent.budget")
 
 # 状态分桶上限（与配置覆盖的 sessions 上限**独立**）：只防内存无限增长，
 # 淘汰最久未用的桶；淘汰只丢「累计值」，不影响任何已落账的账单。
@@ -187,12 +191,17 @@ class Budget:
         # F2/P3：账单明细列**幂等补列**——定义见 agent/tables.py::BUDGET_LOG_FIELDS
         # （表结构真相源归口于该文件；此处不写死列名，避免"看表结构要翻两处"）。
         # 容错是刻意的：存量库这些列早已存在，ALTER 必然报 duplicate column。
+        # ★ **真失败必须可见**（2026-10-04 补，与 sys/storage.py 同款）：原实现全静默，
+        # 补不上时表现为"账单明细列莫名其妙是空的"，日志零线索、只能手工 PRAGMA 才发现。
+        # ``duplicate column`` 属**正常**幂等路径，不计失败（否则每次启动都误报）。
         for col, decl in BUDGET_LOG_FIELDS:
             try:
                 await ctx.db.execute(
                     ctx, f"ALTER TABLE agent_budget_log ADD COLUMN {col} {decl}", ())
-            except Exception:                # noqa: BLE001 —— 列已存在/表未建等 → 尽力而为
-                pass
+            except Exception as exc:         # noqa: BLE001 —— 列已存在/表未建等 → 尽力而为
+                if "duplicate column" not in str(exc).lower():
+                    inc_counter("agent_budget_column_backfill_failed_total")
+                    logger.warning("agent_budget_log 补列 %s 失败 ⇒ 该列将缺失: %s", col, exc)
 
         async def _pre(payload: dict, next) -> dict:
             # est 覆盖 messages + tools 目录（native 形态）+ schema；

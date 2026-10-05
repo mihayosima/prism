@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 
 import pytest
@@ -366,6 +367,56 @@ def test_spawned_child_never_sees_host_safe_delete_vars(tmp_path, monkeypatch):
             payload = json.loads(result["text"])
             assert payload["present"] == [], f"子进程仍看到守卫变量：{payload['present']}"
             assert payload["has_pythonpath"], "PYTHONPATH 应保留"
+        finally:
+            await client.close()
+
+    _run(s())
+
+# ---------------------------------------------------------------------------
+# 子进程落点（2026-10-04）：cwd 是否真的传给了子进程
+# ---------------------------------------------------------------------------
+# 为什么值得端到端真验：spawn 时不设 cwd ⇒ 子进程继承宿主 cwd（= 项目根，那里有
+# ``local_secrets.json`` 与 ``data/*.db``）。落点收拢靠的就是这个参数，
+# 只测"参数存下来了"抓不到"没传给 create_subprocess_exec"。
+#
+# ★ 探针脚本**复用** ``_FAKE_MCP`` 的字符串（只替换 echo 的返回值），不再手抄一份
+# —— 手抄内嵌脚本的 ``\n`` 转义极易出错，出错表现是子进程 SyntaxError 退出，
+# 与"落点没生效"难以区分（本次实测踩到）。
+
+_CWD_MCP = _FAKE_MCP.replace("import sys, json", "import sys, json, os", 1).replace(
+    '"text":json.dumps(args)', '"text":os.getcwd()', 1)
+
+
+def test_child_uses_given_cwd(tmp_path):
+    """给了 cwd ⇒ 子进程的工作目录**就是它**（端到端真探针）。"""
+    workdir = tmp_path / "sandbox" / "u_A-1234abcd"
+    workdir.mkdir(parents=True)
+    script = tmp_path / "cwd_mcp.py"
+    script.write_text(_CWD_MCP, encoding="utf-8")
+    client = McpStdioClient(sys.executable, [str(script)], cwd=str(workdir))
+
+    async def s():
+        await client.start()
+        try:
+            result = await client.call_tool("echo", {"text": "x"})
+            assert os.path.realpath(result["text"]) == os.path.realpath(str(workdir)),                 f"子进程 cwd 不是落点目录：{result['text']}"
+        finally:
+            await client.close()
+
+    _run(s())
+
+
+def test_child_without_cwd_inherits_host(tmp_path):
+    """不传 cwd ⇒ 继承宿主 cwd（历史行为，**不得**被这次改动悄悄改掉）。"""
+    script = tmp_path / "cwd_mcp.py"
+    script.write_text(_CWD_MCP, encoding="utf-8")
+    client = McpStdioClient(sys.executable, [str(script)])
+
+    async def s():
+        await client.start()
+        try:
+            result = await client.call_tool("echo", {"text": "x"})
+            assert os.path.realpath(result["text"]) == os.path.realpath(os.getcwd()),                 f"未给 cwd 时不应改动子进程工作目录：{result['text']}"
         finally:
             await client.close()
 

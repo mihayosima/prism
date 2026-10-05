@@ -36,7 +36,7 @@ from agent.api import (CapabilityNotImplemented, ConfigError, SESSION_CFG_VIEW,
                        coerce_config, set_current_session_key,
                        validate_config)
 from agent.plugins.sandbox import (DEFAULT_CONFIG, ENFORCEMENTS, MODES, describe,
-                                in_scope, match)
+                                in_scope, match, workspace_for)
 from agent.profiles import BASE_AGENT_CONFIG, build_agent
 from agent.sys.plugin_manager import PluginManager
 
@@ -412,6 +412,118 @@ def test_untouched_surfaces_stay_untouched():
     for rel in ("plugins/playwright_mcp/__init__.py", "plugins/windows_mcp/__init__.py"):
         assert "sandbox" not in (AGENT_DIR / rel).read_text(encoding="utf-8").lower(), \
             f"{rel} 不应改动（沙箱在准入层，不进桥）"
+
+
+# ---------------------------------------------------------------------------
+# ⑫ 落点收拢（2026-10-04）：把外部子进程的写入落点挪出项目根
+# ---------------------------------------------------------------------------
+# 动机（可验证的事实，不是感觉）：``core/mcp_client.py`` spawn 时不设 cwd ⇒ 子进程
+# 继承宿主 cwd = 项目根，那里有 ``local_secrets.json`` 与 ``data/*.db``。
+
+def test_workspace_for_is_opt_in_default_off():
+    """``mode="none"`` ⇒ **不重定向**（保持现状，不劣化）。这是 opt-in 的硬保证。"""
+    assert workspace_for({"mode": "none"}) is None
+    assert workspace_for({}) is None
+    assert workspace_for({"mode": "瞎写的档位"}) is None      # 非法档位回落 none
+    assert workspace_for({"targets": ["mcp.*"]}) is None       # 未声明档位
+
+
+def test_workspace_for_redirects_known_cache_dirs():
+    """声明档位 ⇒ 给出 cwd + 一整套缓存/临时目录重定向。"""
+    for mode in ("read-only", "workspace-write"):
+        ws = workspace_for({"mode": mode}, "u:A")
+        assert ws is not None, f"{mode} 应给出落点"
+        cwd = ws["cwd"]
+        assert cwd.startswith("data/sandbox/u_A-"), f"{cwd} 应落在根下且带会话前缀"
+        assert ws["env"]["TMP"] == cwd and ws["env"]["TEMP"] == cwd
+        # 两个桥各自的缓存家目录必须被收进去（否则 npx/uvx 仍往宿主家目录写）
+        assert ws["env"]["npm_config_cache"] == cwd
+        assert ws["env"]["UV_CACHE_DIR"] == cwd
+        assert ws["env"]["PLAYWRIGHT_BROWSERS_PATH"] == cwd
+
+
+def test_workspace_seg_is_path_traversal_safe():
+    """会话键进路径前必须净化：``..`` 不得原样保留（否则逃出根目录）。"""
+    for bad in ("../../etc", "..", ".", "a/../b"):
+        ws = workspace_for({"mode": "workspace-write"}, bad)
+        assert ws is not None
+        seg = ws["cwd"].split("/")[-1]
+        assert ".." not in seg, f"{bad!r} 产生了可穿越的目录段 {seg!r}"
+        assert "." not in seg, f"{bad!r} 目录段仍含点 {seg!r}"
+
+
+def test_workspace_segments_do_not_collide():
+    """★ 净化不可逆（``.``/``:`` 都被替换）⇒ 必须靠哈希后缀防碰撞。
+
+    碰撞的后果是**两个不同会话落进同一个目录** —— 那正是本次要修的串味，
+    只是从"记忆串味"换成"文件落点串味"。
+    """
+    a = workspace_for({"mode": "workspace-write"}, "u.a")["cwd"]
+    b = workspace_for({"mode": "workspace-write"}, "u_a")["cwd"]
+    c = workspace_for({"mode": "workspace-write"}, "u:a")["cwd"]
+    assert len({a, b, c}) == 3, f"落点碰撞：{a} / {b} / {c}"
+
+
+def test_confinement_audit_carries_workspace(tmp_path):
+    """审计行带 ``cwd`` / ``env_redirected`` ⇒ 「东西落在哪」可查。
+
+    默认档位下两者为空/False（不谎报成已收拢）。
+    """
+    c = _container(tmp_path, config_agent={"sandbox": {"mode": "workspace-write"}})
+
+    async def s():
+        await c.assemble()
+        set_current_session_key("u:A")
+        _register(c, names=("mcp.windows.open",))
+        await c.root.tasks.invoke(c.root, "mcp.windows.open", caller="test")
+        rows = await _sandbox_rows(c)
+        await c.teardown()
+        return rows
+
+    rows = _run(s())
+    assert rows, "应落一条隔离自述"
+    payload = json.loads(rows[0]["payload"])
+    assert payload["cwd"].startswith("data/sandbox/u_A-")
+    assert payload["env_redirected"] is True
+    # ★ 关键：落点收拢**不是**强制 —— enforcement 不得因此抬升（抬了就是谎报）
+    assert payload["enforcement"] == "none"
+    assert payload["gap"] is True
+
+
+def test_audit_workspace_empty_when_mode_none(tmp_path):
+    """未声明档位 ⇒ 审计里 cwd 为空、env_redirected=False（诚实）。"""
+    c = _container(tmp_path)
+
+    async def s():
+        await c.assemble()
+        _register(c, names=("mcp.windows.open",))
+        await c.root.tasks.invoke(c.root, "mcp.windows.open", caller="test")
+        rows = await _sandbox_rows(c)
+        await c.teardown()
+        return rows
+
+    rows = _run(s())
+    payload = json.loads(rows[0]["payload"])
+    assert payload["cwd"] == ""
+    assert payload["env_redirected"] is False
+
+
+def test_status_reports_workspace(tmp_path):
+    """``status()`` 暴露落点 ⇒ 插件页可展示"当前是否把子进程挪出项目根"。"""
+    c = _container(tmp_path, config_agent={"sandbox": {"mode": "read-only"}})
+
+    async def s():
+        await c.assemble()
+        set_current_session_key("u:B")
+        st = {s["id"]: s["status"] for s in await c.plugin_statuses()}
+        await c.teardown()
+        return st
+
+    st = _run(s())
+    sb = st.get("plugins.sandbox") or {}
+    assert (sb.get("workspace") or "").startswith("data/sandbox/u_B-")
+    assert sb.get("env_redirected") is True
+    assert sb.get("enforcement") == "none"       # 仍不谎报
 
 
 # ---------------------------------------------------------------------------

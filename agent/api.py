@@ -26,7 +26,7 @@ from agent.core.errors import (
 from agent.core.events import EventBus
 from agent.core.events_catalog import Events, all_events, EVENT_MODE, REQUIRED_SUBSCRIBER_EVENTS
 from agent.core.mcp_client import McpStdioClient, build_task_schema
-from agent.core.config_schema import coerce_config, validate_config
+from agent.core.config_schema import DEFAULT_DB_PATH, coerce_config, validate_config
 from agent.core.obs import (bind_request_id, configure_logging, counters_snapshot,
                             current_request_id, ensure_request_id, inc_counter,
                             new_request_id, trace_fields)
@@ -206,6 +206,7 @@ __all__ = [
     # 配置归一/校验（实现位于 core/config_schema；装配根 profiles 经本出口取用）
     "coerce_config",
     "validate_config",
+    "DEFAULT_DB_PATH",
     # 提示词标记 SSOT（D4：离线 fixture 据此路由；`<!--` 字面量只许出现在本文件）
     "MARK_CHAT_PLAN",
     "MARK_CHAT_ANSWER",

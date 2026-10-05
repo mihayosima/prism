@@ -36,6 +36,8 @@ _STATE_KEYS = {
 }
 _STATE_KEYS_SSOT = AGENT / "core" / "state_keys.py"
 _MARKER_SSOT = AGENT / "api.py"
+_DB_PATH_SSOT = AGENT / "core" / "config_schema.py"
+_DB_PATH_DEFAULT = "data/agent.db"
 
 
 def _py_files():
@@ -71,6 +73,27 @@ def test_state_key_literals_only_in_state_keys():
             if s in _STATE_KEYS:
                 bad.append((fp.name, s))
     assert not bad, f"ctx.state 共享键裸字面量（应改用 agent.api.StateKeys）: {bad}"
+
+
+def test_db_path_default_literal_only_in_config_schema():
+    """``data/agent.db`` 字面量只允许出现在 ``core/config_schema.py``。
+
+    ★ 曾**三处**硬编码并漂移（``profiles.BASE_AGENT_CONFIG``、``sys/storage`` 的兜底取值、
+    ``run/chat`` 的 ``--db`` 默认），表现为「改了配置但库没换」，排查要翻三个文件。
+    现统一引用 ``DEFAULT_DB_PATH``（经 agent.api 出口），本守卫防回潮（与 StateKeys 同风格）。
+
+    注：``run/chat.py`` 的 ``data/agent_chat.db`` 是**另一个**值（服务器入口独立库，
+    刻意与离线用法隔离），不受本守卫约束。
+    """
+    bad: list[str] = []
+    for fp in _py_files():
+        if fp.resolve() == _DB_PATH_SSOT.resolve():
+            continue
+        tree = ast.parse(fp.read_text(encoding="utf-8"), filename=str(fp))
+        for s in _string_constants(tree):
+            if s == _DB_PATH_DEFAULT:
+                bad.append(fp.name)
+    assert not bad, f"db_path 默认值裸字面量（应改用 agent.api.DEFAULT_DB_PATH）: {bad}"
 
 
 def test_marker_literals_only_in_api():

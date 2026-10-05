@@ -140,10 +140,17 @@ class DefaultActor:
     def __init__(self, *, caller: str = "plugins.react"):
         self._caller = caller
 
-    async def act(self, ctx, calls) -> list[ToolResult]:
-        return [await self._one(ctx, c) for c in calls]
+    async def act(self, ctx, calls, *, timeout_s: float | None = None) -> list[ToolResult]:
+        """``timeout_s``（H3）：本次 act 的**剩余预算**，逐个下压给 ``tasks.invoke``。
 
-    async def _one(self, ctx, call: ToolCall) -> ToolResult:
+        没有它时，卡死的工具会让 ``await`` 永不返回，而 run 的 deadline 只在
+        **循环顶**检查 ⇒ 永远到不了那个检查点 ⇒ 整个 run 永久挂住。
+        ``None`` = 不限时（默认，既有行为不变）。
+        """
+        return [await self._one(ctx, c, timeout_s) for c in calls]
+
+    async def _one(self, ctx, call: ToolCall,
+                   timeout_s: float | None = None) -> ToolResult:
         if getattr(call, "truncated", False):
             # E（方案）：生成侧截断的调用**不执行**——半截 JSON 已被 _wire_call 拒析，
             # 强行 invoke 只会得到「缺少必填参数」的误导报错。此处如实回灌自纠指引。
@@ -157,6 +164,7 @@ class DefaultActor:
                 is_error=True, tool_call_id=call.id)
         try:
             result = await ctx.tasks.invoke(ctx, call.name, caller=self._caller,
+                                            timeout_s=timeout_s,
                                             **dict(call.arguments or {}))
         except CapabilityNotImplemented as exc:
             return ToolResult(call.name, f"被拒绝：{exc}", is_error=True, denied=True,

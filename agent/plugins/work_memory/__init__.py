@@ -77,6 +77,7 @@ class WorkMemory:
 
     def __init__(self):
         self._impl: WorkMemoryLike | None = None
+        self._cfg: dict = {}
 
     async def apply(self, ctx) -> None:
         cfg = ((ctx.config or {}).get("agent") or {}).get("work_memory") or {}
@@ -114,6 +115,24 @@ class WorkMemory:
             self._impl = InMemoryWorkMemory(ttl=ttl, prefix=prefix,
                                             snapshot_ttl=snapshot_ttl)
         ctx.provide(Services.WORK_MEMORY, self)
+
+    async def status(self, ctx) -> dict:
+        """运行态：**后端是不是 Redis**（降级到 InMemory 时跨进程续接不保证，必须可见）。
+
+        这是本插件最该被看见的一件事——降级只在**启动日志**里出现一次，
+        插件页若不报，运维看到"一切正常"却以为断点续传在工作。
+        """
+        backend = "in-memory"
+        degraded = True
+        if self._impl is not None:
+            backend = type(self._impl).__name__
+            degraded = not isinstance(self._impl, RedisWorkMemory)
+        return {
+            "backend": backend,
+            # ★ True = 降级中：断点续接/跨会话链**不保证**（跨进程会丢）
+            "degraded": degraded,
+            "cross_process_resume": not degraded,
+        }
 
     # ---- 委托（吞异常，主链路不崩） ----
     async def begin(self, task_id: str, meta: dict) -> None:
@@ -202,10 +221,28 @@ class WorkMemory:
             await self._impl.snapshot_mark_finished(tenant, task_id)
         except Exception as exc:                             # noqa: BLE001
             logger.error("work_memory.snapshot_mark_finished failed twice: %s", exc)
-            try:
-                await self._impl.snapshot_flag_finished(tenant, task_id)
-            except Exception as exc2:                        # noqa: BLE001 —— 确认键亦失败：仅记录
-                logger.error("work_memory.snapshot_flag_finished failed: %s", exc2)
+        try:
+            await self._impl.snapshot_flag_finished(tenant, task_id)
+        except Exception as exc2:                        # noqa: BLE001 —— 确认键亦失败：仅记录
+            logger.error("work_memory.snapshot_flag_finished failed: %s", exc2)
+
+    async def snapshot_mark_abandoned(self, tenant: str, task_id: str) -> None:
+        """H1（2026-10-04）：取消/异常路径把快照标 ``cancelled``（H1 的修复落点）。
+
+        与 ``snapshot_mark_finished`` 同款"不走吞异常路径"：置位失败 ⇒ 快照停在
+        ``running`` ⇒ 下次被当崩溃残留**自动续接**。但**兜底不写完成确认键**——
+        那个键的语义是"已完成"，用它兜底等于把取消谎报成完成。
+        失败只记 ERROR（调用方在取消上下文里，拿不到更好的处置）。
+        """
+        if not self._impl:
+            return
+        fn = getattr(self._impl, "snapshot_mark_abandoned", None)
+        if fn is None:                       # 旧/裸实现没有该方法 ⇒ 跳过（不劣化）
+            return
+        try:
+            await fn(tenant, task_id)
+        except Exception as exc:             # noqa: BLE001
+            logger.error("work_memory.snapshot_mark_abandoned failed: %s", exc)
 
 
 __all__ = ["WorkMemory", "InMemoryWorkMemory", "RedisWorkMemory", "WorkMemoryLike"]

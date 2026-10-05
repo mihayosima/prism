@@ -3,15 +3,26 @@ name = "agent-runtime"
 version = "0.1.0"
 description = "Agent — slim Cordis-style runtime（everything-is-a-plugin）；独立可自举。"
 requires-python = ">=3.10"
+
+# ★ 2026-10-04：依赖从"只有下限"改为"**上下界区间**"。
+# 原先全是 `>=`，意味着上游任何破坏性升级都会直接打到生产（构建不可复现）。
+# 区间写法：`>=` 保灵活性（能吃到补丁/次版本修复），`<` 挡住破坏性大版本。
+#
+# ★ **真正的可复现靠 requirements.lock**（`uv pip compile` 生成，含全部传递依赖）。
+# 本文件表达"允许的区间"，锁文件表达"本次验证过的确切版本"。两者缺一不可：
+# 只有区间 → 每次装出来都可能不同；只有锁文件 → 升依赖要手工改多处。
+#
+# 重新生成锁：`uv pip compile pyproject.toml --python-version 3.12 -o requirements.lock`
+# （--no-header 不写命令注释，便于 diff；带 dev 依赖时加 `--all-extras`）
 dependencies = [
-    "fastapi>=0.139",
-    "uvicorn>=0.51",
-    "httpx>=0.28",
-    "redis>=5.0",
+    "fastapi>=0.142,<1.0",
+    "uvicorn>=0.54,<1.0",
+    "httpx>=0.28,<1.0",
+    "redis>=5.0,<9.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "fakeredis>=2.0"]
+dev = ["pytest>=9.0,<10.0", "fakeredis>=2.0,<3.0"]
 
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -24,3 +35,32 @@ include = ["agent*"]
 [tool.pytest.ini_options]
 testpaths = ["agent/tests"]
 addopts = "-q"
+
+# ---------------------------------------------------------------------------
+# ruff（2026-10-04 新增）：零 lint 是明账欠债，先上**不改变现有行为**的一档。
+# ---------------------------------------------------------------------------
+# 选这一档而不是全套规则：项目已有 600+ 用例做行为兜底，lint 的价值在于
+# **抓人眼抓不到的**（未用导入、变量遮蔽、裸 except、f-string 里的空位），
+# 而不是|style|争议项。全开 E/W/F 会产出成百上千条历史噪声 ⇒ 治理成本压倒收益。
+#
+# 故意**不开**的规则及原因：
+#   E501 行长 —— 中文注释 + 长 SQL，放宽到 120；
+#   E731/E741 等风格项 —— 与本项目"注释即文档"的风格冲突；
+#   F401 在 __init__.py 的 re-export 上要靠 per-file-ignores 单独放行。
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+exclude = [".workbuddy", "langgraph input", "web", "data"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "B"]     # 语法/未用名/潜在 bug；**不含** E501
+ignore = [
+    "B008",    # 函数默认值里调函数（FastAPI 的 Depends/File 惯用法）——项目必用
+    "B904",    # raise ... from ——我们**刻意**在少数处用裸 raise 保留原异常
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 插件/包入口大量 re-export：__all__ 里列出的名字在别处 import 用，属正常
+"agent/api.py" = ["F401"]
+"agent/plugins/*/__init__.py" = ["F401"]
+"agent/tests/*" = ["F401", "B011"]

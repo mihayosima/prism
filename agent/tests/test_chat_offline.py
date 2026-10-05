@@ -78,3 +78,41 @@ def test_chat_honest_when_no_key(monkeypatch, tmp_path):
         await c.teardown()
 
     _run(s())
+
+def test_chat_background_tasks_are_tracked_and_drained(tmp_path):
+    """★ 后台任务必须**被持有并追踪**：裸 ``create_task`` 不持引用 ⇒ 可能被 GC 中途
+    回收、teardown 也不等它 ⇒ 压缩静默丢失（表现为"历史有时没压缩"）。
+
+    与 ``core/events.py`` 的 ``_tasks`` + ``aclose()`` 同一纪律；此处对称落地到 chat。
+    """
+    from agent.sys.chat import ChatDriver
+
+    d = ChatDriver()
+    started = False
+
+    async def slow():
+        nonlocal started
+        started = True
+        await asyncio.sleep(10)
+
+    async def s():
+        d._spawn_bg(slow())
+        await asyncio.sleep(0)                 # 让任务真正启动
+        assert started, "后台任务没跑起来"
+        assert len(d._bg) == 1, "在途任务未被登记 ⇒ 等于没追踪"
+        await d.drain()
+        assert not d._bg, "drain 后仍残留登记 ⇒ 没等到/没取消"
+
+    _run(s())
+
+
+def test_chat_teardown_drains_background_tasks(tmp_path):
+    """端到端：容器 teardown 走 effect ⇒ 后台任务被收干净（不留悬挂写库）。"""
+    c = build_agent(config=_cfg(tmp_path))
+
+    async def s():
+        await c.assemble()
+        await c.root.chat.send(c.root, "ping 健康检查")
+        await c.teardown()                     # 收尾必须不抛、不挂
+
+    _run(s())

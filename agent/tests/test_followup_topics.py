@@ -518,9 +518,15 @@ def test_tool_domains_registered_in_settings():
     assert srv._coerce_setting("tool_domains", []) == []
     assert srv._coerce_setting("tool_domains", "plugins.windows_mcp") == ["plugins.windows_mcp"]
 
-    # 陷阱回归：默认值若写成 None，_coerce_setting 会把 None 收成字符串 "None"
-    assert srv._coerce_setting("tool_domains", None) == ["None"], \
-        "此断言记录该陷阱本身；故 _SETTING_DEFAULTS 必须是 [] 而非 None"
+    # 陷阱回归（2026-10-04 改为「陷阱已修」）：
+    # 原实现把 ``None`` 收成字符串 ``"None"``（幽灵项）；此处**曾**断言 ``== ["None"]``，
+    # 借这个副作用来提醒「_SETTING_DEFAULTS 必须是 [] 而非 None」。
+    # 副作用式守卫的致命问题是：**陷阱被修好的那天，守卫也一起失效**。
+    # 现改为直接断言默认值本身——防护更明确，且不依赖任何缺陷行为。
+    assert srv._coerce_setting("tool_domains", None) == [], \
+        "None 必须当空列表，不能产生字面量 'None' 幽灵项"
+    assert srv._SETTING_DEFAULTS["tool_domains"] == [], \
+        "默认值必须是 [] 而非 None（否则设置页会渲染出一个 None 候选项）"
     assert srv._coerce_setting("tool_domains", srv._SETTING_DEFAULTS["tool_domains"]) == []
 
 

@@ -34,7 +34,18 @@ class SystemMemory:
         cfg = ((ctx.config or {}).get("agent") or {}).get("system_memory") or {}
         # 外部目录配置 → 完全覆盖默认目录（非合并）
         text = load_system_memory(cfg.get("dir"))
+        self._text = text
+        self._dir = cfg.get("dir")
         ctx.provide(Services.SYSTEM_MEMORY, text)
+
+    async def status(self, ctx) -> dict:
+        """运行态：加载了多少叙事、来自哪个目录（空目录是"配错了"的常见形态，须可见）。"""
+        text = getattr(self, "_text", "")
+        return {
+            "chars": len(text or ""),
+            "empty": not (text or "").strip(),
+            "dir": getattr(self, "_dir", None) or "(默认目录)",
+        }
 
 
 __all__ = ["SystemMemory", "load_system_memory", "DEFAULT_DIR"]

@@ -21,7 +21,7 @@ import logging
 import os
 import shutil
 
-from agent.api import Services, StateKeys, plugin
+from agent.api import Services, StateKeys, current_session_key, plugin
 from agent.api import McpStdioClient, build_task_schema
 
 logger = logging.getLogger("agent.plugins.playwright_mcp")
@@ -93,10 +93,40 @@ class PlaywrightMcp:
         self._lock = asyncio.Lock()
 
     def _spawn(self, cfg: dict) -> McpStdioClient:
-        """按配置造一个客户端（含 S4 stderr 接线）。"""
+        """按配置造一个客户端（含 S4 stderr 接线 + 可选落点收拢）。"""
         command, args, timeout = resolve(cfg, os.environ)
-        return McpStdioClient(command, args, dict(cfg.get("env") or {}),
-                              timeout_s=timeout, on_stderr=_on_stderr)
+        env = dict(cfg.get("env") or {})
+        cwd = self._workspace()
+        if cwd:
+            env.update(cwd.get("env") or {})
+            logger.info("playwright_mcp 落点收拢：cwd=%s", cwd.get("cwd"))
+        return McpStdioClient(command, args, env, timeout_s=timeout,
+                              on_stderr=_on_stderr, cwd=(cwd or {}).get("cwd"))
+
+    def _workspace(self) -> dict | None:
+        """取沙箱落点接缝（2026-10-04）：声明了档位 ⇒ 把子进程挪出项目根。
+
+        沙箱未装配 / ``mode=none`` ⇒ ``None`` ⇒ 行为与今天完全一致（opt-in，不劣化）。
+        接缝故障**不得拖垮桥启动**（沙箱是增强维度，不是硬前提）。
+        """
+        if self._ctx is None:
+            return None
+        # ★ 用 getattr 取而不是直接 ``self._ctx.get(...)``：部分装配/测试桩的 ctx 未必
+        # 实现 ``get``。沙箱是**增强维度**，缺了就退回无落点，绝不能把桥启动搞崩。
+        getter = getattr(self._ctx, "get", None)
+        if not callable(getter):
+            return None
+        try:
+            fn = getter(Services.CHILD_SPAWN_OPTIONS)
+        except Exception:                       # noqa: BLE001
+            return None
+        if not callable(fn):
+            return None
+        try:
+            return fn(current_session_key(self._ctx))
+        except Exception:                       # noqa: BLE001 —— 沙箱故障 ⇒ 退回无落点
+            logger.warning("playwright_mcp 取沙箱落点失败 ⇒ 沿用宿主 cwd")
+            return None
 
     async def apply(self, ctx) -> None:
         cfg = (ctx.config or {}).get("playwright_mcp") or {}

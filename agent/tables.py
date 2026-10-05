@@ -19,6 +19,9 @@ _EVENTS = [
     " request_id TEXT, run_id TEXT, session TEXT)",
     "CREATE INDEX IF NOT EXISTS idx_agent_events_event ON agent_events(event)",
     "CREATE INDEX IF NOT EXISTS idx_agent_events_request ON agent_events(request_id)",
+    # 6.5（2026-10-04）：会话/run 维度查询（行级隔离的 /api/events 与 run 维度排查）补足索引。
+    "CREATE INDEX IF NOT EXISTS idx_agent_events_session ON agent_events(session)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_events_run ON agent_events(run_id)",
 ]
 _BUDGET = [
     "CREATE TABLE IF NOT EXISTS agent_budget_log ("
@@ -32,9 +35,15 @@ _MEMORIES = [
     "CREATE TABLE IF NOT EXISTS agent_memories ("
     " id TEXT PRIMARY KEY, kind TEXT, content TEXT, entity_ids TEXT,"
     " score_observed REAL, last_accessed_at TEXT, accessed_count INTEGER,"
-    " created_at TEXT, valid_at TEXT, invalid_at TEXT, source TEXT, extra TEXT)",
+    " created_at TEXT, valid_at TEXT, invalid_at TEXT, source TEXT, extra TEXT,"
+    " session TEXT)",
     "CREATE INDEX IF NOT EXISTS idx_agent_memories_kind ON agent_memories(kind)",
     "CREATE INDEX IF NOT EXISTS idx_agent_memories_last ON agent_memories(last_accessed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_memories_session ON agent_memories(session)",
+    # 6.5（2026-10-04）：召回按 ``session`` 过滤 + ``last_accessed_at`` 排序，
+    # 单列索引各自独立无法同时满足「过滤+排序」，大表下退化为全扫+排序。补复合索引。
+    "CREATE INDEX IF NOT EXISTS idx_agent_memories_session_last "
+    "ON agent_memories(session, last_accessed_at)",
 ]
 _ENTITIES = [
     "CREATE TABLE IF NOT EXISTS agent_entities ("
@@ -47,7 +56,11 @@ _EDGES = [
 ]
 _MESSAGES = [
     "CREATE TABLE IF NOT EXISTS agent_messages ("
-    " seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, at TEXT)",
+    " seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT, at TEXT,"
+    # 6.3（2026-10-04）：这两列原经迁移 agent_012 的裸 ALTER 追加；裸 ALTER 在「列已存在」的
+    # 存量库上会 duplicate column ⇒ MigrationRegistry 整组回滚 ⇒ 服务起不来。改为 DDL 直接带上
+    # （新库一次建好），旧库由 short_term 插件装配期容错 ALTER 补（与 BUDGET_LOG_FIELDS 同款）。
+    " token_count INTEGER, compressed_into INTEGER)",
     "CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id, seq)",
 ]
 
@@ -59,11 +72,12 @@ _SUMMARIES = [
     " covers_up_to_seq INTEGER, tokens INTEGER, updated_at TEXT)",
 ]
 
-# 扩展 agent_messages：token_count（写入时预估，供预算）+ compressed_into（标记被哪版摘要覆盖）。
-# 以 ALTER 追加（幂等：迁移名未应用才执行），兼容已建旧库（agent_010 不含这两列）。
-_MSG_FIELDS = [
-    "ALTER TABLE agent_messages ADD COLUMN token_count INTEGER",
-    "ALTER TABLE agent_messages ADD COLUMN compressed_into INTEGER",
+# agent_messages 扩展列（2026-10-04：与 BUDGET_LOG_FIELDS / EVENTS_EXTRA_COLUMNS / MEMORIES_EXTRA_COLUMNS
+# 同款取舍）。定义收口本文件（表结构真相源归一），执行由 short_term 插件装配期容错跑
+# （幂等：已存在即跳过），兼容「更旧的、建表时尚无该列」的库。
+MESSAGE_FIELDS = [
+    ("token_count", "INTEGER"),
+    ("compressed_into", "INTEGER"),
 ]
 
 # agent_budget_log 的记账明细列（F2/P3：缓存命中 / 思考 token / 会话归属）。
@@ -108,7 +122,9 @@ MIGRATIONS = [
     ("agent_009_edges", _per("sqlite", *_EDGES), "记忆关系边"),
     ("agent_010_messages", _per("sqlite", *_MESSAGES), "会话转写（短期记忆：session_id + role/content 时序）"),
     ("agent_011_session_summaries", _per("sqlite", *_SUMMARIES), "短期记忆滚动摘要（covers_up_to_seq 覆盖非 kept 历史）"),
-    ("agent_012_message_fields", _per("sqlite", *_MSG_FIELDS), "agent_messages 扩 token_count + compressed_into（兼容旧库 ALTER）"),
+    # 6.3（2026-10-04）：原 ALTER 已下移为 short_term 插件装配期的容错补列（见 MESSAGE_FIELDS）；
+    # 此处保留迁移名（no-op）仅为兼容「已应用过该名」的存量库，避免防脏武校验误判 stray ⇒ 拒绝启动。
+    ("agent_012_message_fields", _per("sqlite"), "agent_messages 扩 token_count + compressed_into（兼容旧库 ALTER·已下移为容错补列）"),
 ]
 
 # ``agent_events`` 的补列（路线图 #5 可观测性：让一次请求的痕迹可串联）
@@ -134,5 +150,27 @@ EVENTS_REQUEST_INDEX = (
     "CREATE INDEX IF NOT EXISTS idx_agent_events_request ON agent_events(request_id)"
 )
 
-__all__ = ["MIGRATIONS", "BUDGET_LOG_FIELDS", "EVENTS_EXTRA_COLUMNS",
-           "EVENTS_REQUEST_INDEX"]
+# ``agent_memories`` 的会话归属列（2026-10-04：长期记忆会话化）。
+#
+# 与 ``EVENTS_EXTRA_COLUMNS`` **同一套取舍**（DDL 给新库 + 容错 ALTER 补旧库）：
+# ``MigrationRegistry.apply`` 无容错、失败整组回滚，而 ``ADD COLUMN`` 在已补过的库上
+# 报 duplicate column ⇒ 整组回滚 ⇒ **服务起不来**。故不写成迁移条目。
+#
+# 语义（**必须记住，否则会误判召回结果**）：
+#   ``session`` = ``{user}:{session}``（与 ``core/session.py`` 同源）
+#   **NULL / 空串 = 无归属**（存量行，或显式声明为跨会话共享）
+# 召回规则见 ``plugins/memory``：本会话优先，无归属行仍可见 —— 这样**存量记忆不会
+# 因为加了列而凭空消失**，同时新增记忆严格按会话隔离（根治跨会话串味）。
+# 「还有多少行没有归属」由 ``stats()['unscoped']`` **可见**，不静默。
+MEMORIES_EXTRA_COLUMNS = [
+    ("session", "TEXT"),
+]
+
+# 补列之后建索引（存量库走这条；新库已在 _MEMORIES 里建好，IF NOT EXISTS 幂等）。
+MEMORIES_SESSION_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_agent_memories_session ON agent_memories(session)"
+)
+
+__all__ = ["MIGRATIONS", "BUDGET_LOG_FIELDS", "MESSAGE_FIELDS", "EVENTS_EXTRA_COLUMNS",
+           "EVENTS_REQUEST_INDEX", "MEMORIES_EXTRA_COLUMNS",
+           "MEMORIES_SESSION_INDEX"]

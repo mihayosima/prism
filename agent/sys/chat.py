@@ -192,6 +192,31 @@ class ChatReply:
 class ChatDriver:
     """ctx.chat —— 会话/问答驱动。"""
 
+    def __init__(self) -> None:
+        #: 在途后台任务（压缩/重建）——**必须持有引用并追踪**。
+        #: 此前是裸 ``asyncio.create_task(...)``：不持有引用就可能被 GC 中途回收，
+        #: teardown 也不会等它 ⇒ 压缩静默丢失（表现为"历史有时没压缩"）。
+        #: 与 ``core/events.py`` 的 ``_tasks`` + ``aclose()`` 同一纪律。
+        self._bg: set = set()
+
+    def _spawn_bg(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+        return task
+
+    async def drain(self) -> None:
+        """收尾：取消并等待在途后台任务（对称卸载，不留悬挂写库）。"""
+        pending = [t for t in self._bg if not t.done()]
+        for t in pending:
+            t.cancel()
+        for t in pending:
+            try:
+                await t
+            except BaseException:                 # noqa: BLE001 —— 取消/任务自身异常均吞
+                pass
+        self._bg.clear()
+
     async def send(self, ctx, message: str, session_id: str = "default",
                    identity: SessionIdentity | None = None) -> ChatReply:
         """``identity``：2.2 会话/租户身份（适配层解析后显式线程化；缺省按 session_id 退化）。"""
@@ -252,7 +277,7 @@ class ChatDriver:
             "ok": ok, "error": reply_error, "session_id": session_id, "at": now_iso(),
         })
         if ctx.has(Services.SHORT_TERM):
-            asyncio.create_task(self._safe_compress(ctx, session_id))
+            self._spawn_bg(self._safe_compress(ctx, session_id))
         return ChatReply(text=text, plan=plan, evidence=evidence,
                          tokens_in=ti, tokens_out=to, ok=ok, error=reply_error,
                          session_id=session_id)
@@ -351,7 +376,7 @@ class ChatDriver:
             "session_id": session_id, "at": now_iso(),
         })
         if ctx.has(Services.SHORT_TERM):
-            asyncio.create_task(self._safe_compress(ctx, session_id))
+            self._spawn_bg(self._safe_compress(ctx, session_id))
         return ChatReply(text=text, plan={"intent": "react"}, evidence=res.as_evidence(),
                          tokens_in=res.tokens_in, tokens_out=res.tokens_out, ok=res.ok,
                          error=None if res.ok else res.reason, session_id=session_id,
@@ -756,7 +781,10 @@ class Chat:
     description = "对话驱动：意图规划 → 执行(guard) → LLM 解说"
 
     async def apply(self, ctx) -> None:
-        ctx.provide(Services.CHAT, ChatDriver())
+        driver = ChatDriver()
+        ctx.provide(Services.CHAT, driver)
+        # 对称收尾：取消/等待在途后台任务（否则压缩写库会在 teardown 后悬挂或被丢弃）
+        ctx.effect(driver.drain)
 
 
 __all__ = ["Chat", "ChatDriver", "ChatReply", "is_resume_intent"]

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent.api import Container, coerce_config, validate_config
+from agent.api import DEFAULT_DB_PATH, Container, coerce_config, validate_config
 from agent.sys.budget import Budget
 from agent.sys.chat import Chat
 from agent.sys.events_plugin import EventsPlugin
@@ -29,7 +29,8 @@ from agent.sys.storage import Storage
 from agent.sys.tasks import TasksPlugin
 
 BASE_AGENT_CONFIG: dict = {
-    "db_path": "data/agent.db",
+    # 真源在 core/config_schema.DEFAULT_DB_PATH（勿在此硬编码，避免两处漂移）
+    "db_path": DEFAULT_DB_PATH,
     "agent": {
         "llm": {"provider": "fixture", "model": "fixture", "stream": True,
                 "max_tokens": 8192},   # E：显式生成上限（不设则服务端默认 8K 腰斩长参数）

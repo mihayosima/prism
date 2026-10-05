@@ -32,6 +32,13 @@ class Services:
     SHORT_TERM = "short_term"
     WINDOWS_MCP = "windows_mcp"
     PLAYWRIGHT_MCP = "playwright_mcp"
+    #: **子进程启动选项**接缝（2026-10-04）：``(session_key) -> {"cwd":..., "env":{...}} | None``。
+    #:
+    #: ★ **为什么是中性名字**：桥（MCP 插件）只依赖内核契约，**不该知道**背后是谁在管隔离
+    #: （今天是沙箱，将来可能是受限令牌后端或别的 confinement 实现）。若键名带具体提供方，
+    #: 就把桥和某一实现焊死了 —— 换实现要改桥，正是解耦要避免的。
+    #: 桥侧因此消费的是"内核定义的机制"，提供方是**可替换**的；未装配 ⇒ None ⇒ 不劣化。
+    CHILD_SPAWN_OPTIONS = "mcp.child_spawn_options"
 
 
 # 全部“内核服务键”值集合（供 AST 契约测试比对）
@@ -54,6 +61,7 @@ ALL = frozenset(
         Services.SHORT_TERM,
         Services.WINDOWS_MCP,
         Services.PLAYWRIGHT_MCP,
+        Services.CHILD_SPAWN_OPTIONS,
     }
 )
 

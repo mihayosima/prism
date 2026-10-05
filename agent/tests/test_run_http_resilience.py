@@ -171,7 +171,12 @@ def test_unhandled_exception_returns_json_500(served_app):
 
     assert r.status_code == 500
     assert r.headers["content-type"].startswith("application/json")
-    assert r.json() == {"error": "boom-for-verification", "kind": "RuntimeError"}
+    # ★ 2026-10-04 硬化：未捕获的**意外**异常不得回显内部消息（含栈/路径/密钥/SQL），
+    # 改为通用体 + request_id；完整异常仅留服务端 traceback（见 _on_unhandled）。
+    body = r.json()
+    assert body["error"] == "服务内部错误，请稍后重试或凭 request_id 报障"
+    assert "request_id" in body and body["request_id"], "必须带 request_id 便于报障"
+    assert "boom-for-verification" not in body["error"], "内部异常消息不得回显给客户端"
 
 
 def test_http_exception_shape_unchanged(served_app):
@@ -184,3 +189,48 @@ def test_http_exception_shape_unchanged(served_app):
     assert r.status_code == 404
     assert r.headers["content-type"].startswith("application/json")
     assert r.json() == {"detail": "Not Found"}
+
+
+# ---------------------------------------------------------------------------
+# H2（2026-10-04）：同会话并发护栏
+# ---------------------------------------------------------------------------
+# 缺陷：``/api/chat`` 此前既不登记 ``active_runs`` 也不查会话忙不忙；
+# ``/api/chat/stream`` 只登记不查 ⇒ 同一会话连发两条 ⇒ 两个 run 抢同一个
+# ``react_chain:{session_key}``（互相覆盖），且后一个请求的 ``_probe_resume``
+# 会把**正在跑的**前一个标 orphaned。两条都是静默错误。
+
+def test_session_busy_detects_same_session_only():
+    """纯函数口径：同会话命中、跨会话不命中。"""
+    from agent.run.chat import _session_busy
+
+    runs = {"r1": (None, "u:A"), "r2": (None, "u:B")}
+    assert _session_busy(runs, "u:A") == "r1"
+    assert _session_busy(runs, "u:B") == "r2"
+    assert _session_busy(runs, "u:C") is None
+    assert _session_busy(runs, "") is None
+    assert _session_busy({}, "u:A") is None
+
+
+def test_both_chat_endpoints_guard_and_register(served_app):
+    """★ 两个对话端点都必须 **查忙 + 登记**（源码级守卫）。
+
+    ⚠️ 为什么不用端到端打请求：``TestClient`` **不跑 lifespan** ⇒ 容器未 assemble
+    ⇒ ``/api/chat`` 依赖容器的部分直接 500（``ctx[agent] 读取: 服务 'config' 未提供``）。
+    那是**夹具局限、不是生产缺陷**（要真验需起真实 uvicorn）⇒ 这里退到源码级断言，
+    语义校验交给上面的纯函数用例。
+    """
+    from pathlib import Path as _P
+    src = (_P(__file__).resolve().parent.parent / "run" / "chat.py").read_text(
+        encoding="utf-8")
+    # ★ 2026-10-04：查忙+登记已收口为原子的 ``_acquire_session_run``（修复 H2-TOCTOU），
+    # 两个端点都须走它（内部含 ``_session_busy`` 查忙 + ``active_runs`` 登记）。
+    assert src.count("_acquire_session_run(active_runs, ident.session_key)") >= 2, \
+        "/api/chat 与 /api/chat/stream 都必须经原子登记（查忙+登记一体，防 TOCTOU）"
+    assert 'status_code=409' in src, "忙时必须 409 诚实拒绝（排队会让用户以为没反应）"
+    assert '"code": "session_busy"' in src, "409 响应需带机器可读 code"
+    # 非流式也必须登记（否则它查不到别人、自己也无法被取消）。
+    # 登记动作现统一收进 ``_acquire_session_run``，内部用参数名 ``session_key``：
+    assert "active_runs[run_id] = (marker, session_key)" in src,         "原子登记必须注册占位 marker ⇒ 否则查不到别人、自己也无法被取消"
+    assert "active_runs.pop(run_id, None)" in src, "登记后必须清理（否则 busy 永为真）"
+    # 顺带补上的能力缺口：非流式现在回 run_id ⇒ 那轮可被 /api/chat/cancel 取消
+    assert '"run_id": run_id' in src, "非流式响应应带 run_id（否则无法被取消端点定位）"

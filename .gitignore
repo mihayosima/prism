@@ -11,6 +11,11 @@ agent/tests/.pt/
 agent/tests/.pytest-*/
 # 仓库根下同样可能生成（--basetemp=.pytest-xxx 从项目根跑时）
 /.pytest-*/
+# 本项目常用的临时 basetemp 前缀（.pt-* / .pt-xxx）。
+# ★ 为什么要显式列出：`--basetemp` 是**可任意命名**的，靠 `/.pytest-*/` 兜不住；
+# 未忽略时它们会混进 `git status`，几次之后就没人看 status 了。
+/.pt-*/
+.pt-*/
 agent_runtime.egg-info/
 .playwright-mcp/
 

@@ -28,11 +28,34 @@ from pathlib import Path
 
 from agent.api import (AgentError, SESSION_CFG_VIEW, Services, SessionIdError,
                        StateKeys, bind_request_id, configure_logging,
-                       counters_snapshot, inc_counter, make_identity,
-                       set_current_session_key)
+                       counters_snapshot, current_request_id, inc_counter,
+                       make_identity, set_current_session_key)
 from agent.profiles import BASE_AGENT_CONFIG, build_agent
 from agent.run.config_store import ConfigStore
 from agent.sys.progress import tap_progress
+
+#: 服务器入口的 SQLite 库路径（``--db`` 默认��）。
+#:
+#: ⚠️ **刻意不同于** ``core/config_schema.DEFAULT_DB_PATH``（``data/agent.db``），不是笔误：
+#:   - 后者服务 ``build_agent()`` 的离线/嵌入式用法（含 ``test_event_wiring`` 等不传
+#:     ``config`` 的装配）——它们会真实连上项目根的库文件；
+#:   - 长驻服务器若共用同一个文件，会与上述用法争 WAL、且被离线写入污染服务端账本。
+#: 两库 schema 完全相同（同一套 ``MIGRATIONS``），换入口即可，无需迁移。
+DEFAULT_CHAT_DB_PATH = "data/agent_chat.db"
+
+#: SSE 帧队列容量（H4，2026-10-04）。与 ``sys/progress.py::tap_progress`` 的自建默认值
+#: 保持一致（1024）：token 高频流 + 慢消费者不再无限占内存。
+#: 满了走既有丢帧策略（丢最旧保新帧 + ``queue.dropped`` 计数），**不阻断业务主链路**。
+_STREAM_QUEUE_MAXSIZE = 1024
+
+#: 会话 run 登记锁（H2-TOCTOU 修复，2026-10-04）：``check-busy → register`` 必须原子，
+#: 否则同会话并发两条请求可双双通过忙检、各自登记 ⇒ 两个 run 抢同一会话链互相覆盖。
+#: 放在模块级：本服务进程内单实例，无需按容器分桶。
+_RUN_LOCK = asyncio.Lock()
+
+#: 后台容器重建任务登记（`_bg_rebuild` 经 `create_task` 发起）：仅用于退出时观测/排障，
+#: 不阻塞主链路；任务完成自动从集合移除。
+_BG_TASKS: set[asyncio.Task] = set()
 
 # 本模块开了 ``from __future__ import annotations`` ⇒ 路由签名里的注解是**字符串**，
 # FastAPI 用**模块全局**解析它们。故 ``Request``/``HTTPException`` 必须在模块级可见，
@@ -51,7 +74,7 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--model", default="deepseek-flash",
                    help="deepseek 模型名（线上支持 deepseek-flash / deepseek-v4-pro）")
     p.add_argument("--fixture", action="store_true", help="强制离线夹具（不触真 API）")
-    p.add_argument("--db", default="data/agent_chat.db")
+    p.add_argument("--db", default=DEFAULT_CHAT_DB_PATH)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8720)
     p.add_argument("--once", default=None, help="无头模式：跑一条消息后退出并打印")
@@ -342,7 +365,13 @@ def _coerce_setting(key: str, raw):
             raise ValueError(f"{key} 须 ∈ {spec[1]}")
         return val
     if kind == "list":                                     # 列表：ask 名单（fnmatch）
-        if isinstance(raw, str):
+        # ★ ``None`` 必须视为「空」而不是 ``["None"]``（2026-10-04 修）：
+        # 前端把未填写的设置项以 ``null`` 提交时，原实现会落一个字面量 ``"None"`` 幽灵条目
+        # ——对 ``approval.ask``（工具名 fnmatch 名单）/ ``tool_domains`` 这类键，
+        # 表现为"多出一个永远匹配不到（或叫 None）的域"，且用户看不见来源。
+        if raw is None:
+            parts = []
+        elif isinstance(raw, str):
             parts = raw.replace("，", ",").replace("、", ",").split(",")
         elif isinstance(raw, (list, tuple)):
             parts = list(raw)
@@ -536,6 +565,13 @@ async def _obs_middleware(request, call_next):
     要看该请求的会话，查 ``/api/events?request_id=<rid>`` 的 ``session`` 列。
     """
     rid = bind_request_id()
+    # 同时把 rid 暂存到 ``request.state``：ContextVar 在 ``BaseHTTPMiddleware`` 把下游
+    # 跑在**另一个 task** 时不会回流到异常处理器上下文，直接读 ``current_request_id()``
+    # 会拿到空串。异常处理器/端点改从 ``request.state.rid`` 取（兜底 current_request_id）。
+    try:
+        request.state.rid = rid
+    except Exception:                              # noqa: BLE001 —— state 不可写不应阻断
+        pass
     inc_counter("agent_requests_total")
     log = logging.getLogger("agent.access")
     started = time.perf_counter()
@@ -557,6 +593,97 @@ async def _obs_middleware(request, call_next):
              getattr(getattr(request, "url", None), "path", "?"),
              resp.status_code, (time.perf_counter() - started) * 1000)
     return resp
+
+
+def _req_rid(request) -> str:
+    """从 ``request.state.rid`` 取请求标识（obs 中间件写入），兜底 ``current_request_id()``。
+
+    ★ 为什么不用裸 ``current_request_id()``：``BaseHTTPMiddleware`` 把路由处理跑在独立 task，
+    异常处理器上下文里 ContextVar 可能已回退为空串；``request.state.rid`` 在同一次请求内
+    始终可读（异常处理器拿到的就是同一个 request 对象）。
+    """
+    rid = getattr(getattr(request, "state", None), "rid", "") or ""
+    return rid or current_request_id()
+
+
+async def _security_headers_middleware(request, call_next):
+    """#4 生产级安全响应头（2026-10-04）。
+
+    刻意做成模块级函数（与 ``_obs_middleware`` 同理由），便于单测直接调用。
+
+    - ``X-Content-Type-Options: nosniff``：阻止 MIME 嗅探（防 content-sniffing XSS）。
+    - ``X-Frame-Options: DENY``：禁止被嵌入 iframe（防 clickjacking）。
+    - 对 ``/api/`` 数据面额外加：
+        * ``Cache-Control: no-store``：响应含会话/事件等敏感数据，禁止任何缓存落盘；
+        * ``Content-Security-Policy: default-src 'none'``：API 只返回 JSON，不需要任何
+          子资源加载，收紧到最小（即便有注入点也无法加载外部脚本）。
+
+    说明：HSTS 仅在 HTTPS 部署时有意义，本地/内网多为 http，故此处不强制加，避免
+    误导运维；HTTPS 反向代理侧应自行加 ``Strict-Transport-Security``。
+    """
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    path = getattr(getattr(request, "url", None), "path", "")
+    if path.startswith("/api/"):
+        resp.headers.setdefault("Cache-Control", "no-store")
+        if "content-security-policy" not in resp.headers:
+            resp.headers["Content-Security-Policy"] = "default-src 'none'"
+    return resp
+
+
+def _session_busy(active_runs: dict, session_key: str) -> str | None:
+    """该会话是否已有 run 在跑；是则返回那个 run_id（否则 None）。
+
+    ★ H2（2026-10-04）：同会话并发是**真实可达**的（单用户连发两条消息即可），
+    后果有二，两条都是静默错误：
+      1. 两个 run 抢同一个 ``react_chain:{session_key}`` ⇒ 链互相覆盖；
+      2. 后一个请求的 ``_probe_resume`` 看到前一个的 ``running`` 快照 ⇒ 把它标
+         ``orphaned``，而那个 run **还在跑**。
+    故入口处查一次、忙则 409 诚实拒绝（排队会让用户以为"没反应"）。
+
+    实现上刻意**反查现有 ``active_runs``** 而不另建一张表：
+    少一份状态、且天然与取消端点共用同一真相（不会出现"表里有、run 表里没有"）。
+
+    ★ 顺带修掉一个能力缺口：``/api/chat``（非流式）此前**不登记** ``active_runs``
+    ⇒ 它既查不到别人、也**无法被 ``/api/chat/cancel`` 取消**。现已登记。
+    """
+    if not session_key:
+        return None
+    for rid, entry in list(active_runs.items()):
+        try:
+            _task, owner = entry
+        except (TypeError, ValueError):       # pragma: no cover —— 形状异常不阻塞入口
+            continue
+        if owner == session_key:
+            return rid
+    return None
+
+
+async def _acquire_session_run(active_runs: dict, session_key: str):
+    """★ H2-TOCTOU 修复（2026-10-04）：原子的「查忙 → 登记」。
+
+    此前 ``/api/chat`` 与 ``/api/chat/stream`` 先在入口 ``_session_busy`` 查忙，
+    再在**若干 await 之后**才 ``active_runs[run_id] = ...`` 登记占位/真实任务。
+    两条同会话请求可双双通过忙检、各自登记 ⇒ 两个 run 抢同一 ``react_chain``、
+    后者还会把前者标 orphaned。
+
+    本函数用 ``_RUN_LOCK`` 把「查忙 + 登记占位 marker」包成原子段：
+    任一时刻只有一个协程能进入，登记完成前别的请求查到的仍是「未登记」，
+    故第二个请求必然命中 busy 分支拿 409。
+
+    返回：
+      ``("ok", run_id, marker)``         —— 登记成功，marker 是占位任务（稍后由调用方替换为真实 task）
+      ``("busy", busy_run_id, None)``    —— 该会话已有 run 在跑，调用方应回 409 并带上 busy_run_id
+    """
+    async with _RUN_LOCK:
+        busy = _session_busy(active_runs, session_key)
+        if busy is not None:
+            return ("busy", busy, None)
+        run_id = uuid.uuid4().hex[:8]
+        marker = asyncio.ensure_future(asyncio.sleep(0))   # 占位任务，立即被替换
+        active_runs[run_id] = (marker, session_key)
+        return ("ok", run_id, marker)
 
 def _register_probes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse,
                     _session_cfg, JSONResponse, Request, StreamingResponse):
@@ -660,18 +787,47 @@ def _register_probes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse
 
     @app.post("/api/chat")
     async def _chat(body: dict, request: Request):
+        """非流式对话。
+
+        ★ H2（2026-10-04）：本端点此前**既不登记 active_runs、也不查会话是否在跑**
+        ⇒ 同一会话连发两条 ⇒ 两个 run 抢 ``react_chain:{session_key}`` 互相覆盖，
+        且第二个请求的 ``_probe_resume`` 会把**正在跑的**第一个 run 标 orphaned。
+        现与流式端点同规则：登记 + 忙则 409。
+        """
         ident = _identity(request, body)
+        acq = await _acquire_session_run(active_runs, ident.session_key)
+        if acq[0] == "busy":
+            return JSONResponse(
+                {"error": "该会话还有一轮任务在执行中，请等待完成或先取消",
+                 "code": "session_busy", "run_id": acq[1]},
+                status_code=409)
+        _tag, run_id, marker = acq
         try:
             reply = await c.root.chat.send(c.root, str(body.get("message") or ""),
                                            session_id=ident.session_key,
                                            identity=ident)
             return JSONResponse({"text": reply.text, "ok": reply.ok, "error": reply.error,
                                  "notice": reply.notice,
+                                 "run_id": run_id,
                                  "evidence": {"plan": reply.plan, "evidence": reply.evidence,
                                               "tokens_in": reply.tokens_in,
                                               "tokens_out": reply.tokens_out}})
-        except Exception as exc:  # noqa: BLE001 —— 回显给前端，不裸崩
-            return JSONResponse({"error": str(exc)}, status_code=500)
+        except AgentError as exc:                       # 内核受控错误：消息本身面向用户，可回显
+            rid = _req_rid(request)
+            _err_log.warning("AgentError @ /api/chat session=%s rid=%s: %s",
+                             ident.session_key, rid, exc)
+            return JSONResponse({"error": str(exc), "kind": type(exc).__name__,
+                                 "request_id": rid}, status_code=500)
+        except Exception as exc:                        # noqa: BLE001 —— 内部错误不裸泄
+            rid = _req_rid(request)
+            _err_log.exception("未捕获异常 @ /api/chat session=%s rid=%s",
+                               ident.session_key, rid)
+            return JSONResponse({"error": "服务内部错误，请稍后重试或凭 request_id 报障",
+                                 "request_id": rid}, status_code=500)
+        finally:
+            active_runs.pop(run_id, None)
+            if not marker.done():
+                marker.cancel()
 
     @app.post("/api/chat/stream")
     async def _chat_stream(body: dict, request: Request):
@@ -682,27 +838,71 @@ def _register_probes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse
 
         2.2：会话标识经 ``X-Session-Id`` 请求头（本端点是 fetch POST，可自定义头；
         与 EventSource 不同，无需退化到 query）。
+
+        ★ H2（2026-10-04）：同会话已有 run 在跑时**诚实拒绝 409**（见 ``/api/chat`` 的说明）。
         """
         ident = _identity(request, body)
+        acq = await _acquire_session_run(active_runs, ident.session_key)
+        if acq[0] == "busy":
+            return JSONResponse(
+                {"error": "该会话还有一轮任务在执行中，请等待完成或先取消",
+                 "code": "session_busy", "run_id": acq[1]},
+                status_code=409)
+        _tag, run_id, marker = acq
         message = str(body.get("message") or "")
-        run_id = uuid.uuid4().hex[:8]
-        q: asyncio.Queue = asyncio.Queue()
+        # ★ H4（2026-10-04）：此处曾传**无界**队列，绕过了 ``sys/progress.py`` 自建队列的
+        # 1024 丢帧保护（``tap_progress`` 文档写明"传入自定义 queue 时以其实际容量为准"）
+        # ⇒ 慢客户端/断连时 token 高频帧无限堆积，吃满内存。
+        # 现在有界；``_push`` 满时丢最旧并计数（既有机制），worker 的终止帧另走
+        # ``_put_terminal``（**不能阻塞**：满时也丢最旧，保证 final/error/cancelled 一定送出）。
+        q: asyncio.Queue = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
+
+        async def _put_terminal(frame: dict) -> None:
+            """放终止帧：满了丢最旧再放，**绝不 await 阻塞**。
+
+            ★ 为什么不能直接 ``await q.put``：队列满时它会挂住 ⇒ worker 永不返回 ⇒
+            run 永远停在 active_runs 里（且取消端点也拿不到终态）。
+            """
+            try:
+                q.put_nowait(frame)
+                return
+            except asyncio.QueueFull:
+                pass
+            try:
+                q.get_nowait()                      # 丢最旧一帧
+                q.put_nowait(frame)
+                q.dropped = getattr(q, "dropped", 0) + 1
+            except Exception:                      # noqa: BLE001 —— 极端情况不阻断主链路
+                pass
 
         async def _worker() -> None:
             try:
                 reply = await c.root.chat.send(c.root, message,
                                                session_id=ident.session_key,
                                                identity=ident)
-                await q.put({"event": "final", "payload": {
+                await _put_terminal({"event": "final", "payload": {
                     "text": reply.text, "ok": reply.ok, "error": reply.error,
                     "notice": reply.notice,
                     "evidence": {"plan": reply.plan, "evidence": reply.evidence,
                                  "tokens_in": reply.tokens_in, "tokens_out": reply.tokens_out}}})
             except asyncio.CancelledError:
-                await q.put({"event": "cancelled", "payload": {"run_id": run_id}})
+                await _put_terminal({"event": "cancelled", "payload": {"run_id": run_id}})
                 raise                                  # 保持取消语义，不吞
-            except Exception as exc:                   # noqa: BLE001
-                await q.put({"event": "error", "payload": {"error": str(exc)}})
+            except AgentError as exc:                  # 内核受控错误：消息面向用户，可回显
+                rid = _req_rid(request)
+                _err_log.warning("AgentError @ /api/chat/stream run=%s rid=%s: %s",
+                                 run_id, rid, exc)
+                await _put_terminal({"event": "error",
+                                     "payload": {"error": str(exc),
+                                                 "kind": type(exc).__name__,
+                                                 "request_id": rid}})
+            except Exception as exc:                   # noqa: BLE001 —— 内部错误不裸泄
+                rid = _req_rid(request)
+                _err_log.exception("未捕获异常 @ /api/chat/stream run=%s rid=%s",
+                                   run_id, rid)
+                await _put_terminal({"event": "error",
+                                     "payload": {"error": "服务内部错误，请稍后重试或凭 request_id 报障",
+                                                 "request_id": rid}})
 
         async def _gen():
             task: asyncio.Task | None = None
@@ -710,6 +910,8 @@ def _register_probes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse
                 yield _sse("start", {"run_id": run_id})
                 # 先订阅（不漏帧），再起任务
                 async with tap_progress(c.root, queue=q):
+                    if not marker.done():
+                        marker.cancel()                # 占位任务使命结束，换真实 task
                     task = asyncio.create_task(_worker())
                     active_runs[run_id] = (task, ident.session_key)
                     try:
@@ -724,8 +926,12 @@ def _register_probes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse
                             task.cancel()              # 断连/提前退出 → 取消，防孤儿
             except asyncio.CancelledError:
                 return                                 # 客户端断连：不逃逸，任务已在 finally 取消
-            except Exception as exc:                   # noqa: BLE001
-                yield _sse("error", {"error": str(exc)})
+            except Exception as exc:                   # noqa: BLE001 —— 内部错误不裸泄
+                rid = _req_rid(request)
+                _err_log.exception("未捕获异常 @ /api/chat/stream gen run=%s rid=%s",
+                                   run_id, rid)
+                yield _sse("error", {"error": "服务内部错误，请稍后重试或凭 request_id 报障",
+                                     "request_id": rid})
 
         return StreamingResponse(_gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
@@ -868,13 +1074,18 @@ def _register_approval(app, c, *, active_runs, pm, _identity, _apply_rebuild, _s
                 "budget": _budget_view(c.root, ident, budget_cfg)}
 
     @app.get("/api/events")
-    async def _events(request_id: str = "", limit: int = 120) -> dict:
+    async def _events(request: Request, request_id: str = "", limit: int = 120) -> dict:
         """durable 事件账本（倒序）。
 
         #5：``request_id`` 非空时**只回该请求的痕迹**——这就是"可排查、可串联"的落点：
         拿到响应头 ``X-Request-Id``（或用户报障给的 id）即可拉出那一轮的全部事件。
+
+        ★ 生产级多租户隔离（2026-10-04）：``request_id`` 为空时**不再回吐全局账本**
+        （那会把所有会话的事件一次性泄露给任意调用方），改为只回**本会话**最近事件
+        （行级 ``WHERE session=?``）。要跨请求串联想用 ``request_id`` 精确查。
         ``limit`` 上限 500（防一次拉爆；``agent_events`` 无 per-request 索引退化保护）。
         """
+        ident = _identity(request)                    # 解析身份（同时绑定请求作用域）
         cap = max(1, min(500, int(limit)))
         if request_id:
             rows = await c.root.db.query(
@@ -884,14 +1095,21 @@ def _register_approval(app, c, *, active_runs, pm, _identity, _apply_rebuild, _s
         else:
             rows = await c.root.db.query(
                 c.root, "SELECT seq, event, payload, at, request_id, run_id, session"
-                        " FROM agent_events ORDER BY seq DESC LIMIT ?", (cap,))
-        return {"rows": rows, "request_id": request_id or None}
+                        " FROM agent_events WHERE session=? ORDER BY seq DESC LIMIT ?",
+                (ident.session_key, cap))
+        return {"rows": rows, "request_id": request_id or None,
+                "session": ident.session_key}
 
     # ---- G2.0（P3-1）：Inspector ``/context`` 视图（纯只读旁路，不 import 插件内部）----
 
     @app.get("/api/context")
-    async def _context_view(limit: int = 60) -> dict:
-        """把 governed 遥测合并为**轮次全景账本**并渲染 ``/context`` 分类视图（薄封装）。"""
+    async def _context_view(request: Request, limit: int = 60) -> dict:
+        """把 governed 遥测合并为**轮次全景账本**并渲染 ``/context`` 分类视图（薄封装）。
+
+        ★ 2026-10-04：补 ``_identity(request)`` 解析身份——与 ``/api/perms`` 同理由，
+        未绑定请求作用域会让 ContextVar 落到上一次聊天的会话残留态，视图口径不确定。
+        """
+        _identity(request)                        # 解析身份（副作用：绑定请求作用域）
         return await _context_view_payload(c.root, limit=limit)
 
     @app.get("/api/perms")
@@ -926,7 +1144,10 @@ def _register_approval(app, c, *, active_runs, pm, _identity, _apply_rebuild, _s
         return JSONResponse({"ok": True, "cleared": cleared})
 
     @app.get("/api/tools")
-    async def _tools() -> dict:
+    async def _tools(request: Request) -> dict:
+        # ★ 2026-10-04：补 ``_identity(request)`` —— 与全量 /api 路由一致地解析请求作用域，
+        # 避免 ContextVar 落到上一次聊天的会话残留态。
+        _identity(request)
         return {"tools": c.root.tasks.catalog()}
 
     # ---- 记忆（分层总览：系统 / 短期 / 工作 + 长期子块） ----
@@ -1061,7 +1282,10 @@ def _register_resources(app, c, *, active_runs, pm, _identity, _apply_rebuild, _
         # 避免管理请求长时间阻塞、前端“点了没反应”。前端会显示“处理中…”并在稍后自动刷新。
         res = await _plugins()
         if background:
-            asyncio.create_task(_bg_rebuild())
+            # 登记到模块级集合：退出时可观测/排障；任务完成自动移除（add_done_callback）。
+            _bg = asyncio.create_task(_bg_rebuild())
+            _BG_TASKS.add(_bg)
+            _bg.add_done_callback(_BG_TASKS.discard)
             return res
         try:
             await _apply_rebuild()
@@ -1153,6 +1377,12 @@ def _register_resources(app, c, *, active_runs, pm, _identity, _apply_rebuild, _
                 "sandbox_gap": bool(sb_status.get("gap")),
                 "sandbox_targets": sb_status.get("targets") or ["mcp.*"],
                 "sandbox_reason": sb_status.get("reason", ""),
+                # ★ 落点（2026-10-04）：声明档位时，外部工具子进程被挪到会话私有目录
+                # （cwd + 缓存/临时目录重定向）。与 `enforcement` **分开**报——重定向
+                # **不是**强制（绝对路径仍可写别处），报成 partial 才是谎报。
+                # 这两个字段只回答一件事："东西落在哪"。
+                "sandbox_workspace": sb_status.get("workspace", ""),
+                "sandbox_env_redirected": bool(sb_status.get("env_redirected")),
                 "values": values,
                 "session_id": sk,
                 "scopable": sorted(_SETTING_SCOPABLE),
@@ -1353,15 +1583,21 @@ async def _serve(args: argparse.Namespace) -> int:
 
     @app.exception_handler(AgentError)
     async def _on_agent_error(request: Request, exc: AgentError) -> JSONResponse:
-        _err_log.error("AgentError @ %s: %s", request.url.path, exc)
-        return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
-                            status_code=500)
+        # AgentError 是内核**受控**错误族（消息本就面向用户，如「能力未就绪/被策略拦截」），
+        # 故仍回显其消息；但补 request_id 便于报障，并在服务端落完整日志（含路径）。
+        rid = _req_rid(request)
+        _err_log.error("AgentError @ %s rid=%s: %s", request.url.path, rid, exc)
+        return JSONResponse({"error": str(exc), "kind": type(exc).__name__,
+                             "request_id": rid}, status_code=500)
 
     @app.exception_handler(Exception)
     async def _on_unhandled(request: Request, exc: Exception) -> JSONResponse:
-        _err_log.exception("未捕获异常 @ %s", request.url.path)
-        return JSONResponse({"error": str(exc), "kind": type(exc).__name__},
-                            status_code=500)
+        # ★ 生产级：未捕获的**意外**异常绝不回显 str(exc)（可能含栈帧/路径/密钥/SQL），
+        # 改为通用体 + request_id；完整异常仅留服务端 traceback（_err_log.exception）。
+        rid = _req_rid(request)
+        _err_log.exception("未捕获异常 @ %s rid=%s", request.url.path, rid)
+        return JSONResponse({"error": "服务内部错误，请稍后重试或凭 request_id 报障",
+                             "request_id": rid}, status_code=500)
 
     # ---- #5 可观测性：每请求绑定 request id ---------------------------------
     # 装在**所有路由之外**的中间件里 ⇒ 无论端点是否经 ``_identity`` 解析身份
@@ -1372,6 +1608,8 @@ async def _serve(args: argparse.Namespace) -> int:
     # 实现见模块级 ``_obs_middleware``（抽成模块级函数才能被单测直接调用——
     # ``_serve`` 返回时容器已 teardown，无法在进程内对其发真实请求）。
     app.middleware("http")(_obs_middleware)
+    # ---- #4 安全响应头（见模块级 ``_security_headers_middleware``）----
+    app.middleware("http")(_security_headers_middleware)
 
     # ---- B3.1 跨域（opt-in）------------------------------------------------
     # 默认「不启用」：沿用 dev 下的 Vite proxy（同源），零行为变化。
@@ -1549,6 +1787,30 @@ async def _serve(args: argparse.Namespace) -> int:
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
+        # ---- 优雅退出：先排空在跑的会话任务，再 teardown（避免孤儿进程/半截写入）----
+        # 关 SIGTERM 后 uvicorn 已停止 accept，但已建立的流式连接在 ``task`` 取消时才断；
+        # 这里显式取消 active_runs 里未完的 run（chat/stream 的 cancel 在 finally 收尾），
+        # 等它们干净退出再 teardown（其中含 MCP 子进程的回收）。
+        _svc_log.warning("draining in-flight runs before teardown (%d active)",
+                         len(active_runs))
+        _pending = [t for (t, _owner) in active_runs.values()
+                    if isinstance(t, asyncio.Task) and not t.done()]
+        for t in _pending:
+            t.cancel()
+        for t in _pending:
+            try:
+                await asyncio.wait_for(t, timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
+        # 后台容器重建任务也一并等待（最多再给 5s），避免 teardown 时它还在动容器
+        _bg = [t for t in list(_BG_TASKS) if not t.done()]
+        if _bg:
+            _svc_log.warning("waiting for %d background rebuild task(s)", len(_bg))
+            for t in _bg:
+                try:
+                    await asyncio.wait_for(t, timeout=5)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):  # noqa: BLE001
+                    pass
         await c.teardown()
     return 0
 

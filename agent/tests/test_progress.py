@@ -123,3 +123,39 @@ def test_cancel_mid_tool_is_recorded_as_cancelled(tmp_path):
             await c.teardown()
 
     _run(s())
+
+
+# ---------------------------------------------------------------------------
+# H4（2026-10-04）：SSE 队列必须有界
+# ---------------------------------------------------------------------------
+# 缺陷：``/api/chat/stream`` 传的是**无界** ``asyncio.Queue()``，而
+# ``tap_progress`` 文档写明"传入自定义 ``queue`` 时以其实际容量为准"
+# ⇒ **绕过了**自建队列的 1024 丢帧保护。慢客户端/断连时 token 高频帧无限堆积。
+
+def test_stream_queue_is_bounded():
+    """守卫：流式端点用的队列**必须有界**（源码级，防回归回无界）。"""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "run" / "chat.py").read_text(
+        encoding="utf-8")
+    assert "asyncio.Queue()" not in src, \
+        "run/chat.py 出现了无界 asyncio.Queue() ⇒ 绕过丢帧保护，慢客户端可吃满内存"
+    assert "maxsize=_STREAM_QUEUE_MAXSIZE" in src
+    assert "_STREAM_QUEUE_MAXSIZE = 1024" in src
+
+
+def test_bounded_queue_drops_oldest_and_keeps_newest():
+    """有界 + 慢消费者：丢最旧、保新帧、计数可见（复用生产 _pusher 的真实实现）。"""
+    from agent.sys.progress import _pusher
+
+    async def s():
+        q: asyncio.Queue = asyncio.Queue(maxsize=4)
+        push = _pusher(q, "agent/llm/token")
+        for i in range(10):
+            push({"i": i})                    # 远快于消费
+        assert q.qsize() == 4, f"队列应被限住，实际 {q.qsize()}"
+        assert getattr(q, "dropped", 0) == 6, f"丢帧未计数：{getattr(q, 'dropped', 0)}"
+        got = [await q.get() for _ in range(4)]
+        assert [g["payload"]["data"]["i"] for g in got] == [6, 7, 8, 9], \
+            "应保留最新帧（丢最旧）"
+
+    _run(s())

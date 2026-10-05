@@ -88,6 +88,37 @@ export const ENFORCEMENT_BADGES: Record<string, { text: string; color: string; t
   },
 }
 
+/**
+ * 子进程落点块（2026-10-04）。
+ *
+ * ★ 与上面的强度徽标**刻意分开**，措辞上强调"这不是保护强度"：
+ * 落点收窄（cwd + 缓存目录重定向）只让**相对路径**的写入落在会话私有目录，
+ * **绝对路径仍然写得进去**。把它并进"强度"一栏就会让人以为受保护了 ——
+ * 那正是本项目此前最大的误导源。
+ */
+function sandboxWorkspaceBlock(j: SettingsResponse): string {
+  const on = j.sandbox_env_redirected === true
+  const ws = String(j.sandbox_workspace || '')
+  if (!on) {
+    return (
+      '<div class="muted" style="margin-top:12px;padding:10px 12px;border:1px solid var(--line);border-radius:8px">' +
+      '子进程落点：<b>未收窄</b>（随宿主工作目录）。声明档位（mode ≠ none）后会把外部工具子进程挪到会话私有目录。' +
+      '</div>'
+    )
+  }
+  return (
+    '<div style="margin-top:12px;padding:10px 12px;border:1px solid var(--line);border-radius:8px">' +
+    '<div style="font-weight:600">子进程落点：已收窄到会话私有目录</div>' +
+    '<code style="display:block;margin-top:6px;word-break:break-all">' +
+    esc(ws) +
+    '</code>' +
+    '<div class="muted" style="margin-top:8px">' +
+    '外部工具子进程的 <code>cwd</code> 与缓存/临时目录指向此处。<b>这不是隔离强度</b>：' +
+    '它只收窄相对路径的写入落点，<b>绝对路径仍然写得进去</b> —— 强度看上方的徽标。' +
+    '</div></div>'
+  )
+}
+
 /** 准入名单四键的中文标签（归属已改 guard：sys/guard.py 是策略唯一持有者） */
 export const GUARD_FIELD_LABELS: Record<string, string> = {
   targets: '管辖范围 targets（工具名模式，逗号分隔）',
@@ -565,6 +596,7 @@ export function renderSettingsHtml(j: SettingsResponse, scope: SettingsScope = '
       '<div class="muted" style="' +
       HINT +
       '">本层只自述 <code>mcp.*</code> 域（隔离是<b>按桥</b>配置的：每个 MCP 桥一个子进程）。改管辖范围请用上一张卡的 <code>targets</code>。</div></label>' +
+      sandboxWorkspaceBlock(j) +
       '</div>'
   }
 

@@ -83,9 +83,12 @@ def test_on_references_real_constants():
     assert on_consts <= valid, f"ctx.on 引用了非 Events 常量：{on_consts - valid}"
 
 
-def test_assemble_verifies_wiring():
+def test_assemble_verifies_wiring(tmp_path):
     from agent.profiles import build_agent
-    c = build_agent()                       # 默认 verify_wiring=True
+    # ★ 必须显式给 db_path（2026-10-04）：不传则落到 ``DEFAULT_DB_PATH``
+    # = 项目根的 ``data/agent.db``，装配会真实连上并建表——测试污染仓库内的真实库文件
+    # （表现：跑完测试多出一个库/被写入，而用例本身与持久化毫无关系）。
+    c = build_agent(config={"db_path": str(tmp_path / "agent.db")})   # 默认 verify_wiring=True
     _run(c.assemble())
     bus = c.root.get(Services.EVENTS)
     # LLM_PRE_CALL 由 guard + budget 挂（≥1）；TASKS_PRE_EXECUTE 由 guard 挂（≥1）

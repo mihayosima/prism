@@ -19,6 +19,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Callable
 
 from .errors import EventWiringError
+from .obs import inc_counter
 
 if TYPE_CHECKING:
     from .context import Context
@@ -66,12 +67,26 @@ class _Listener:
 class EventBus:
     """ctx.events —— 事件总线。注册走 ctx.on（挂 ctx 作用域）；分发走 ctx.events.<mode>。"""
 
-    def __init__(self, strict_payload: bool = True, required_seams: set = set()):
+    #: fire-and-forget 在途任务上限。**超出即丢弃并计数**（2026-10-04）。
+    #: 默认 256：当前生产监听器数量远低于此 ⇒ 正常态**永不触发**，
+    #: 只在"高频事件 × 大量异步监听器"这种异常形态下兜住内存增长。
+    DEFAULT_MAX_INFLIGHT = 256
+
+    def __init__(self, strict_payload: bool = True, required_seams: set = set(),
+                 max_inflight: int | None = None):
         self._listeners: dict[str, list[_Listener]] = {}
         self._seq = 0
         self.strict_payload = strict_payload
         self._required_seams: set = set(required_seams)
         self._tasks: set[asyncio.Task] = set()   # 在途 fire-and-forget 任务（K4a 追踪）
+        self._max_inflight = int(max_inflight or self.DEFAULT_MAX_INFLIGHT)
+        #: 因超过上限而被**丢弃**的监听器次数（非 0 即说明出现过事件洪峰）
+        self.dropped = 0
+
+    @property
+    def inflight(self) -> int:
+        """当前在途 fire-and-forget 任务数（诊断用）。"""
+        return len(self._tasks)
 
     # ---------- 注册 ----------
 
@@ -105,13 +120,30 @@ class EventBus:
     # ---------- 分发：双模式 ----------
 
     async def emit(self, name: str, *args: Any) -> None:
-        """遥测/审计：同步按注册序、async 并发 fire（fire-and-forget）；错误互不影响。"""
+        """遥测/审计：同步按注册序、async 并发 fire（fire-and-forget）；错误互不影响。
+
+        ★ 在途任务有**上限**（2026-10-04）：此前只登记不设 cap ⇒ 高频事件遇到慢的
+        异步监听器时会无界堆积。超限时**丢弃该监听器并计数**——
+        刻意**不排队、不阻塞**：``emit`` 的契约就是"不 await"，
+        阻塞会把遥测发射变成背压点，反过来拖慢业务主链路。
+        ★ 丢弃是**不诚实的**（那一帧遥测/审计就没了），所以必须可见：
+        ``dropped`` 计数 + ``agent_events_dropped_total`` 指标。
+        ⚠️ **不影响 waterfall**：闸门链是 ``await`` 的、有 ``required_seams`` 兜底，
+        不经过这条路径 ⇒ 限流永远不会"悄悄打开闸门"。
+        """
         if self.strict_payload:
             _assert_pure_data(args, f"emit({name!r})")
         for entry in self._snapshot(name):
             if entry.ctx.closed:
                 continue
             if entry.is_async:
+                if len(self._tasks) >= self._max_inflight:
+                    self.dropped += 1
+                    inc_counter("agent_events_dropped_total")
+                    logger.warning(
+                        "emit(%r) 在途监听器已满（%d）⇒ 丢弃一个异步监听器（遥测有缺）",
+                        name, self._max_inflight)
+                    continue
                 task = asyncio.create_task(self._guarded(entry, name, args))
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)

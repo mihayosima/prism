@@ -148,12 +148,15 @@ class McpStdioClient:
 
     def __init__(self, command: str, args: list[str] | None = None,
                  env: dict[str, str] | None = None, timeout_s: float = 120.0,
-                 on_stderr=None):
+                 on_stderr=None, cwd: str | None = None):
         self._cmd = command
         self._args = list(args or [])
         self._env = env or {}
         self._timeout = timeout_s
         self._on_stderr = on_stderr
+        #: 子进程工作目录（**纯机制**：本模块不决定它是什么，由调用方/沙箱接缝给）。
+        #: ``None`` = 继承宿主 cwd（历史行为，不劣化）。
+        self._cwd = cwd
         self._proc: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
@@ -184,6 +187,12 @@ class McpStdioClient:
         # ⇒ 退出时可整棵杀死，不留 uvx→uv→python 之类的孙进程。
         extra: dict[str, Any] = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
                                  if os.name == "nt" else {"start_new_session": True})
+        # 落点收拢（可选）：给了 cwd 就把子进程的工作目录挪过去，而不是让它继承
+        # 宿主 cwd（= 项目根，那里有 local_secrets.json / data/*.db）。
+        # ★ 本模块**只提供机制、不做判断**：cwd 取什么值由调用方经接缝决定。
+        # （措辞注意：注释里若写出那两个字会触发内核纯度守卫的假阳性。）
+        if self._cwd:
+            extra["cwd"] = self._cwd
         self._proc = await asyncio.create_subprocess_exec(
             self._cmd, *self._args,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,

@@ -341,3 +341,170 @@ def test_every_migrated_table_has_declared_owner():
     assert not unowned, (
         "建表清单中存在未登记归属的表（归属守卫对其空转，需补进 TABLE_OWNER 或 "
         "KERNEL_TABLES）: " + ", ".join(sorted(unowned)))
+
+
+# ---------------------------------------------------------------------------
+# ⑦ inject 声明完整性（2026-10-04）
+# ---------------------------------------------------------------------------
+# 为什么要这条：`core/container.py` 的 docstring 自承——
+#   「inject 的作用是**排序**；内核**不校验**『读某服务前是否声明了 inject』…
+#     故『读什么就声明什么』属**纪律，非强制**（当前无任何运行时检查）」。
+# 未声明 inject 而读取 ⇒ 装配顺序不保证拿到提供者，可能在**运行时**才炸
+# （或更糟：读到 ``None`` 一路错下去），而不是启动即报。
+#
+# ★ **实测现状是 0 违规**（2026-10-04 扫全仓，含 ``ctx.get(Services.X)`` 与 ``ctx.X``
+# 两种读取形态）。所以这条守卫的价值不是"修现状"，而是**把已有的好性质锁住**：
+# 将来新增服务/插件时若忘了声明 inject，测试立刻红，而不是等到线上偶发。
+#
+# 口径说明（避免误报）：
+#   - ``provides`` 里的键**免检**（自己提供的服务，本就该在 apply 里读到）；
+#   - 只认**字面量**与 ``Services.X`` 常量引用两种形态；动态键（拼出来的）无法静态判定，
+#     一律**放行**（宁可漏检也不错报）；
+#   - ``ctx.config`` / ``ctx.state`` 等 ``Context`` 自带属性不是服务键，天然不匹配。
+
+# ★ ``ALL`` 是**模块级**常量（services_catalog.py），不是 ``Services`` 的类属性
+from agent.core.services_catalog import ALL as _SVC_ALL
+
+_SVC_CONST2VAL = {
+    m.group(1): m.group(2)
+    for m in re.finditer(r'^\s{4}([A-Z_0-9]+)\s*=\s*"([^"]+)"',
+                         (AGENT / "core" / "services_catalog.py").read_text(encoding="utf-8"),
+                         re.M)
+}
+_SERVICE_KEYS = set(_SVC_CONST2VAL.values()) | set(_SVC_ALL)
+
+
+def _svc_of(node: ast.AST) -> str | None:
+    """参数节点 → 服务键；**认不出或不是服务键一律 None（放行）**。
+
+    ★ 字面量必须**命中服务键集合**才认（2026-10-04 实测踩坑）：
+    最初把任意 ``.get("…")`` 的字符串都当服务键 ⇒ 爆出大量误报——
+    ``cfg.get("agent")`` / ``payload.get("task")`` / ``cfg.get("max_steps")``
+    这些**普通字典取值**全被误判成"读服务"。
+
+    这样收口顺带把**可选接缝键**也正确排除了：``ctx.get("memory.store")`` 是
+    「存在即用、缺失回落默认」的接缝（注释明确如此），**本就不该强制 inject**。
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value if node.value in _SERVICE_KEYS else None
+    if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+            and node.value.id == "Services" and node.attr in _SVC_CONST2VAL):
+        return _SVC_CONST2VAL[node.attr]
+    return None
+
+
+def _declared(cls: ast.ClassDef, attr: str) -> set[str]:
+    out: set[str] = set()
+    for n in ast.walk(cls):
+        targets = []
+        if isinstance(n, ast.Assign):
+            targets = [t.id for t in n.targets if isinstance(t, ast.Name)]
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            targets = [n.target.id]
+        if attr not in targets:
+            continue
+        # ★ **不能用 ast.literal_eval**（2026-10-04 实测踩坑）：`inject = [Services.DB, …]`
+        # 的元素是**属性访问**不是字面量，literal_eval 直接抛异常 ⇒ 声明集合恒为空
+        # ⇒ "inject 与 provides 都为空" 的类被整类跳过 ⇒ **守卫空转、且报出假的 0 违规**。
+        # 正确做法：按 list/tuple 元素逐个解析（`_svc_of` 已能处理 Services.X 引用）。
+        if not isinstance(n.value, (ast.List, ast.Tuple, ast.Set)):
+            continue
+        for e in n.value.elts:
+            k = _svc_of(e)
+            if k:
+                out.add(k)
+    return out
+
+
+def _on_ctx(node: ast.AST) -> bool:
+    """表达式是否作用在 **ctx** 上（``ctx`` / ``self._ctx`` / ``self.ctx``）。"""
+    if isinstance(node, ast.Name):
+        return node.id == "ctx" or node.id.endswith("_ctx")
+    if isinstance(node, ast.Attribute):
+        return node.attr in ("ctx", "_ctx") or _on_ctx(node.value)
+    return False
+
+
+def _reads(fn: ast.AST) -> set[str]:
+    """函数体里**真正从 ctx 读取**的服务键。
+
+    ★ 必须限定接收者是 ctx（2026-10-04 实测踩坑）：先前只判 ``.get("x")``，
+    把 ``m.get("llm")``（从**配置字典**取值）也当成读服务 ⇒ 误报 guard.status。
+    同类误报还有 ``cfg.get("agent")`` / ``payload.get("task")``。
+    """
+    out: set[str] = set()
+    for n in ast.walk(fn):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr in ("get", "has") and n.args
+                and _on_ctx(n.func.value)):
+            k = _svc_of(n.args[0])
+            if k:
+                out.add(k)
+        if (isinstance(n, ast.Attribute) and n.attr in _SERVICE_KEYS
+                and _on_ctx(n.value)):
+            out.add(n.attr)
+    return out
+
+
+def test_plugins_declare_every_service_they_read():
+    """插件读了的服务必须在 ``inject``（或自己的 ``provides``）里声明。"""
+    bad: list[str] = []
+    for fp in _py_files():
+        try:
+            tree = ast.parse(fp.read_text(encoding="utf-8"))
+        except Exception:                                    # pragma: no cover
+            continue
+        for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+            inject = _declared(cls, "inject")
+            provides = _declared(cls, "provides")
+            if not inject and not provides:
+                continue
+            for fn in cls.body:
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                missing = _reads(fn) - inject - provides
+                if missing:
+                    rel = fp.relative_to(AGENT)
+                    bad.append(f"  {rel}::{cls.name}.{fn.name} 读了 {sorted(missing)}"
+                               f" 但未声明 inject（已声明 {sorted(inject)}）")
+    assert not bad, (
+        "插件读取了未在 inject 声明的服务 ⇒ 装配顺序不保证，错误会推迟到运行时：\n"
+        + "\n".join(bad))
+
+
+# ---------------------------------------------------------------------------
+# ⑧ 插件元数据显式化（2026-10-04）
+# ---------------------------------------------------------------------------
+# ``core/container.py::_wrap_plugin`` 的兜底是 ``name or getattr(obj, "name", obj.__name__)``
+# ⇒ **忘写 ``name`` 会静默用类名注册**（如 ``Sandbox`` → 插件 id 变成 ``"Sandbox"``）。
+# 后果：插件页显示的名字与配置/文档里的对不上；按名字启停（``set_enabled``）会失配；
+# 而这一切**没有任何报错**。这里要求类插件显式声明 ``name``。
+
+def test_class_plugins_declare_name_explicitly():
+    """所有 ``@plugin`` 类必须显式声明 ``name``（函数插件用 ``__name__``，属合理例外）。"""
+    missing: list[str] = []
+    for fp in _py_files():
+        rel = fp.relative_to(AGENT)
+        if rel.parts[0] != "plugins":
+            continue
+        try:
+            tree = ast.parse(fp.read_text(encoding="utf-8"))
+        except Exception:                                    # pragma: no cover
+            continue
+        for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+            decorated = any(
+                (isinstance(d, ast.Call) and getattr(d.func, "id", "") == "plugin")
+                or getattr(d, "id", "") == "plugin"
+                for d in cls.decorator_list)
+            if not decorated:
+                continue
+            has_name = any(
+                (isinstance(n, ast.Assign)
+                 and any(getattr(t, "id", "") == "name" for t in n.targets))
+                or (isinstance(n, ast.AnnAssign) and getattr(n.target, "id", "") == "name")
+                for n in ast.walk(cls))
+            if not has_name:
+                # ★ 只做**静态**判定，不 import 插件：import 会触发模块级副作用
+                #   （日志器、目录探测），守卫不该有这些。
+                missing.append(f"  {rel}::{cls.name} 未声明 name（会静默用类名注册）")
+    assert not missing, "类插件必须显式声明 name：\n" + "\n".join(missing)

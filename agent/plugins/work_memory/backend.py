@@ -74,6 +74,9 @@ class WorkMemoryLike(Protocol):
     async def snapshot_list(self, tenant: str, prefix: str | None = None) -> list[dict]: ...
     async def snapshot_mark_finished(self, tenant: str, task_id: str) -> None: ...
     async def snapshot_flag_finished(self, tenant: str, task_id: str) -> None: ...
+    #: 取消/异常路径专用（H1）：把 ``running`` 挪到 ``cancelled``。
+    #: 老实现没有该方法时，调用方（react loop）会**跳过**并记计数——不劣化、不崩。
+    async def snapshot_mark_abandoned(self, tenant: str, task_id: str) -> None: ...
 
 
 class InMemoryWorkMemory:
@@ -207,6 +210,25 @@ class InMemoryWorkMemory:
         except Exception:                       # noqa: BLE001
             return
         data["status"] = "finished"
+        self._snap[key] = (exp, json.dumps(data, ensure_ascii=False))
+
+    async def snapshot_mark_abandoned(self, tenant: str, task_id: str) -> None:
+        """H1：取消/异常路径把 ``running`` → ``cancelled``。
+
+        ★ 为什么非 ``finished`` 不可：把取消标成"已完成"是对状态的**谎报**——审计里
+        查不到"这个 run 是被中断的"。而 ``_probe_resume`` 只认 ``status=="running"``，
+        标成 ``cancelled`` 同样能阻止它被当崩溃残留自动续接，但**保留了真相**。
+        """
+        key = _snap_key(tenant, task_id)
+        entry = self._snap.get(key)
+        if entry is None:
+            return
+        exp, raw = entry
+        try:
+            data = json.loads(raw)
+        except Exception:                       # noqa: BLE001
+            return
+        data["status"] = "cancelled"
         self._snap[key] = (exp, json.dumps(data, ensure_ascii=False))
 
     async def snapshot_flag_finished(self, tenant: str, task_id: str) -> None:
@@ -346,6 +368,20 @@ class RedisWorkMemory:
             return
         data["status"] = "finished"
         # 重设 TTL（收尾后快照寿命回归 snapshot_ttl；不用 keepttl 以规避 fakeredis 兼容性）
+        await self._r.set(key, json.dumps(data, ensure_ascii=False),
+                          ex=self._snapshot_ttl)
+
+    async def snapshot_mark_abandoned(self, tenant: str, task_id: str) -> None:
+        """H1：取消/异常路径 → ``cancelled``（不标 finished：那是谎报，见 InMemory 版说明）。"""
+        key = _snap_key(tenant, task_id)
+        raw = await self._r.get(key)
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except Exception:                       # noqa: BLE001
+            return
+        data["status"] = "cancelled"
         await self._r.set(key, json.dumps(data, ensure_ascii=False),
                           ex=self._snapshot_ttl)
 

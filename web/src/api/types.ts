@@ -282,6 +282,16 @@ export interface SettingsResponse {
   sandbox_targets?: string[]
   /** 自述理由（人类可读，排查"为什么没保护"的唯一线索） */
   sandbox_reason?: string
+  /**
+   * ★ 落点（2026-10-04）：声明档位时，外部工具子进程被挪到该目录
+   * （cwd + 缓存/临时目录重定向）。空串 = 未重定向（`mode=none`）。
+   *
+   * ⚠️ **它不代表"受保护"**：重定向挡不住绝对路径写入。与 `sandbox_enforcement`
+   * 分开报正是为了不让人把"东西落在哪"误读成"隔离有多强"。
+   */
+  sandbox_workspace?: string
+  /** 是否真的做了环境重定向（与 `sandbox_workspace` 配套，避免靠路径猜） */
+  sandbox_env_redirected?: boolean
   /** 当前请求落在哪个会话键（`{user}:{session}`） */
   session_id?: string
   /** 允许写到「本会话」层的设置键白名单（G2 会话级化） */

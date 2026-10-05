@@ -70,7 +70,11 @@ class Approval:
     version = "0.4.0"
     layer = "system"
     provides = [Services.APPROVAL]
-    inject = [Services.EVENTS, Services.DB]
+    # ★ 2026-10-04 补 ``Services.TASKS``：``apply`` / ``_sync_submit_plan`` 里注册钩子用
+    # ``ctx.tasks.register(...)``，此前**读了却没声明** ⇒ 装配顺序只是"碰巧对"
+    # （sys 插件先装），不是契约保证。``tasks`` 由 ``SYS_PLUGINS`` 常驻提供，
+    # 声明它**不会**破坏 opt-in（规则 2：内核服务可声明，只有别的插件提供的才不可）。
+    inject = [Services.EVENTS, Services.DB, Services.TASKS]
     tables = ()                     # 审计走现成 agent_events，不自建表 ⇒ 卸载零残留
 
     async def apply(self, ctx) -> None:
