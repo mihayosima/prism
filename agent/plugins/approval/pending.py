@@ -22,8 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 DENY_TIMEOUT = {"approved": False, "by": "timeout"}
 DENY_SHUTDOWN = {"approved": False, "by": "shutdown"}

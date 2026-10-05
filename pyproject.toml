@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=9.0,<10.0", "fakeredis>=2.0,<3.0"]
+dev = ["pytest>=9.0,<10.0", "pytest-cov>=6.0,<8.0", "fakeredis>=2.0,<3.0"]
 
 [build-system]
 requires = ["setuptools>=61.0"]

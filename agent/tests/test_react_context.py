@@ -344,21 +344,3 @@ def test_react_context_edge_is_soft_and_one_way():
 
     ctx_src = (PLUGIN_DIR / "context" / "governor.py").read_text(encoding="utf-8")
     assert "plugins.react" not in ctx_src                     # 治理器不反向依赖
-
-
-# ---------------------------------------------------------------------------
-# 依赖边守卫：react --软--> context（单向；不新增硬耦合）
-# ---------------------------------------------------------------------------
-
-
-def test_react_context_edge_is_soft_and_one_way():
-    """S3 新增依赖边必须**软**且**单向**：react 只经 ``ctx.get(Services.CONTEXT)`` 感知，
-    不 import 其实现、不写进 ``inject``；治理器**不反向**依赖 react。"""
-    react_src = (PLUGIN_DIR / "react" / "loop.py").read_text(encoding="utf-8")
-    assert "Services.CONTEXT" in react_src                    # 只经接缝感知
-    assert "agent.plugins.context" not in react_src           # 不 import 实现
-    pkg_src = (PLUGIN_DIR / "react" / "__init__.py").read_text(encoding="utf-8")
-    assert "Services.CONTEXT" not in pkg_src.split("def apply")[0]   # 不进 inject（软依赖）
-
-    ctx_src = (PLUGIN_DIR / "context" / "governor.py").read_text(encoding="utf-8")
-    assert "plugins.react" not in ctx_src                     # 治理器不反向依赖

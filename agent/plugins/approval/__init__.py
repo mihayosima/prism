@@ -47,6 +47,17 @@ DEFAULT_CONFIG: dict = {
     "default": "deny",
 }
 
+#: 会话级名单的**会话数**上限（每会话内的工具集合本身有界于注册表，无需单独限）。
+#: 只防长期运行下「会话数 × 名单」无限增长；淘汰最久未用者（dict 保序）。
+_SESSION_BUCKET_LIMIT = 512
+
+
+def _remember(bucket: dict, session: str, task: str) -> None:
+    """把 ``task`` 记入 ``session`` 的名单桶（「本会话总是允许/拒绝」），并限总量。"""
+    bucket.setdefault(session, set()).add(task)
+    while len(bucket) > _SESSION_BUCKET_LIMIT:
+        bucket.pop(next(iter(bucket)), None)      # dict 保序：最早插入的会话先淘汰
+
 
 def _picked(ans: dict) -> list[str]:
     """把应答里的单选 ``choice`` / 多选 ``choices`` 统一成取值列表（保序去空去重）。"""
@@ -185,7 +196,7 @@ class Approval:
         # 2.2：写回**本会话**的桶（不再写全局）
         if by == "user" and ans.get("always"):
             bucket = (self._session_allow if approved else self._session_deny)
-            bucket.setdefault(session, set()).add(task)
+            _remember(bucket, session, task)      # 记入本会话名单（含总量上限，防无界增长）
         if by == "timeout":
             await self._audit(Events.APPROVAL_TIMEOUT,
                               {"call_id": call_id, "tool": task, "waited_ms": waited_ms})

@@ -1,0 +1,23 @@
+# 依赖自动更新（此前无任何依赖自动化）。
+# 三生态：pip（根，含 dev）、npm（web/）、github-actions（CI 用的 actions）。
+# 周更、限量 open PR，避免洪峰；安全更新由 GitHub 的 Dependabot alerts 另行触发。
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "python"]
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "frontend"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "ci"]

@@ -72,12 +72,12 @@ class EventBus:
     #: 只在"高频事件 × 大量异步监听器"这种异常形态下兜住内存增长。
     DEFAULT_MAX_INFLIGHT = 256
 
-    def __init__(self, strict_payload: bool = True, required_seams: set = set(),
+    def __init__(self, strict_payload: bool = True, required_seams: set | None = None,
                  max_inflight: int | None = None):
         self._listeners: dict[str, list[_Listener]] = {}
         self._seq = 0
         self.strict_payload = strict_payload
-        self._required_seams: set = set(required_seams)
+        self._required_seams: set = set(required_seams or ())
         self._tasks: set[asyncio.Task] = set()   # 在途 fire-and-forget 任务（K4a 追踪）
         self._max_inflight = int(max_inflight or self.DEFAULT_MAX_INFLIGHT)
         #: 因超过上限而被**丢弃**的监听器次数（非 0 即说明出现过事件洪峰）
@@ -202,6 +202,23 @@ class EventBus:
             except BaseException:  # noqa: BLE001 —— 取消 / 监听器自身异常均吞掉
                 pass
         self._tasks.clear()
+
+    async def idle(self) -> None:
+        """等待全部在途 fire-and-forget 任务**自然结束**（不取消）。
+
+        与 ``aclose`` 的分工：``aclose`` 取消并等待（teardown 用），本方法只等待
+        （收尾前的"记账/审计落地后再断言"、测试确定性、优雅停止用）。
+
+        ★ 为什么需要它：``emit`` 的 async 监听器是 fire-and-forget，绑定 DB 之后
+        其落地时刻取决于**事件循环轮次 + 线程池往返**（``storage`` 经 ``to_thread``
+        卸载）。用 ``await asyncio.sleep(0)`` × N 等待是**碰运气**——线程往返一慢就漏。
+        本方法轮询到 ``_tasks`` 为空，是确定性等待。
+
+        ★ 循环而非单次 ``gather``：在途监听器自身可能再 ``emit``（派生新任务），
+        单次 gather 会漏掉派生出来的那批。
+        """
+        while self._tasks:
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
     def _snapshot(self, name: str) -> list[_Listener]:
         return list(self._listeners.get(name, ()))

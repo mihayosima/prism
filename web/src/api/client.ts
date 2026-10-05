@@ -65,12 +65,13 @@ export function setToken(token: string): void {
 }
 
 /**
- * 为本项目请求构造完整 URL（含 SSE 用的 `?token=`）。
+ * 为本项目请求构造完整 URL。
  *
- * ★ B3 直连形态的兼容点：`API_BASE` 可能是**绝对地址**
- * （`http://127.0.0.1:8720/api`）。此时必须用 `new URL(...)` 组装，
- * 否则 `URLSearchParams` 的查询串会被拼在路径后而丢失 host 语义；
- * 相对形态（`/api`）同样走 `new URL(p, base)`，两者结果一致。
+ * ★ 不再注入 `?token=`（2026-10-05）：本项目**所有**请求（含 SSE，`api/sse.ts` 走
+ * `fetch` + `Authorization` 头，全仓无 `EventSource`）都能带认证头，故 query 里的
+ * token 纯属历史遗留——而它是唯一会进入代理/访问日志的泄露面。鉴权一律走
+ * `authHeaders()` 的 `Authorization: Bearer`。`getToken()` 仍保留一次性 `?token=`
+ * 引导通道（读入后立刻从地址栏抹除，见上）。
  *
  * ★ base 取 `location.href`（**不是** `location.origin`）：
  *   `origin` 在部分环境/测试桩下可能缺失，`new URL(x, undefined)` 会抛
@@ -85,8 +86,6 @@ export function buildUrl(path: string, params?: Record<string, string>): string 
   const u = /^https?:\/\//i.test(raw)
     ? new URL(raw)
     : new URL(raw, location.href)
-  const token = getToken()
-  if (token) u.searchParams.set('token', token)
   for (const [k, v] of Object.entries(params || {})) u.searchParams.set(k, v)
   return u.toString()
 }

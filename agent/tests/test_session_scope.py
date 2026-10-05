@@ -58,13 +58,15 @@ def _spent(ctx) -> dict:
     return m if isinstance(m, dict) else {}
 
 
-async def _settle(n: int = 8) -> None:
-    """让 `LLM_POST_CALL`（**异步**监听器，fire-and-forget）的对账任务落地。
+async def _settle(ctx) -> None:
+    """等待 `LLM_POST_CALL`（**异步** fire-and-forget）对账任务**确定性**落地。
 
     不对账时 ``budget_spent`` 还停在预借值、账单行也未写——断言会看到中间态。
+    此前用 ``await asyncio.sleep(0)`` × N：绑定 DB 后对账经 ``to_thread`` 卸载，
+    只要线程往返比 N 次事件循环轮次慢就会漏（实测挂红）⇒ 改用 ``EventBus.idle()``
+    ——轮询到全部在途监听器任务结束，与循环轮次/线程调度无关。
     """
-    for _ in range(n):
-        await asyncio.sleep(0)
+    await ctx.events.idle()
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +199,7 @@ def test_t4_t5_budget_limit_and_spend_isolated(tmp_path):
         c.root.state[StateKeys.SESSION_KEY] = "u:B"
         r = await c.root.llm.complete(c.root, [{"role": "user", "content": "hi"}],
                                       caller="t")
-        await _settle()
+        await _settle(c.root)
         assert r.tokens_in > 0
         m = _spent(c.root)
         assert m.get("u:A", 0) == 0, "T5：B 的消耗串到了 A 的桶"
@@ -223,7 +225,7 @@ def test_t6_chat_reset_only_clears_own_session(tmp_path):
         for sk in ("u:A", "u:B"):
             c.root.state[StateKeys.SESSION_KEY] = sk
             await c.root.llm.complete(c.root, msg, caller="t")
-            await _settle()                                   # 先让对账落地再切会话
+            await _settle(c.root)                                   # 先让对账落地再切会话
         m = _spent(c.root)
         a_before, b_before = m.get("u:A", 0), m.get("u:B", 0)
         assert a_before > 0 and b_before > 0
@@ -246,7 +248,7 @@ def test_t6b_legacy_reset_without_session_falls_back_to_all(tmp_path):
         await c.assemble()
         c.root.state[StateKeys.SESSION_KEY] = "u:A"
         await c.root.llm.complete(c.root, [{"role": "user", "content": "hi"}], caller="t")
-        await _settle()
+        await _settle(c.root)
         assert _spent(c.root).get("u:A", 0) > 0
         await c.root.events.emit(Events.CHAT_RESET, {})       # 无 session_id
         assert not _spent(c.root), "无 session_id 时应回退清全部"
@@ -271,7 +273,7 @@ def test_t7_budget_log_attributed_by_session(tmp_path):
         for sk in ("u:A", "u:A", "u:B"):
             c.root.state[StateKeys.SESSION_KEY] = sk
             await c.root.llm.complete(c.root, msg, caller="t")
-            await _settle()
+            await _settle(c.root)
         rows = await c.root.db.query(
             c.root, "SELECT session, tokens_in, tokens_out FROM agent_budget_log")
         assert len(rows) == 3
@@ -304,7 +306,7 @@ def test_t8_cost_calibration_stays_global(tmp_path):
         for sk in ("u:A", "u:B"):
             c.root.state[StateKeys.SESSION_KEY] = sk
             await c.root.llm.complete(c.root, msg, caller="t")
-            await _settle()
+            await _settle(c.root)
         stats = c.root.state.get(StateKeys.LLM_COST_RATIO) or {}
         assert stats, "校准统计未写入"
         total = sum(int(v.get("samples") or 0) for v in stats.values())

@@ -13,7 +13,8 @@ import asyncio
 import json
 import random
 import re
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -101,10 +102,15 @@ class LlmService:
         ``finalize=True``（方案A）：标记为触顶收尾调用——budget 据此允许动用
         收尾预留额度（正常调用只能用 ``max_tokens_per_run - finalize_reserve_tokens``）。
         """
+        # call_id：本次调用的唯一关联键，贯穿 pre/post/failed 三个 payload。
+        # 为什么需要它：budget 的预借槽此前按 **caller** 关联 pre↔post，而 post 是
+        # fire-and-forget —— 同 caller 的连续/并发调用会互相覆盖槽位（先到的 post 弹出
+        # 后到的预借），使真实 token 记错账、EWMA 少样本。改用唯一 call_id 后关联无歧义。
+        call_id = uuid.uuid4().hex
         decision = await ctx.events.waterfall(
             Events.LLM_PRE_CALL,
             {"messages": messages, "schema": schema, "caller": caller,
-             "tools": tools, "finalize": bool(finalize)},
+             "tools": tools, "finalize": bool(finalize), "call_id": call_id},
             # 传原始工具目录（native 形态），由 budget 经 core 估算器同源计量
         )
         if isinstance(decision, dict) and decision.get("denied"):
@@ -116,7 +122,7 @@ class LlmService:
         except Exception as exc:
             # S1：失败路径——durable 审计 + live 通知（budget 同步退款），随后原样抛出。
             # 成功路径行为零变化。
-            payload = {"caller": caller, "error": str(exc)}
+            payload = {"caller": caller, "error": str(exc), "call_id": call_id}
             await durable(ctx, Events.LLM_CALL_FAILED, dict(payload))
             await ctx.events.emit(Events.LLM_CALL_FAILED, dict(payload))
             raise
@@ -141,7 +147,7 @@ class LlmService:
         await ctx.events.emit(Events.LLM_POST_CALL, {
             "provider": self._model, "tokens_in": tokens_in, "tokens_out": tokens_out,
             "caller": caller, "cache_hit": cache_hit,
-            "reasoning_tokens": reasoning_tokens,
+            "reasoning_tokens": reasoning_tokens, "call_id": call_id,
         })
         return LlmResult(data=data, tokens_in=tokens_in, tokens_out=tokens_out,
                          model=self._model, provider=self.provider_label,
@@ -150,9 +156,6 @@ class LlmService:
 
 def _parse_json(text: str) -> dict:
     """剥离 markdown code-fence 后解析 JSON。"""
-    import json
-    import re
-
     s = (text or "").strip()
     if s.startswith("```"):
         s = re.sub(r"^```[a-zA-Z]*\s*", "", s)

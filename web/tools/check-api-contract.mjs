@@ -68,8 +68,8 @@ ok('buildUrl 处理绝对地址（http(s)://）',
 ok('authHeaders 注入 Bearer',
   /Authorization.*Bearer/.test(client), '未找到 Bearer 注入')
 
-ok('buildUrl 附加 ?token=',
-  /searchParams\.set\('token'/.test(client), '未找到 token 查询参数注入')
+ok('buildUrl 不再注入 ?token=（鉴权走 Authorization 头，防进日志）',
+  !/searchParams\.set\('token'/.test(client), 'buildUrl 仍在 URL 里拼 token（会进代理/访问日志）')
 
 ok('.env.example 存在（三种部署形态有据可依）',
   existsSync(join(root, '.env.example')))

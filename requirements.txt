@@ -1,0 +1,28 @@
+# 生产依赖锁（**不含 dev**）——供 Dockerfile 构建时使用，使镜像构建可复现。
+#
+# 与 requirements.lock（full，含 pytest/fakeredis，供本地/CI 用）的关系：
+#   · 本文件 = requirements.lock 去掉 dev 依赖及其独占传递依赖（pytest / fakeredis /
+#     colorama / iniconfig / packaging / pluggy / pygments / sortedcontainers）；
+#   · 两者版本号一致，同源于一次 `uv pip compile`。
+#
+# 重新生成（需 uv）：
+#   uv pip compile pyproject.toml --python-version 3.12 -o requirements.lock            # full
+#   uv pip compile pyproject.toml --python-version 3.12 --no-extra dev -o requirements.txt  # prod
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+certifi==2026.7.22
+click==8.5.0
+fastapi==0.142.2
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+opentelemetry-api==1.45.0
+pydantic==2.13.5
+pydantic-core==2.46.5
+redis==8.1.0
+starlette==1.7.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+uvicorn==0.54.0

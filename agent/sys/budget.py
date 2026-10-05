@@ -72,6 +72,17 @@ def _run_id(ctx) -> str:
     return current_run_id(ctx)
 
 
+def _pending_key(payload: dict) -> str:
+    """预借槽的**唯一关联键**：优先 ``call_id``，缺省回退 ``caller``（兼容旧调用方）。
+
+    ★ 为什么从 ``caller`` 改为 ``call_id``：``LLM_POST_CALL`` 是 fire-and-forget，
+    预借槽按 caller 关联时，**同 caller 的连续/并发调用会互相覆盖**——先到的 post
+    弹出后到的预借，使真实 token 记错账、校准样本丢失（实测触发挂红）。``call_id``
+    由 ``sys/llm.py::complete`` 每次调用生成并贯穿 pre/post/failed 三 payload，关联无歧义。
+    """
+    return str(payload.get("call_id") or payload.get("caller") or "unknown")
+
+
 def _cfg_view(ctx):
     """取会话配置视图接缝（软取；缺失即 None ⇒ 回落容器配置）。"""
     try:
@@ -235,11 +246,11 @@ class Budget:
                     warn_map[sk] = warn
                     await durable(ctx, Events.BUDGET_WARNING, dict(warn))
                     await ctx.events.emit(Events.BUDGET_WARNING, dict(warn))
-            # 预借记账（确定性：与 post 竞态无关）；pending **按会话 + caller 分槽**
-            # （D3：react 与 memory 并发调 LLM 时互不覆盖；G2：会话间亦互不覆盖）。
-            caller = str(payload.get("caller") or "unknown")
+            # 预借记账（确定性：与 post 竞态无关）；pending 槽键 = **唯一 call_id**
+            # （D3：react 与 memory 并发调 LLM 时互不覆盖；G2：会话间亦互不覆盖；
+            #  F0：同 caller 连续调用也不再互相覆盖——见 ``_pending_key``）。
             _set_spent(ctx, sk, spent + est)
-            _pending_map(ctx, sk)[caller] = {
+            _pending_map(ctx, sk)[_pending_key(payload)] = {
                 "est": est, "raw": int(raw_est),
                 # R1：归组键同走请求作用域通道（此前读容器级 state，并发下会取到别人的 run）
                 "run_id": _run_id(ctx)}
@@ -254,7 +265,7 @@ class Budget:
             to = int(payload.get("tokens_out", 0))
             caller = str(payload.get("caller") or "unknown")
             pending = _pending_map(ctx, sk)
-            entry = pending.pop(caller, None) or {}
+            entry = pending.pop(_pending_key(payload), None) or {}
             if isinstance(entry, int):       # 兼容旧形状（纯数字预借）
                 entry = {"est": entry, "raw": entry, "run_id": ""}
             est = int(entry.get("est") or 0)
@@ -295,9 +306,8 @@ class Budget:
         def _call_failed(payload: dict) -> None:
             # S1：调用失败 → 全额退还本次预借（同步监听器，emit 内联执行立即生效）。
             sk = _session_key(ctx)
-            caller = str(payload.get("caller") or "unknown")
             pending = _pending_map(ctx, sk)
-            entry = pending.pop(caller, None) or {}
+            entry = pending.pop(_pending_key(payload), None) or {}
             if isinstance(entry, int):       # 兼容旧形状
                 entry = {"est": entry}
             est = int(entry.get("est") or 0)

@@ -43,7 +43,8 @@ def test_stream_true_emits_multiple_token_pieces(tmp_path):
     """stream 开启（显式 true）+ schema None → 多片 token 帧，拼接 == 最终文本。"""
     c = build_agent(config=_cfg(tmp_path, {"stream": True}))
     async def s():
-        await c.assemble(); await c.start()
+        await c.assemble()
+        await c.start()
         try:
             reply, frames = await _collect_tokens(c, _answer_messages())
         finally:
@@ -60,7 +61,8 @@ def test_stream_default_is_true(tmp_path):
     """未显式配置 stream（D5 默认 true）→ 仍应产生 token 帧。"""
     c = build_agent(config=_cfg(tmp_path))          # 不含 stream 键
     async def s():
-        await c.assemble(); await c.start()
+        await c.assemble()
+        await c.start()
         try:
             reply, frames = await _collect_tokens(c, _answer_messages())
         finally:
@@ -74,7 +76,8 @@ def test_schema_call_emits_no_token(tmp_path):
     """schema 非空（内部规划 _plan 路径）→ 不产生任何 token 帧。"""
     c = build_agent(config=_cfg(tmp_path, {"stream": True}))
     async def s():
-        await c.assemble(); await c.start()
+        await c.assemble()
+        await c.start()
         try:
             # schema 非空，且随便给条消息（route 不影响「schema 非空不发」规则）
             reply, frames = await _collect_tokens(
@@ -91,7 +94,8 @@ def test_stream_off_emits_no_token_and_text_intact(tmp_path):
     """stream 关闭 → 零 token 帧，且 reply.data["text"] 与今天一致（行为不变）。"""
     c = build_agent(config=_cfg(tmp_path, {"stream": False}))
     async def s():
-        await c.assemble(); await c.start()
+        await c.assemble()
+        await c.start()
         try:
             reply, frames = await _collect_tokens(c, _answer_messages())
         finally:

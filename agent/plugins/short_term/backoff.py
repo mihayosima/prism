@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Callable
+from typing import Callable
 
 
 # 连续失败次数 → 暂停分钟数（索引 = 次数-1，封顶最后一档）

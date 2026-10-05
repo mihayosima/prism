@@ -384,6 +384,12 @@ win.window = win; win.self = win; win.globalThis = win
 win.__vueErrors = []
 doc.defaultView = win
 
+// 会话对齐（2026-10-05）：本脚本预取 /api/events 等资源时**不带会话头** ⇒ 后端落到
+// `default:default`（CI 预热写入的会话）。而前端默认会**生成随机 sid**（标签级会话），
+// 于是 /api/events 查的是空会话 ⇒ 事件视图渲染 0 行、与预取数据对不上（2 项假红）。
+// 这里把前端会话钉到 `default`，使"预取"与"视图实查"落在同一会话——对拍才成立。
+win.sessionStorage.setItem('prism_session_id', 'default')
+
 // ---------- 执行 ----------
 const errors = []
 process.on('uncaughtException', (e) => errors.push((e && e.stack) || String(e)))

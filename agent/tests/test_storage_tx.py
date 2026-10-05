@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 
 import pytest
 
@@ -149,7 +150,7 @@ def test_failed_migration_leaves_no_partial_state(tmp_path):
         await db.start()
         reg = MigrationRegistry(db)
         bad = [("m1", {"sqlite": ("CREATE TABLE t1(a INT)", "THIS IS NOT SQL")}, "d")]
-        with pytest.raises(Exception):
+        with pytest.raises(sqlite3.OperationalError):   # 非法 SQL 由 sqlite3 抛出
             await reg.apply(None, bad, "sqlite")
         tables = await db.query(
             None, "SELECT name FROM sqlite_master WHERE type='table' AND name='t1'")

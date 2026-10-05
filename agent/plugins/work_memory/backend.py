@@ -22,6 +22,18 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _enc(v: Any) -> str:
+    """Redis hash 字段编码：str 原样，其余 ``json.dumps``（Redis 只存字符串）。
+
+    ⚠️ **两后端的 ``get()`` 值类型有意不同**（契约见 ``WorkMemoryLike.get``）：Redis 后端
+    把非字符串字段序列化为字符串 ⇒ ``step`` 读到 ``str``；InMemory 后端保留原生 ⇒ 读到
+    ``int``。消费方一律用 ``int(...)`` / ``str(...)`` 归一（``checkpoint`` 已是此法）。
+    这属**已知取舍**，不做统一——把 Redis 侧强行 json 反解会引入"数值型 session_id 被误
+    还原成 int"这类歧义；统一到字符串又会改掉 InMemory 既有测试锁定的原生类型。
+    """
+    return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+
+
 def _initial_data(meta: dict, ttl: int) -> dict:
     """hash 初始字段（两种后端共用）。"""
     return {
@@ -62,7 +74,10 @@ class WorkMemoryLike(Protocol):
     async def begin(self, task_id: str, meta: dict) -> None: ...
     async def update(self, task_id: str, **fields) -> None: ...
     async def checkpoint(self, task_id: str, name: str, data: Any) -> None: ...
-    async def get(self, task_id: str) -> dict | None: ...
+    async def get(self, task_id: str) -> dict | None:
+        """返回字段映射，**值类型随后端而异**：Redis 后端为字符串（非 str 字段被
+        ``json.dumps``），InMemory 后端保留原生（int/list/…）。消费方须用 ``int``/``str``
+        归一，勿假定某一类型。"""
     async def finish(self, task_id: str) -> None: ...
     async def list_active(self, session_id: str | None = None) -> list[str]: ...
     # ---- 跨进程 run 快照（阶段 2；键 run_snapshot:{tenant}:{task_id}，与 wm: 独立）----
@@ -256,13 +271,9 @@ class RedisWorkMemory:
     def _idx(self, session_id: str) -> str:
         return f"{self._prefix}idx:{session_id}"
 
-    @staticmethod
-    def _enc(v: Any) -> str:
-        return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
-
     async def begin(self, task_id: str, meta: dict) -> None:
         key = self._k(task_id)
-        mapping = {k: self._enc(v) for k, v in _initial_data(meta, self._ttl).items()}
+        mapping = {k: _enc(v) for k, v in _initial_data(meta, self._ttl).items()}
         await self._r.hset(key, mapping=mapping)
         await self._r.expire(key, self._ttl)
         sid = meta.get("session_id")
@@ -272,7 +283,7 @@ class RedisWorkMemory:
     async def update(self, task_id: str, **fields) -> None:
         if not fields:
             return
-        mapping = {k: self._enc(v) for k, v in fields.items()}
+        mapping = {k: _enc(v) for k, v in fields.items()}
         mapping["updated_at"] = _now_iso()
         await self._r.hset(self._k(task_id), mapping=mapping)
         await self._r.expire(self._k(task_id), self._ttl)
@@ -290,9 +301,16 @@ class RedisWorkMemory:
         cps.append(entry)
         if len(cps) > 10:
             cps = cps[-10:]
-        await self._r.hset(key, mapping={
+        # 写入用**事务管道**：checkpoints 与 updated_at 同生共死，且与 TTL 一并提交
+        # （减少往返；避免"键已写但 TTL 未设"的窗口）。
+        # ⚠️ 读-改-写（hget→append→hset）本身未加锁：同一 task_id **并发** checkpoint
+        # 会丢条目。实践上 run 循环对自身 wm 是顺序调用 ⇒ 不触发；要彻底消解须用
+        # WATCH/Lua（低频率，后续按需）。
+        pipe = self._r.pipeline(transaction=True)
+        pipe.hset(key, mapping={
             "checkpoints": json.dumps(cps, ensure_ascii=False), "updated_at": _now_iso()})
-        await self._r.expire(key, self._ttl)
+        pipe.expire(key, self._ttl)
+        await pipe.execute()
 
     async def get(self, task_id: str) -> dict | None:
         raw = await self._r.hgetall(self._k(task_id))
@@ -301,10 +319,20 @@ class RedisWorkMemory:
     async def finish(self, task_id: str) -> None:
         # D1 锁死：只删工作记忆键 wm:{task_id}，**绝不**触及 run_snapshot: 前缀
         # （跨进程快照的存活是断点续传前提；finish 只结束"运行内"工作记忆）。
+        # H4（2026-10-05）：**先读 session_id 再删**，随后从会话索引精确 SREM ——
+        # 此前只删键、不 SREM ⇒ ``wm:idx:{session}`` 集合无界增长（原注释自认的遗留）。
         key = self._k(task_id)
+        try:
+            sid = await self._r.hget(key, "session_id")
+        except Exception:                    # noqa: BLE001 —— 读失败不阻断 finish
+            sid = None
         await self._r.delete(key)
-        # 索引清理：遍历所有 idx 集合代价高，仅当能从 data 取 session_id 时精确 SREM
-        # （finish 时 hash 已删，session_id 不可得 → 由 list_active 的 exists 校验兜漏）
+        s = sid.decode() if isinstance(sid, bytes) else sid
+        if s:
+            try:
+                await self._r.srem(self._idx(s), task_id)
+            except Exception:                # noqa: BLE001 —— 索引清理失败不阻断
+                pass
 
     async def list_active(self, session_id: str | None = None) -> list[str]:
         if session_id:

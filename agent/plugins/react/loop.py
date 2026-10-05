@@ -66,10 +66,10 @@ from agent.api import (CapabilityNotImplemented, Events, Services, SessionIdenti
                       estimate_tokens, inc_counter, now_iso, current_permission_mode,
                       set_current_run_id, set_current_session_key)
 
-logger = logging.getLogger("agent.react")
-
 from .components import Actor, Finalizer, Observer, Reasoner, ToolResult
 from .prompt import BUDGET_TIGHT_SYSTEM, build_system, render_params
+
+logger = logging.getLogger("agent.react")
 
 
 @dataclass(slots=True)
@@ -247,9 +247,14 @@ def _trim(messages: list[dict], keep: int) -> list[dict]:
     """历史裁剪：保 system + 首个用户请求 + 最近 ``keep`` 条（多步循环的上下文治理）。
 
     只裁剪**喂给模型的窗口**，不丢循环自身的状态（消息全集由调用方持有）。
+
+    ★ 未超阈时返回**浅拷贝**（而非原对象）：调用方（``_run_impl``）会在预算预警时
+    对返回值 ``append`` 一条系统提示——若返回原 list，就会**就地改到共享的 ``messages``**，
+    下一步再 append 一次 ⇒ 提示随步数累积、prompt 持续膨胀（此前注释自称"幂等"，
+    实为累积；仅在无治理器的降级路径触发）。返回新 list 后 append 落在这份副本上，幂等。
     """
     if keep <= 0 or len(messages) <= keep + 2:
-        return messages
+        return list(messages)
     first_user = next((i for i, m in enumerate(messages)
                        if m.get("role") == "user" and isinstance(m.get("content"), str)), None)
     cut = len(messages) - keep
@@ -798,11 +803,22 @@ class ReactLoop:
         remaining = float(cfg.deadline_s) - (time.monotonic() - started)
         if remaining <= 0:
             remaining = None                     # 已超期：交给循环顶统一触顶，不额外收紧
-        for kwargs in ({"timeout_s": remaining}, {}):
+        # 首选：把剩余 deadline 作为 timeout_s 下压给 Actor（新签名，逐个下压给 tasks.invoke）
+        try:
+            return await self._actor.act(ctx, calls, timeout_s=remaining)
+        except TypeError:                        # 注入实现不认该参数 → 退回旧签名
+            pass
+        # 旧签名兜底（H3）：Actor 不认 timeout_s ⇒ 本层用剩余 deadline 包一层硬上限。
+        # 超时**不向上抛**（抛会绕过循环顶的触顶收尾、直接中断 run）——改成回灌"超时"观察，
+        # 让循环正常走到顶端的 deadline 检查再统一收尾。
+        if remaining is not None:
             try:
-                return await self._actor.act(ctx, calls, **kwargs)
-            except TypeError:                    # 注入实现不认该参数 → 退回旧签名
-                continue
+                return await asyncio.wait_for(self._actor.act(ctx, calls), timeout=remaining)
+            except asyncio.TimeoutError:
+                return [ToolResult(getattr(c, "name", "?"),
+                                   f"工具执行超时（超过剩余 deadline {remaining:.1f}s）",
+                                   is_error=True, tool_call_id=getattr(c, "id", ""))
+                        for c in calls]
         return await self._actor.act(ctx, calls)
 
     def _prepare_chain(self, gov, chain: list[dict], keep_recent: int, *,

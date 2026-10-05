@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 
 from agent.api import Services
+from agent.core.services_catalog import ALL as _SVC_ALL
 
 AGENT = Path(__file__).resolve().parent.parent          # agent/
 
@@ -362,8 +363,7 @@ def test_every_migrated_table_has_declared_owner():
 #     一律**放行**（宁可漏检也不错报）；
 #   - ``ctx.config`` / ``ctx.state`` 等 ``Context`` 自带属性不是服务键，天然不匹配。
 
-# ★ ``ALL`` 是**模块级**常量（services_catalog.py），不是 ``Services`` 的类属性
-from agent.core.services_catalog import ALL as _SVC_ALL
+# ★ ``ALL`` 是**模块级**常量（services_catalog.py），不是 ``Services`` 的类属性 —— 已在文件顶部 import。
 
 _SVC_CONST2VAL = {
     m.group(1): m.group(2)

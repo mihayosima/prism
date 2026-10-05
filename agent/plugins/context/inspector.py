@@ -21,7 +21,7 @@ G2.0（P3）新增。三职责（对应方案 §4.3「Inspector 视图与不变�
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 # ---- 契约词汇（与 §4.4 五层同源；未知层原样显示，不臆造语义）----

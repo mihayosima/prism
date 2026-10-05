@@ -52,7 +52,7 @@ from agent.api import clip_text, clip_text_hard, estimate_tokens
 
 from .protocols import (ACTION_KINDS, COMPACT_MODES, Action, ApplyResult, Assembly,
                         AssemblyReport, AttachmentReport, AttachmentSpec, BlockDecl,
-                        BlockReport, BlockSpec, WaterlineReport, resolve_layer)
+                        BlockReport, BlockSpec, WaterlineReport)
 from .inspector import (LedgerEntry, RoundLedger, entry_from_payload,
                         ledger_from_payloads, render_entry)
 
@@ -933,7 +933,8 @@ class ContextGovernor:
         sizes = [max(1, estimate_tokens(t)) for _j, _r, t in texts]
         total = sum(sizes) or 1
         for (j, r, text), alloc in zip(texts,
-                                       [max(1, int(avail * s / total)) for s in sizes]):
+                                       [max(1, int(avail * s / total)) for s in sizes],
+                                       strict=False):
             clipped = clip_fn(text, alloc)
             if r is None:
                 unit[j] = {**unit[j], "content": clipped}
@@ -996,7 +997,7 @@ class ContextGovernor:
             unit = [dict(messages[i]) for i in u]
             unit = self._clip_unit_hard(unit, budget, self._clip_hard)
             keep_u.add(len(units) - 1)
-            override = {i: m for i, m in zip(u, unit)}
+            override = {i: m for i, m in zip(u, unit, strict=False)}
             clipped = True
         kept: list[dict] = []
         for k, u in enumerate(units):

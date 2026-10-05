@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import signal
-import sys
 import time
 import uuid
 from pathlib import Path
@@ -56,6 +55,12 @@ _RUN_LOCK = asyncio.Lock()
 #: 后台容器重建任务登记（`_bg_rebuild` 经 `create_task` 发起）：仅用于退出时观测/排障，
 #: 不阻塞主链路；任务完成自动从集合移除。
 _BG_TASKS: set[asyncio.Task] = set()
+
+#: 路由处理器日志器。★ **必须模块级**：`_register_probes`/`_register_approval` 等是
+#: **模块级函数**，其内部 handler（`/api/chat` 的错误分支等）引用本名——此前只在 `_serve`
+#: 内定义局部 `_err_log`，机械搬移路由到模块级函数时漏了这条依赖 ⇒ 那些错误分支调用时
+#: `NameError`（AgentError 的面向用户消息被通用 500 顶掉）。提到模块级后两处同源。
+_err_log = logging.getLogger("agent.chat")
 
 # 本模块开了 ``from __future__ import annotations`` ⇒ 路由签名里的注解是**字符串**，
 # FastAPI 用**模块全局**解析它们。故 ``Request``/``HTTPException`` 必须在模块级可见，
@@ -96,7 +101,15 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
                    help="日志级别（DEBUG/INFO/WARNING/ERROR；默认 INFO）")
     p.add_argument("--log-format", default="text", choices=("text", "json"),
                    help="text=人读（行内含 rid/session/run）；json=单行 JSON 供采集侧解析")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    # 生产加固：token 与 hardened 支持**环境变量**注入（镜像/compose 默认形态不必把密钥写进 CMD）。
+    # 显式命令行参数优先；env 只在未传时兜底。
+    if not args.token:
+        args.token = os.environ.get("PRISM_TOKEN", "")
+    if not args.hardened and os.environ.get("PRISM_HARDENED", "").strip().lower() in (
+            "1", "true", "on", "yes"):
+        args.hardened = True
+    return args
 
 
 def _cfg(args: argparse.Namespace) -> dict:
@@ -818,7 +831,7 @@ def _register_probes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse
                              ident.session_key, rid, exc)
             return JSONResponse({"error": str(exc), "kind": type(exc).__name__,
                                  "request_id": rid}, status_code=500)
-        except Exception as exc:                        # noqa: BLE001 —— 内部错误不裸泄
+        except Exception:                        # noqa: BLE001 —— 内部错误不裸泄
             rid = _req_rid(request)
             _err_log.exception("未捕获异常 @ /api/chat session=%s rid=%s",
                                ident.session_key, rid)
@@ -896,7 +909,7 @@ def _register_probes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse
                                      "payload": {"error": str(exc),
                                                  "kind": type(exc).__name__,
                                                  "request_id": rid}})
-            except Exception as exc:                   # noqa: BLE001 —— 内部错误不裸泄
+            except Exception:                   # noqa: BLE001 —— 内部错误不裸泄
                 rid = _req_rid(request)
                 _err_log.exception("未捕获异常 @ /api/chat/stream run=%s rid=%s",
                                    run_id, rid)
@@ -926,7 +939,7 @@ def _register_probes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse
                             task.cancel()              # 断连/提前退出 → 取消，防孤儿
             except asyncio.CancelledError:
                 return                                 # 客户端断连：不逃逸，任务已在 finally 取消
-            except Exception as exc:                   # noqa: BLE001 —— 内部错误不裸泄
+            except Exception:                   # noqa: BLE001 —— 内部错误不裸泄
                 rid = _req_rid(request)
                 _err_log.exception("未捕获异常 @ /api/chat/stream gen run=%s rid=%s",
                                    run_id, rid)
@@ -1479,6 +1492,14 @@ async def _serve(args: argparse.Namespace) -> int:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+    # 生产加固 fail-fast：`--hardened` 语义是"deny-by-default"，缺 token 会让**所有**工具调用
+    #（含 chat）被 guard 拒绝 ⇒ 服务虽起但不可用，且"看起来在跑"极具误导性。**在装配之前**就
+    # 拒绝（此前检查放在 _boot 之后 ⇒ 白白拉起 Redis/MCP 子进程再退出）。
+    if getattr(args, "hardened", False) and not str(args.token or ""):
+        raise SystemExit(
+            "--hardened 已启用但未提供 token：deny-by-default 下所有工具调用（含 chat）都会被拒。"
+            "请同时提供 --token 或环境变量 PRISM_TOKEN。")
+
     # ---- #5 可观测性：**最先**装日志（此前全仓无任何 handler，INFO 级静默丢弃）----
     # 放在这里（而非 uvicorn.Config 之前）是为了让 ``create_app`` 内部的所有日志
     # ——含前端产物提示、重建失败——也走同一套 handler 与字段。
@@ -1579,7 +1600,7 @@ async def _serve(args: argparse.Namespace) -> int:
     # `{"error": ...}`，前端零改动），并记一条带路径的 error 日志。
     # 注意：HTTPException 不在此接管——Starlette 默认已返回 JSON `{"detail": ...}`，
     # 覆盖它会改变 400/404 的既有响应体形状，属于无收益的行为变更。
-    _err_log = logging.getLogger("agent.chat")
+    # （`_err_log` 是**模块级**常量，此处直接复用，勿再定义局部同名——见其定义处说明。）
 
     @app.exception_handler(AgentError)
     async def _on_agent_error(request: Request, exc: AgentError) -> JSONResponse:
@@ -1635,6 +1656,7 @@ async def _serve(args: argparse.Namespace) -> int:
     # SSE / 静态资源走 `?token=`；其余 fetch 走 `Authorization`）。
     _AUTH_EXEMPT = {"/", "/api/status"}       # 健康探针：首页与状态接口始终放行
     _token = str(args.token or "")
+    # （--hardened 缺 token 的 fail-fast 已在 `_serve` 入口、装配之前完成。）
 
     def _extract_token(request) -> str:
         """按 `Authorization: Bearer x` → `?token=x` 顺序取令牌（headers 优先）。"""
@@ -1702,6 +1724,15 @@ async def _serve(args: argparse.Namespace) -> int:
                 ctype = resp.headers.get("content-type", "")
                 if ctype.startswith("text/html"):
                     resp.headers["Cache-Control"] = "no-store"
+                    # #4 纵深防御：应用 HTML 此前**无 CSP**（CSP 只加在 /api/* 契约响应上），
+                    # 而前端是 v-html / innerHTML 结构，安全性全押在手写 esc() 上。
+                    # 这里补一层：script 只允许同源（挡住注入的外部脚本与内联脚本执行），
+                    # style 放开 'unsafe-inline'（卡片 HTML 可能带内联样式，收紧会白屏）。
+                    resp.headers.setdefault(
+                        "Content-Security-Policy",
+                        "default-src 'self'; script-src 'self'; img-src 'self' data:; "
+                        "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+                        "frame-ancestors 'none'; base-uri 'none'")
                 return resp
 
         app.mount("/", _SPAStaticFiles(directory=str(_DIST), html=True), name="web")
@@ -1722,9 +1753,8 @@ async def _serve(args: argparse.Namespace) -> int:
             "未找到前端产物 %s —— 首页将返回 503 与构建指引", _DIST)
 
     # ---- 生产改造 #4：安全姿态告警 ----
-    # 无论是否 hardened，只要「无 token 且权限开放」即打印醒目 WARNING（部署风险）。
-    # hardened 模式下若仍缺 token，deny-by-default 会让所有工具调用（含 chat）被拒，
-    # 故额外强告警提示必须同时提供 --token。
+    # 只要「无 token 且权限开放」即打印醒目 WARNING（部署风险）。
+    # （--hardened 缺 token 已在 `_token` 计算处 fail-fast，不在此处。）
     _perms_cfg = ((c.root.config or {}).get("agent") or {}).get("permissions") or {}
     if _perms_cfg.get("default") != "deny":
         if _token:
@@ -1735,10 +1765,6 @@ async def _serve(args: argparse.Namespace) -> int:
             logging.getLogger("agent.chat").warning(
                 "未启用 token 且权限默认开放（default=open）：部署到网络即任何人可写插件/删文件。"
                 "生产环境请加 --token 并启用 --hardened。")
-    if getattr(args, "hardened", False) and not _token:
-        logging.getLogger("agent.chat").warning(
-            "--hardened 已启用但未设置 --token：deny-by-default 下所有工具调用将被拒绝"
-            "（包括 chat）。请务必同时提供 --token。")
 
     url = f"http://{args.host}:{args.port}"
     # #5：走 logger（级别由 --log-level 决定；设为 WARNING 及以上时不再打印此行）

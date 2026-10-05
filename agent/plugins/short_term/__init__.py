@@ -18,15 +18,16 @@
 
 from __future__ import annotations
 
-from agent.api import Services, inc_counter, plugin
-from agent.tables import MESSAGE_FIELDS
 import logging
 
-_logger = logging.getLogger("plugins.short_term")
+from agent.api import Services, inc_counter, plugin
+from agent.tables import MESSAGE_FIELDS
 
 from .compactor import HistoryCompactor
 from .facade import ShortTermMemory
 from .store import SessionSummaryStore
+
+_logger = logging.getLogger("plugins.short_term")
 
 
 @plugin

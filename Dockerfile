@@ -12,13 +12,16 @@
 #     -e DEEPSEEK_API_KEY=... \
 #     prism:latest
 #
-# 生产加固（deny-by-default + 强制 token）——覆盖 CMD 追加参数即可：
-#   docker run ... prism:latest \
-#     python -m agent.run.chat --host 0.0.0.0 --port 8720 --hardened --token <TOKEN>
+# 生产加固（deny-by-default + 强制 token）**已是默认 CMD**，token 经环境变量注入：
+#   docker run --rm -p 8720:8720 -e PRISM_TOKEN=$(openssl rand -hex 16) \
+#     -e DEEPSEEK_API_KEY=... -v "$PWD/data:/app/data" prism:latest
+# （需要无鉴权 dev 形态时覆盖 CMD 去掉 --hardened，并自担风险。）
 
 # =============================================================================
 # 阶段 1 · 构建前端产物（web/dist）
 # =============================================================================
+# TODO(supply-chain)：基础镜像按 digest 固定（`node:22-alpine@sha256:…`），当前用飘动 tag
+# 会有上游静默漂移。取 digest：`docker buildx imagetools inspect node:22-alpine`。
 FROM node:22-alpine AS web
 
 WORKDIR /build/web
@@ -35,6 +38,7 @@ RUN npm run build
 # =============================================================================
 # 阶段 2 · 运行时
 # =============================================================================
+# TODO(supply-chain)：同阶段 1，基础镜像按 digest 固定（`python:3.12-slim@sha256:…`）。
 FROM python:3.12-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
@@ -43,14 +47,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# 只安装**第三方依赖**（从 pyproject.toml 读取，保持单一真相源）。
+# 只安装**第三方依赖**：从**生产锁文件**装（精确版本 ⇒ 构建可复现）。
+# 此前从 pyproject.toml 读**区间**装 ⇒ 同一 tag 两次构建可能解析出不同版本，锁文件形同虚设。
+# requirements.txt = 生产依赖（不含 dev）；full 锁 requirements.lock 供本地/CI 用，见其头部注释。
 # 刻意不 `pip install .`：那会把 agent 包装进 site-packages，使 run/chat.py 的
 # __file__ 落到 site-packages 下，而它用 Path(__file__).parents[2] / "web" / "dist"
 # 定位前端产物 ⇒ 会找不到 dist。保持源码布局（从 /app 以 cwd 方式运行）才正确。
-COPY pyproject.toml ./
-RUN python -c "import tomllib, subprocess, pathlib; \
-    d = tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8')); \
-    subprocess.check_call(['pip', 'install', *d['project']['dependencies']])"
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
 # 源码 + 前端产物：两者必须同在 /app 下以维持 __file__ → web/dist 的相对定位
 COPY agent/ ./agent/
@@ -74,5 +78,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request, sys; \
     sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8720/health', timeout=4).status == 200 else 1)"
 
-# 默认监听 0.0.0.0（容器内必须，否则宿主机映射不进来）
-CMD ["python", "-m", "agent.run.chat", "--host", "0.0.0.0", "--port", "8720"]
+# 默认监听 0.0.0.0（容器内必须，否则宿主机映射不进来）。
+# 生产加固（2026-10-05 起为**默认**）：`--hardened` = 权限 deny-by-default；
+# 访问令牌经环境变量 `PRISM_TOKEN` 注入（**不写进镜像/CMD**）。缺 PRISM_TOKEN 时
+# 进程会 fail-fast 退出（deny-by-default 下没有 token 等于全拒，宁可起不来）。
+# 本地纯 dev 无鉴权形态请直接用宿主机 `python -m agent.run.chat`，不要用本镜像默认 CMD。
+CMD ["python", "-m", "agent.run.chat", "--host", "0.0.0.0", "--port", "8720", "--hardened"]

@@ -7,39 +7,43 @@
 #   · Redis 不持久化的话，重启即丢 run 快照 ⇒ 断点续传静默失效，
 #     故 Redis 显式开启 AOF。
 #
-# 用法：
-#   DEEPSEEK_API_KEY=sk-xxx docker compose up -d --build
-#   docker compose logs -f prism
+# 用法（**默认即生产加固姿态**，2026-10-05 起）：
+#   DEEPSEEK_API_KEY=sk-xxx PRISM_TOKEN=$(openssl rand -hex 16) docker compose up -d --build
 #   open http://127.0.0.1:8720
 #
-# 只想要 Redis（服务在宿主机上跑）：
-#   docker compose up -d redis
-#
-# 生产加固：给 prism 的 command 追加 `--hardened --token <TOKEN>`（见下方注释）。
+# 安全默认（本次翻转）：
+#   · prism 默认 `--hardened --token`（deny-by-default + 强制鉴权）——缺 PRISM_TOKEN 即 compose 报错；
+#   · Redis 绑 **loopback only** + `--requirepass` + 内存上限，不再对全网暴露。
+#   要跑"本地纯 dev 无鉴权"形态，请直接用宿主机 `python -m agent.run.chat`，不要用本 compose。
 
 services:
   redis:
     image: redis:7-alpine
     # AOF 持久化：没有它，Redis 一重启快照全丢，跨重启续传就废了。
-    command: ["redis-server", "--appendonly", "yes"]
+    # requirepass / maxmemory：Redis 存 run_snapshot（含 ReAct chain = 对话与工具结果），
+    # 无密码 + 对外暴露即数据泄露面；内存上限防一个 Redis 吃光宿主内存。
+    command: ["redis-server", "--appendonly", "yes",
+              "--requirepass", "${REDIS_PASSWORD:-prism-local}",
+              "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-prism-local}",
+             "--no-auth-warning", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
       start_period: 5s
     restart: unless-stopped
-    # 端口映射说明（踩过的坑）：这里**不能**写成 "127.0.0.1:6379:6379"。
-    # Windows 上 localhost 会**优先解析到 IPv6 ::1**，只绑 IPv4 loopback 时
-    # redis-py 连 ::1 会超时 ⇒ work_memory 以为 Redis 不可用而静默降级，
-    # 断点续传随之失效（表现为"代码在位但能力不生效"）。写成 "6379:6379"
-    # 会同时监听 0.0.0.0 与 [::]，宿主与容器都能连。
-    # 若部署环境要求仅本机可访问，改成 "127.0.0.1:6379:6379"，**同时**给 prism
-    # 设 PRISM_REDIS_URL=redis://127.0.0.1:6379/0（绕开 localhost 的 IPv6 优先解析）。
+    mem_limit: 320m
+    # 端口映射说明（踩过的坑，2026-10-05 收紧）：
+    #   · 绑 **127.0.0.1 only**（不再发布到 0.0.0.0）：Redis 无隔离语义，不该对全网暴露；
+    #   · Windows 上 `localhost` 会**优先解析到 IPv6 ::1**，只绑 IPv4 loopback 时 redis-py
+    #     连 ::1 会超时 ⇒ work_memory 以为 Redis 不可用而静默降级，断点续传随之失效
+    #     （表现为"代码在位但能力不生效"）。故 prism 侧务必用 `redis://127.0.0.1:...` 而非
+    #     `localhost`（`localhost` 仅用于解析 IPv4，见下方 PRISM_REDIS_URL）。
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
 
   prism:
     build: .
@@ -51,19 +55,40 @@ services:
       - "8720:8720"
     environment:
       # compose 网络内必须用服务名（不是 localhost）
-      PRISM_REDIS_URL: redis://redis:6379/0
+      PRISM_REDIS_URL: redis://:${REDIS_PASSWORD:-prism-local}@redis:6379/0
       # 生产形态：Redis 不可用即**启动失败**，不静默降级。
       # 降级会让断点续传"代码在位但能力不生效"，比启动失败更难发现。
       PRISM_REDIS_REQUIRED: "1"
       # LLM 密钥由外部注入，绝不写进镜像
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      # 生产加固（默认开启）：deny-by-default + 强制鉴权。缺 PRISM_TOKEN 即 compose 报错中止。
+      PRISM_HARDENED: "1"
+      PRISM_TOKEN: ${PRISM_TOKEN:?需设置 PRISM_TOKEN（如 \`openssl rand -hex 16\`）后重试}
     volumes:
       # SQLite 库 / 插件期望态 / 配置覆盖
       - prism-data:/app/data
     restart: unless-stopped
-    # 生产加固（deny-by-default + 强制 token）——取消注释并替换 TOKEN：
-    # command: ["python", "-m", "agent.run.chat", "--host", "0.0.0.0",
-    #           "--port", "8720", "--hardened", "--token", "REPLACE_ME"]
+    # 容器安全加固（无特权、不可提权、资源受限）
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    mem_limit: 1g
+    cpus: "1.0"
+    healthcheck:
+      # 用 /ready（查 DB 可达 + 核心服务注册）而非 /health（恒 200 的存活探针）
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8720/ready',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
 
 volumes:
   redis-data:

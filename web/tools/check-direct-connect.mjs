@@ -474,9 +474,9 @@ ok('所有 API 请求都发往后端绝对地址', absUrls.length > 0 && relApiU
 ok('请求 URL 含后端 host', absUrls.every((u) => u.startsWith(BACKEND)),
   absUrls[0] || '(无绝对请求)')
 if (TOKEN) {
-  ok('请求 URL 携带 ?token=（SSE/EventSource 兼容通道）',
-    absUrls.some((u) => u.includes('token=' + encodeURIComponent(TOKEN))),
-    '没有任何请求带 token 查询参数')
+  ok('请求 URL 不带 ?token=（鉴权走 Authorization 头，防进代理日志）',
+    absUrls.every((u) => !u.includes('token=')),
+    absUrls.find((u) => u.includes('token=')) || '(无 URL 带 token)')
   ok('请求头携带 Authorization: Bearer',
     seenUrls.length > 0 && true, '（见下方 C 段：headers 由 authHeaders 注入）')
 }
@@ -568,7 +568,8 @@ if (TOKEN) {
     }
     ok('恢复 token 后同一请求成功（对照组）',
       !!okResp && !err2, err2 ? String(err2.message) : '')
-    ok('带 token 时 URL 含 ?token=', seenUrls.some((u) => u.includes('token=' + encodeURIComponent(TOKEN))),
+    ok('带 token 时鉴权经 Authorization 头（URL 不含 ?token=）',
+      !!okResp && !seenUrls.some((u) => u.includes('token=')),
       seenUrls.slice(-1).join(' | '))
   }
 } else {

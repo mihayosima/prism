@@ -38,12 +38,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Lint（ruff；pyproject 已配置，此前 CI 从不执行）
+        run: |
+          pip install ruff
+          ruff check agent
+
+      - name: 依赖漏洞扫描（pip-audit；先仅告警，稳定后再收紧为硬门禁）
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.lock || echo "::warning::pip-audit 发现漏洞（见上）"
+
       # 用 -e（editable）：agent 指向源码目录，与本地开发同构。
       # 测试入口读 pyproject 的 testpaths=agent/tests，故无需额外参数。
       # 说明：本机（Windows + 安全删除守卫，trash 二进制不可用）会让
       # test_windows_mcp 的 1 例假红；Linux runner 无该守卫，应当全绿。
-      - name: 全量测试
-        run: python -m pytest -q
+      - name: 全量测试 + 覆盖率门禁
+        run: python -m pytest -q --cov=agent --cov-report=term --cov-fail-under=85
 
   # ---------------------------------------------------------------------------
   # 前端：契约自检 + 生产构建
@@ -129,11 +139,12 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - name: 依赖 + 契约自检 + 生产构建
+      - name: 依赖 + 契约自检 + 单测 + 生产构建
         working-directory: web
         run: |
           npm ci
           npm run check
+          npm test          # vitest 单测（package.json 早已定义，此前 CI 从不执行）
           npm run build
 
       - name: 后端日志（仅失败时打印，便于排查）
@@ -152,12 +163,13 @@ jobs:
       - name: 构建镜像
         run: docker build -t prism:ci .
 
-      # 冒烟：用镜像的**默认 CMD**（即生产启动方式，不带 --fixture）起容器。
-      # 已实测：无 LLM API key 时服务照常启动（key 仅在调用时解析），
+      # 冒烟：用镜像的**默认 CMD**（即生产启动方式，不带 --fixture）。
+      # 默认 CMD 已含 `--hardened`（deny-by-default），缺 token 会 fail-fast 退出 ⇒
+      # 这里注入 PRISM_TOKEN。已实测：无 LLM API key 时服务照常启动（key 仅在调用时解析），
       # 但 LLM 相关的调用会失败 —— 故这里只探 /health（存活探针）。
       - name: 容器冒烟（/health）
         run: |
-          docker run -d --name prism-smoke -p 18720:8720 prism:ci
+          docker run -d --name prism-smoke -e PRISM_TOKEN=ci-smoke -p 18720:8720 prism:ci
           ok=0
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:18720/health > /dev/null 2>&1; then

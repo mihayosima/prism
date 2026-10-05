@@ -96,8 +96,7 @@ def test_ewma_maintained_after_calls(tmp_path):
         for _ in range(2):
             await c.root.llm.complete(c.root, [{"role": "user", "content": "你好"}],
                                       caller="t")
-            for _ in range(5):                   # _post 是 async fire-and-forget
-                await asyncio.sleep(0)           # 且同一 caller 的 pending 槽会被下次覆盖
+            await c.root.events.idle()           # 等 fire-and-forget 对账确定性落地
         stats = c.root.state.get(StateKeys.LLM_COST_RATIO) or {}
         m = stats.get("fixture") or {}
         assert int(m.get("samples") or 0) >= 2, "每次调用须喂 EWMA 样本"
@@ -136,8 +135,7 @@ def test_budget_log_records_run_id(tmp_path):
         await c.assemble()
         _register_echo(c.root)
         await c.root.react.run(c.root, "请触顶循环")
-        for _ in range(5):                       # _post 是 async fire-and-forget，让出循环
-            await asyncio.sleep(0)
+        await c.root.events.idle()               # 等 fire-and-forget 对账确定性落地
         rows = await c.root.db.query(
             c.root, "SELECT run_id FROM agent_budget_log"
                     " WHERE run_id IS NOT NULL AND run_id != ''")
@@ -180,8 +178,7 @@ def test_cost_drift_event_on_big_deviation(tmp_path):
         await c.assemble()
         c.root.llm._provider = _Prov()           # 注入大 usage 的 stub provider
         await c.root.llm.complete(c.root, [{"role": "user", "content": "hi"}], caller="t")
-        for _ in range(5):                       # _post 是 async fire-and-forget，让出循环
-            await asyncio.sleep(0)
+        await c.root.events.idle()               # 等 fire-and-forget 对账确定性落地
         rows = await c.root.db.query(
             c.root, "SELECT event FROM agent_events WHERE event='agent/llm/cost-drift'")
         assert rows, "偏差 >25% 须落 drift 事件"

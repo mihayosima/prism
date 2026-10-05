@@ -12,6 +12,8 @@ from __future__ import annotations
 import ast
 import pathlib
 
+from agent.api import StateKeys
+
 AGENT = pathlib.Path(__file__).resolve().parent.parent
 
 _SCAN_ROOTS = [
@@ -23,8 +25,6 @@ _SCAN_ROOTS = [
     AGENT / "api.py",
     AGENT / "profiles.py",
 ]
-
-from agent.api import StateKeys
 
 # 由 StateKeys **反射生成**，不再手写常量清单。
 # 此前手写 5 个值、漏掉 budget_warning / llm_cost_ratio / react_run_id ——
