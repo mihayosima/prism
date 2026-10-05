@@ -72,14 +72,6 @@ def _attach_view(c, sessions: dict) -> None:
                    if section == "guard" else {})
 
 
-@pytest.fixture(autouse=True)
-def _isolate_session_scope():
-    """会话键是 ContextVar ⇒ 用例间必须复位（沙箱已踩过顺向泄漏）。"""
-    set_current_session_key(None)
-    yield
-    set_current_session_key(None)
-
-
 # ---------------------------------------------------------------------------
 # ① match 真值表（与 sandbox 逐位等价）
 # ---------------------------------------------------------------------------

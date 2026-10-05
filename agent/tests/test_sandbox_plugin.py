@@ -88,14 +88,6 @@ async def _sandbox_rows(c):
                 " WHERE event='agent/sandbox/confinement' ORDER BY seq")
 
 
-@pytest.fixture(autouse=True)
-def _isolate_session_scope():
-    """会话键是 ContextVar ⇒ 用例间必须复位，否则顺着用例泄漏（见 MEMORY §3 纪律）。"""
-    set_current_session_key(None)
-    yield
-    set_current_session_key(None)
-
-
 # ---------------------------------------------------------------------------
 # ① 默认放行 + 审计
 # ---------------------------------------------------------------------------

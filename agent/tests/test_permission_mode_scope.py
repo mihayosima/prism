@@ -55,18 +55,6 @@ def _register(c):
         c.root.tasks.register(c.root, name, schema={}, handler=h, risk=risk, owner=None)
 
 
-@pytest.fixture(autouse=True)
-def _isolate_request_scope():
-    """每个用例前后解除会话键绑定。
-
-    ContextVar 绑定在当前线程上下文里 ⇒ 不复位会泄漏到后续用例/文件，表现为
-    「未绑定却读到上一个用例的会话键」（本项目已在两个测试文件上踩过）。
-    """
-    set_current_session_key(None)
-    yield
-    set_current_session_key(None)
-
-
 # ---------------------------------------------------------------------------
 # ① 档位本身：会话隔离
 # ---------------------------------------------------------------------------

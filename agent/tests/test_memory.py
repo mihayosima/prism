@@ -22,18 +22,6 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-@pytest.fixture(autouse=True)
-def _reset_session_scope():
-    """复位会话键 ContextVar（全仓无 conftest，复位逻辑按文件自持）。
-
-    ★ 不复位的话，本文件里绑定的会话键会顺着 ContextVar 泄漏到后续用例，
-    表现为"没绑会话却读到上一个用例的会话"这类跨用例串扰。
-    """
-    set_current_session_key(None)
-    yield
-    set_current_session_key(None)
-
-
 def _pm(tmp_path, *, enable: bool = True, enable_all: bool = False) -> PluginManager:
     """指向真实 agent/plugins 的管理器；期望态落在 tmp，避免污染 data/。"""
     pm = PluginManager(plugin_dir=str(PLUGIN_DIR),

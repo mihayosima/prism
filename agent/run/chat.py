@@ -23,6 +23,8 @@ import os
 import signal
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent.api import (AgentError, SESSION_CFG_VIEW, Services, SessionIdError,
@@ -698,13 +700,52 @@ async def _acquire_session_run(active_runs: dict, session_key: str):
         active_runs[run_id] = (marker, session_key)
         return ("ok", run_id, marker)
 
-def _register_probes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse,
-                    _session_cfg, JSONResponse, Request, StreamingResponse):
+@dataclass
+class HandlerDeps:
+    """★ 路由处理器的依赖包（2026-10-06，依赖显式化）。
+
+    此前四个 ``_register_*`` 各带 7~11 个参数，且**共用同一组**闭包项
+    （``active_runs`` / ``pm`` / ``_identity`` / ``_apply_rebuild`` / ``_sse`` …）。
+    这带来两个真问题：
+
+    1. **加一个依赖要改 4 处签名 + 2 处调用**：漏一处 ⇒ 该函数体内名字未定义
+       ⇒ 调用即 ``NameError`` ⇒ 该端点 500（曾真实发生在 ``/api/approval/pending``）。
+    2. **依赖只能由真跑 ``_serve`` 才能构造**：它们全部是 ``_serve`` 的局部闭包，
+       要凑齐就得真起 uvicorn + 真实装配容器 ⇒ handler **脱离真实进程就测不了**，
+       HTTP 层覆盖率因此长期钉在低位。
+
+    收成单一对象后：依赖集合**一处声明、一处构造**；且测试可用**替身**构造它
+    （假容器句柄 / 假 ``active_runs`` / 假 ``pm``），把路由注册到一个全新的
+    ``FastAPI()`` 上直接打端点——不需要 uvicorn，也不需要真实容器。
+
+    ★ 刻意**不含** ``_session_cfg``：它只被 ``_serve`` 内部的 ``_identity`` 使用；
+    经 AST 逐个函数核实，三个域函数的函数体**均未引用**它 ⇒ 继续转发是死参数。
+    """
+
+    c: object                 # ``_Box`` 容器句柄；handlers 一律经 ``c.root`` 取服务
+    active_runs: dict         # run_id -> (Task, 会话键)；取消/断连清理用
+    pm: object                # PluginManager（插件启停与重建）
+    identity: Callable        # 请求身份解析（会话键绑定的单一漏斗）
+    apply_rebuild: Callable   # 按当前配置重建容器（管理操作即时生效）
+    sse: Callable             # SSE 帧序列化 (event, payload) -> str
+    approval_or_none: Callable  # 取审批门面（未装配时为 None）
+    JSONResponse: type
+    Request: type
+    StreamingResponse: type
+
+
+def _register_probes(app, deps):
     """★ 探针 + 会话流路由（/health /ready /metrics /api/chat*）。
 
     从 ``_register_routes`` 拆出（2026-10-04，机械搬移）。调用顺序由
     ``_register_routes`` 固定：**探针 → 会话流 → approval → 资源**。
     """
+    c = deps.c
+    active_runs = deps.active_runs
+    _identity = deps.identity
+    _sse = deps.sse
+    JSONResponse = deps.JSONResponse
+    StreamingResponse = deps.StreamingResponse
     # ---- 生产改造 #2：健康/就绪/指标探针（顶层路径，免 /api/ 鉴权）----
     # 必须在 SPA mount("/")（约 904 行）之前注册，否则被 catch-all 吞成 index.html。
     # 顶层路径（非 /api/）即便启用 --token 也由中间件豁免（见 _AUTH_EXEMPT：非 /api/ 直接放行）。
@@ -971,8 +1012,7 @@ def _register_probes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse
         return JSONResponse({"ok": True, "run_id": rid})
 
 
-def _register_approval(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse,
-                       _session_cfg, _approval_or_none, JSONResponse, Request):
+def _register_approval(app, deps):
     """★ 审批 + 只读状态路由（11 条）。
 
     含 ``/api/approval/*``（answer/pending/mode）与**只读**状态端点
@@ -986,6 +1026,10 @@ def _register_approval(app, c, *, active_runs, pm, _identity, _apply_rebuild, _s
     ``_register_routes`` 固定：**probes → approval(本函数) → resources**。
     ⚠️ 本函数必须在 ``mount("/")`` 之前调用（Starlette 按注册顺序匹配）。
     """
+    c = deps.c
+    _identity = deps.identity
+    _approval_or_none = deps.approval_or_none
+    JSONResponse = deps.JSONResponse
     @app.post("/api/approval/answer")
     async def _approval_answer(body: dict, request: Request):
         """人对在途请求的应答：审批（批/驳）与澄清问询（choice/text）共用。
@@ -1238,8 +1282,7 @@ def _register_approval(app, c, *, active_runs, pm, _identity, _apply_rebuild, _s
     # ---- 插件管理（引擎式：desired/actual/delta；改动即时重建生效） ----
 
 
-def _register_resources(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse,
-                       _session_cfg, JSONResponse, Request):
+def _register_resources(app, deps):
     """★ 插件与设置路由（6 条，写操作域）。
 
     ``/api/plugins``（列表）、``/api/plugins/{enable,scaffold,remove}``、
@@ -1252,6 +1295,11 @@ def _register_resources(app, c, *, active_runs, pm, _identity, _apply_rebuild, _
     ``_register_routes`` 固定：**probes → approval → resources(本函数)**。
     ⚠️ 本函数必须在 ``mount("/")`` 之前调用（Starlette 按注册顺序匹配）。
     """
+    c = deps.c
+    pm = deps.pm
+    _identity = deps.identity
+    _apply_rebuild = deps.apply_rebuild
+    JSONResponse = deps.JSONResponse
     @app.get("/api/plugins")
     async def _plugins() -> dict:
         manifest = c.container.plugin_manifest()
@@ -1461,31 +1509,25 @@ def _register_resources(app, c, *, active_runs, pm, _identity, _apply_rebuild, _
             return JSONResponse({"ok": False, "error": f"参数错误: {exc}"}, status_code=400)
 
 
-def _register_routes(app, c, *, active_runs, pm, _identity, _apply_rebuild, _sse,
-                    _session_cfg, _approval_or_none, JSONResponse, Request,
-                    StreamingResponse):
+def _register_routes(app, deps):
     """★ 注册全部 HTTP 路由（2026-10-04 从 ``_serve`` 机械搬移）。
 
-    本函数只做**编排**：按固定顺序调用三个域函数。
+    本函数只做**编排**：按固定顺序把同一个 ``HandlerDeps`` 交给三个域函数。
     ① 探针/会话流 → ② approval → ③ 资源（``/api/settings`` 等）。
     ④ 静态托管 ``mount("/")`` 由 ``_serve`` 在**本函数之后**追加
        （Starlette 按注册顺序匹配，Mount 会捕获其后一切 ⇒ 必须最后）。
 
+    依赖经 ``HandlerDeps`` **整体**传递（2026-10-06 依赖显式化）：不再在此逐个
+    转发闭包项 ⇒ 新增依赖只改 ``HandlerDeps`` 一处，不会再出现"某个域函数漏收
+    一个参数 ⇒ 函数体 NameError ⇒ 该端点 500"（该回归曾真实发生，见守卫的
+    ``check_missing_names``；它仍会继续静态兜底）。
+
     等价性守卫：``.workbuddy/verify_serve_split_equiv.py``
     （真跑一次 ``_serve``，与基线**逐字段比对有序路由表** + 断言 Mount 最后）。
-    ★ 参数只有 `app`/`c` 是位置参数，其余必须**关键字传**（签名里有 `*`）。
     """
-    _kw = dict(active_runs=active_runs, pm=pm, _identity=_identity,
-               _apply_rebuild=_apply_rebuild, _sse=_sse, _session_cfg=_session_cfg)
-    # ★ 每个注册函数需要的**全部**来自 `_serve` 的闭包项都在此显式转发。
-    #   少转发一个 ⇒ 该名字在函数体内未定义 ⇒ 调用即 NameError ⇒ 该端点 500
-    #   （曾真实发生：`/api/approval/pending`）。守卫 verify_serve_split_equiv.py 的
-    #   check_missing_names() 会静态抓出这类漏项。
-    _register_probes(app, c, JSONResponse=JSONResponse, Request=Request,
-                     StreamingResponse=StreamingResponse, **_kw)
-    _register_approval(app, c, _approval_or_none=_approval_or_none,
-                       JSONResponse=JSONResponse, Request=Request, **_kw)
-    _register_resources(app, c, JSONResponse=JSONResponse, Request=Request, **_kw)
+    _register_probes(app, deps)
+    _register_approval(app, deps)
+    _register_resources(app, deps)
 
 async def _serve(args: argparse.Namespace) -> int:
     import uvicorn
@@ -1693,12 +1735,14 @@ async def _serve(args: argparse.Namespace) -> int:
 
     # ★ 路由注册已抽到模块级 `_register_routes`（2026-10-04，纯机械搬移）。
     #   等价性守卫：`.workbuddy/verify_serve_split_equiv.py`（比对有序路由表 + Mount 必须在最后）。
-    _register_routes(
-        app, c, active_runs=active_runs, pm=pm,
-        _identity=_identity, _apply_rebuild=_apply_rebuild,
-        _sse=_sse, _session_cfg=_session_cfg,
-        _approval_or_none=_approval_or_none, JSONResponse=JSONResponse,
-        Request=Request, StreamingResponse=StreamingResponse)
+    # 依赖包**一处构造**：此后新增依赖只需改 HandlerDeps，不再逐个函数改签名。
+    deps = HandlerDeps(
+        c=c, active_runs=active_runs, pm=pm,
+        identity=_identity, apply_rebuild=_apply_rebuild, sse=_sse,
+        approval_or_none=_approval_or_none,
+        JSONResponse=JSONResponse, Request=Request,
+        StreamingResponse=StreamingResponse)
+    _register_routes(app, deps)
     # ---- B4：单端口托管前端产物（web/dist） ------------------------------------
     # 放在**全部 /api/* 路由注册之后**：Starlette 按注册顺序匹配，先注册者优先。
     # 故 `/api/*` 照旧命中上面的路由，只有剩余路径落到这里。
