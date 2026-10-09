@@ -52,3 +52,4 @@ web/_backup_legacy/
 # 改造前本地备份（仅本地留档，不入版本库）
 *.bak-b4
 agent/run/chat.py.bak*
+_commit_msg.txt
