@@ -10,7 +10,18 @@ MVP 不读 YAML（扩展点预留），只内置 ``default`` / ``explorer`` / ``
 
 from __future__ import annotations
 
+import json
+import logging
+import pathlib
+import re
 from typing import Iterable
+
+logger = logging.getLogger("agent.subagent.roles")
+
+# 角色文件名（= 角色名）合法字符集：与会话键净化同款口径，防路径穿越/注入。
+# ★ 首尾必须落在 [A-Za-z0-9_]，中间才允许 . 与 - —— 否则 "..evil" / ".hidden"
+# 这类以点开头（含路径穿越语义）的名字会被 {1,64} 的通配点号放行。
+_ROLE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}[A-Za-z0-9_]$|^[A-Za-z0-9_]$")
 
 # 内置角色。``tools`` 为 ``None`` 时表示「不额外收窄」（仍受父权限裁剪）；
 # 为具体名单时表示在该角色下**只允许**这些工具名/域（与父可见集取交集）。
@@ -57,10 +68,16 @@ class Role:
         self.system_note = system_note
 
 
-def get_role(name: str) -> Role:
-    """按名取角色；未知名回落 ``default``（诚实降级，不抛异常，避免父循环崩溃）。"""
+def get_role(name: str, extra: dict | None = None) -> Role:
+    """按名取角色；未知名回落 ``default``（诚实降级，不抛异常，避免父循环崩溃）。
+
+    ``extra`` 是经 :func:`load_role_files` 校验过的目录式角色表（阶段 2）；
+    文件角色**不覆盖**内置角色（内置优先，保证升级不改变既有语义）。
+    """
     name = (name or "default").strip() or "default"
     spec = BUILTIN_ROLES.get(name)
+    if spec is None:
+        spec = (extra or {}).get(name)
     if spec is None:
         spec = BUILTIN_ROLES["default"]
         name = "default"
@@ -68,9 +85,81 @@ def get_role(name: str) -> Role:
                 tools=spec.get("tools"), system_note=spec.get("system_note", "") or "")
 
 
-def list_roles() -> list[str]:
+def list_roles(extra: dict | None = None) -> list[str]:
     """已注册角色名（目录 / 调试用）。"""
-    return sorted(BUILTIN_ROLES)
+    names = set(BUILTIN_ROLES) | set(extra or {})
+    return sorted(names)
+
+
+# ---------------------------------------------------------------------------
+# 阶段 2：目录式角色文件（设计稿 §3.4 评审 R4）
+# ---------------------------------------------------------------------------
+
+def roles_dir(data_dir: str | pathlib.Path) -> pathlib.Path:
+    """角色目录 = ``<data_dir>/agent_roles``（**非 Web 可写目录**）。"""
+    return pathlib.Path(data_dir) / "agent_roles"
+
+
+def validate_role_spec(name: str, spec: dict,
+                       catalog_names: set[str], catalog_domains: set[str]) -> dict:
+    """校验单个角色定义，非法 ⇒ 抛 ``ValueError``（调用方跳过该文件并记账）。
+
+    安全边界（评审 R4）：工具名/域名**必须在当前工具目录内**。
+    为什么「未知工具」要整份拒绝而不是静默丢弃：白名单是**安全下界**，
+    一处笔误若被静默忽略，角色就会静默变成「不收窄」——表面正常、实际越权。
+    故宁可让该角色不可用（并记账），也不给一个语义被悄悄改写的角色。
+    """
+    if not isinstance(spec, dict):
+        raise ValueError(f"角色 {name!r}：文件内容必须是对象")
+    unknown_keys = set(spec) - {"description", "tools", "system_note"}
+    if unknown_keys:
+        raise ValueError(f"角色 {name!r}：出现未知字段 {sorted(unknown_keys)}")
+    tools = spec.get("tools")
+    if tools is not None:
+        if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+            raise ValueError(f"角色 {name!r}：tools 必须是字符串数组或 null")
+        bad = [t for t in tools if t != "*"
+               and t not in catalog_names and t not in catalog_domains]
+        if bad:
+            raise ValueError(f"角色 {name!r}：引用了不存在的工具/域 {sorted(set(bad))}")
+        tools = [t for t in tools if t] or None
+    note = spec.get("system_note") or ""
+    if not isinstance(note, str):
+        raise ValueError(f"角色 {name!r}：system_note 必须是字符串")
+    desc = spec.get("description") or ""
+    if not isinstance(desc, str):
+        raise ValueError(f"角色 {name!r}：description 必须是字符串")
+    return {"description": desc, "tools": tools, "system_note": note}
+
+
+def load_role_files(directory: str | pathlib.Path, catalog: list[dict]) -> dict:
+    """扫描角色目录，返回**校验通过**的角色表；非法文件跳过并记账（不掀起委派）。
+
+    - 目录不存在 ⇒ 返回空表（内置角色照常可用，零行为变化）；
+    - 单个文件坏 ⇒ 跳过该文件，**不影响其他角色与内置角色**；
+    - 角色名 = 文件名主干，须匹配 ``[A-Za-z0-9_.-]{1,64}``（防路径穿越/注入）；
+    - 内置角色优先，文件角色**不覆盖**内置（升级不改变既有语义）。
+
+    每次 ``delegate`` 调用时扫目录：读几个小文件的 IO 相对「起一个 LLM 子循环」
+    可忽略，换来「加角色不用改代码」（评审 R4 选 (a)，不引入文件监视器）。
+    """
+    names = {str(t.get("name") or "") for t in catalog or []}
+    domains = {str(t.get("owner") or "") for t in catalog or [] if t.get("owner")}
+    out: dict[str, dict] = {}
+    d = pathlib.Path(directory)
+    if not d.is_dir():
+        return out
+    for fp in sorted(d.glob("*.json")):
+        stem = fp.stem
+        if not _ROLE_NAME_RE.match(stem):
+            logger.warning("跳过角色文件（非法角色名）：%s", fp.name)
+            continue
+        try:
+            spec = json.loads(fp.read_text(encoding="utf-8"))
+            out[stem] = validate_role_spec(stem, spec, names, domains)
+        except Exception as exc:                      # 单文件坏不影响其他
+            logger.warning("跳过角色文件 %s：%s", fp.name, exc)
+    return out
 
 
 def combine_tools(role_tools: Iterable[str] | None,

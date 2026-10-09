@@ -19,15 +19,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import logging
+import pathlib
 
 from agent.api import (
-    AgentError, DEFAULT_SESSION, DEFAULT_TENANT, DEFAULT_USER, Events, Services,
-    StateKeys, current_run_id, current_session_key, durable, make_identity, now_iso,
+    DEFAULT_DB_PATH, AgentError, DEFAULT_SESSION, DEFAULT_TENANT, DEFAULT_USER,
+    Events, Services, StateKeys, current_run_id, current_session_key, durable,
+    make_identity, now_iso,
 )
 
-from .roles import combine_tools, get_role
+from .roles import combine_tools, get_role, load_role_files, roles_dir
 
 logger = logging.getLogger("agent.subagent")
 
@@ -35,8 +38,70 @@ logger = logging.getLogger("agent.subagent")
 SUBAGENT_MAX_STEPS = 6           # 子循环步数上限（比父的 8 更紧）
 SUBAGENT_DEADLINE_S = 60.0       # 子循环整体时延上限（秒）；子循环自身的 deadline 闸据此收尾
 
+# 阶段 2：并行委派护栏
+MAX_SUBAGENT_THREADS = 4         # 每**父 run** 的在飞子 Agent 上限（审查意见 #4）
+MAX_SUBAGENT_BATCH = 16          # 单次 tools 调用最多委派的子任务数（防一次 fan-out 打爆）
+
 # 当前委派深度（ContextVar，按 task 隔离）。主循环上下文为 0；每深入一层 +1。
 _SUBAGENT_DEPTH = contextvars.ContextVar("subagent_depth", default=0)
+
+# ---- 每父 run 的并发信号量（作用域 = 父 run，非全局 / 非每会话） ----
+# 审查意见 #4 明确：限制的是「同一个父 run 下同时在飞的子 Agent 数」。
+# 键取父 run_id（ContextVar，task 隔离，天然随父 run 生命周期），无则回退会话键。
+_PARENT_SEMS: dict[str, tuple[int, asyncio.Semaphore]] = {}
+_PARENT_REFS: dict[str, int] = {}
+
+
+def _parent_run_key(ctx) -> str:
+    """并发限流的分桶键 = 父 run（无父 run 时回退会话）。"""
+    return (current_run_id(ctx) or current_session_key(ctx)
+            or "__anonymous_parent__")
+
+
+def _data_dir(ctx) -> str:
+    """数据目录（角色文件的父目录）：取 db_path 的父目录，缺省回落 ``data``。"""
+    # 缺省值经 SSOT 引用（守卫：data/agent.db 字面量只允许出现在 core/config_schema）
+    db_path = (ctx.config or {}).get("db_path") or DEFAULT_DB_PATH
+    return str(pathlib.Path(db_path).parent)
+
+
+def _catalog(ctx) -> list[dict]:
+    """当前工具目录（角色文件校验的白名单基准）。"""
+    try:
+        return ctx.tasks.catalog() or []
+    except Exception:                                  # 目录不可读 ⇒ 不做校验基准
+        return []
+
+
+@contextlib.asynccontextmanager
+async def _parent_slot(ctx, limit: int):
+    """占用本父 run 的一个并发槽位（退出释放；引用计数归零则销毁信号量，防泄漏）。
+
+    为什么不能用全局/每会话信号量：全局会把「另一个父 run 的子 Agent」算进来，
+    无故压低吞吐；每会话则跨 run 串扰。每父 run 才是审查意见 #4 的语义。
+    """
+    if limit <= 0:                       # 0/负 ⇒ 视为不限（但 batch 上限仍生效）
+        yield
+        return
+    key = _parent_run_key(ctx)
+    if key not in _PARENT_SEMS:
+        _PARENT_SEMS[key] = (limit, asyncio.Semaphore(limit))
+        _PARENT_REFS[key] = 0
+    elif _PARENT_SEMS[key][0] != limit:  # 限额变更 ⇒ 重建（旧信号量已无引用）
+        _PARENT_SEMS[key] = (limit, asyncio.Semaphore(limit))
+    _PARENT_REFS[key] += 1
+    _, sem = _PARENT_SEMS[key]
+    try:
+        await sem.acquire()
+        try:
+            yield
+        finally:
+            sem.release()
+    finally:
+        _PARENT_REFS[key] -= 1
+        if _PARENT_REFS[key] <= 0:
+            _PARENT_SEMS.pop(key, None)
+            _PARENT_REFS.pop(key, None)
 
 
 async def _child_wrapper(loop, ctx, prompt: str, identity, depth: int):
@@ -49,7 +114,7 @@ async def _child_wrapper(loop, ctx, prompt: str, identity, depth: int):
 
 
 async def run_subagent(ctx, *, task: str, role: str, param_tools: list | None,
-                       max_depth: int) -> dict:
+                       max_depth: int, max_threads: int = MAX_SUBAGENT_THREADS) -> dict:
     """委派一个受限子循环并回收结构化结果。
 
     参数
@@ -71,7 +136,9 @@ async def run_subagent(ctx, *, task: str, role: str, param_tools: list | None,
             f"已达子 Agent 最大递归深度（{max_depth}），禁止继续委派；"
             f"如需更深层次，请在阶段 3 显式放宽 max_depth 并评估风险")
 
-    role_obj = get_role(role)
+    # 阶段 2：目录式角色（每次委派时扫目录，改角色不用改代码；内置优先不被覆盖）
+    extra_roles = load_role_files(roles_dir(_data_dir(ctx)), _catalog(ctx))
+    role_obj = get_role(role, extra_roles)
     role_name = role_obj.name
 
     # ---- 工具三层交集的下两层：role.tools ∩ 请求 tools（父权限裁剪由工厂再做） ----
@@ -110,16 +177,21 @@ async def run_subagent(ctx, *, task: str, role: str, param_tools: list | None,
     # ★ 读会话键必须经原语（会话键守卫：禁止 ctx.state 直读，防 R1 悄悄退化）
     saved_skey = current_session_key(ctx)
 
-    child_task = asyncio.create_task(
-        _child_wrapper(child_loop, ctx, prompt, child_identity, depth + 1))
     result = None
     exc_info: BaseException | None = None
     try:
-        result = await child_task
-    except BaseException as exc:                      # 子运行期异常：结构化，不裸抛
-        exc_info = exc
+        # 阶段 2：占用本父 run 的一个并发槽位（单发也走同一条限流路径 ⇒ 并行与串行口径一致）
+        async with _parent_slot(ctx, max_threads):
+            child_task = asyncio.create_task(
+                _child_wrapper(child_loop, ctx, prompt, child_identity, depth + 1))
+            try:
+                result = await child_task
+            except BaseException as exc:              # 子运行期异常：结构化，不裸抛
+                exc_info = exc
     finally:
         # ★ 还原父的共享账单键（子收尾会把它清空；ContextVar 已隔离无需动）
+        # 并行下多个子会互相改写该共享键，但每个子保存的都是**同一个父值**，
+        # 故无论谁最后收尾，最终都回到父值；审计走 ContextVar，不受中间态影响。
         ctx.state[StateKeys.REACT_RUN_ID] = saved_rid
         ctx.state[StateKeys.SESSION_KEY] = saved_skey
 
@@ -154,3 +226,54 @@ async def run_subagent(ctx, *, task: str, role: str, param_tools: list | None,
             "evidence": (getattr(result, "as_evidence", lambda: {})()
                          if result is not None else {}),
             "request_id": getattr(result, "run_id", "") or ""}
+
+
+async def run_subagents_parallel(ctx, *, tasks: list[str], role: str,
+                                 param_tools: list | None, max_depth: int,
+                                 max_threads: int = MAX_SUBAGENT_THREADS) -> dict:
+    """并行委派多个子任务（阶段 2）：``asyncio.gather`` + 每父 run 信号量限流。
+
+    **不改共享 Actor**：并行 fan-out 全部发生在本工具 handler 内，
+    react 的 ``DefaultActor`` 仍是一次 ``await`` 拿回一个工具结果（顺序语义不变）。
+
+    隔离保证（并行下仍然成立）：
+    - 每个子跑在**独立 asyncio task** ⇒ ``_SUBAGENT_DEPTH`` / run_id 等 ContextVar
+      各自独立，互不污染（审计 ``trace_fields`` 优先读 ContextVar ⇒ 不会串号）；
+    - 共享 ``ctx.state[REACT_RUN_ID]`` 会被并发改写，但每个子保存的都是同一个父值
+      ⇒ 全部收尾后必然回到父值（见 ``run_subagent`` 内注释）。
+
+    部分失败语义：单个子失败**不影响其他子**，各自结构化上报；整体按
+    ``全部成功=ok / 部分成功=partial / 全部失败=error`` 汇总，父循环可据此自纠。
+
+    返回 ``{"status", "count", "succeeded", "failed", "results", "request_ids"}``。
+    """
+    if not tasks:
+        raise AgentError("并行委派：tasks 为空，至少要给一个子任务")
+    if len(tasks) > MAX_SUBAGENT_BATCH:
+        raise AgentError(f"并行委派子任务数 {len(tasks)} 超过上限 {MAX_SUBAGENT_BATCH}")
+
+    async def _one(index: int, one_task: str) -> dict:
+        try:
+            out = await run_subagent(ctx, task=one_task, role=role,
+                                     param_tools=param_tools, max_depth=max_depth,
+                                     max_threads=max_threads)
+        except BaseException as exc:                  # 单子失败不掀翻整批
+            out = {"status": "error", "answer": None,
+                   "evidence": {"error": type(exc).__name__,
+                                "detail": str(exc)[:500]},
+                   "request_id": ""}
+        return {"index": index, "task": one_task, **out}
+
+    raw = await asyncio.gather(*[_one(i, t) for i, t in enumerate(tasks)])
+    results = list(raw)
+    ok_n = sum(1 for r in results if r.get("status") in ("ok", "exhausted"))
+    fail_n = len(results) - ok_n
+    if fail_n == 0:
+        status = "ok"
+    elif ok_n == 0:
+        status = "error"
+    else:
+        status = "partial"
+    return {"status": status, "count": len(results), "succeeded": ok_n,
+            "failed": fail_n, "results": results,
+            "request_ids": [r.get("request_id") or "" for r in results]}

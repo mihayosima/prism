@@ -17,8 +17,9 @@ import logging
 
 from agent.api import AgentError, Events, Services, plugin
 
-from .roles import get_role, list_roles
-from .runner import run_subagent
+from .roles import list_roles, load_role_files, roles_dir
+from .runner import (MAX_SUBAGENT_BATCH, MAX_SUBAGENT_THREADS, _catalog, _data_dir,
+                     run_subagent, run_subagents_parallel)
 
 logger = logging.getLogger("agent.subagent")
 
@@ -48,8 +49,14 @@ class SubAgent:
         ctx.tasks.register(
             ctx, "agent.delegate",
             schema={
-                "task": {"type": "str", "required": True,
-                         "description": "委派给子 Agent 的独立任务描述（目标明确、可独立验收）"},
+                "task": {"type": "str", "required": False, "default": "",
+                         "description": ("委派给子 Agent 的独立任务描述（目标明确、可独立验收）。"
+                                         "与 tasks 二选一；两个都给时以 tasks 为准")},
+                "tasks": {"type": "array", "required": False, "default": [],
+                          "description": (f"**并行**委派多个子任务（阶段 2）：数组，每项是一条独立任务描述。"
+                                          f"最多 {MAX_SUBAGENT_BATCH} 条；同一父 run 下同时在飞的"
+                                          f"子 Agent 不超过 {MAX_SUBAGENT_THREADS} 个（其余排队）。"
+                                          "单个子任务失败不影响其他子，结果按原顺序返回")},
                 "role": {"type": "str", "required": False, "default": "default",
                          "description": ("子 Agent 角色（内置 default/explorer/worker；"
                                          "阶段 3 经 agent.react.subagents YAML 扩展）；"
@@ -70,9 +77,17 @@ class SubAgent:
             risk="read",      # plan 模式仍可见（只读语义；写操作仍受 guard/approval 硬兜底）
         )
 
-    async def _delegate(self, *, task: str, role: str = "default",
-                       tools: list | None = None) -> dict:
+    async def _delegate(self, *, task: str = "", role: str = "default",
+                        tools: list | None = None,
+                        tasks: list | None = None) -> dict:
         ctx = self._ctx
+        batch = [t for t in (tasks or []) if str(t or "").strip()]
+        if batch:                                     # 并行路径（阶段 2）
+            return await run_subagents_parallel(
+                ctx, tasks=batch, role=role, param_tools=tools or [],
+                max_depth=MAX_SUBAGENT_DEPTH)
+        if not str(task or "").strip():
+            raise AgentError("agent.delegate 需要 task 或 tasks（两者皆空，无法委派）")
         return await run_subagent(
             ctx, task=task, role=role, param_tools=tools or [],
             max_depth=MAX_SUBAGENT_DEPTH)
@@ -81,9 +96,15 @@ class SubAgent:
 
     async def status(self, ctx) -> dict:
         enabled = ctx.has(Services.REACT_FACTORY)
+        extra = (load_role_files(roles_dir(_data_dir(ctx)), _catalog(ctx))
+                 if enabled else {})
         return {"delegate_enabled": enabled,
                 "max_depth": MAX_SUBAGENT_DEPTH,
-                "roles": list_roles() if enabled else []}
+                "max_threads": MAX_SUBAGENT_THREADS,
+                "max_batch": MAX_SUBAGENT_BATCH,
+                "roles_dir": str(roles_dir(_data_dir(ctx))),
+                "roles": list_roles(extra) if enabled else [],
+                "file_roles": sorted(extra) if enabled else []}
 
 
 __all__ = ["SubAgent", "MAX_SUBAGENT_DEPTH"]

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pathlib
 
 import pytest
 
@@ -20,7 +21,7 @@ from agent.api import AgentError, Events, Services, StateKeys
 from agent.core.session import make_identity
 from agent.plugins.react import React
 from agent.plugins.subagent import runner as runner_mod
-from agent.plugins.subagent import SubAgent
+from agent.plugins.subagent import roles, SubAgent
 from agent.plugins.subagent.roles import Role, combine_tools, get_role
 from agent.profiles import build_agent
 
@@ -101,12 +102,29 @@ class _FakeCtx:
                       StateKeys.SESSION_KEY: "default:default"}
         self._factory = factory
         self._has = has_factory
+        # 阶段 2：角色文件加载需要 config(db_path) 与 tasks.catalog()
+        self.config = {"db_path": str(pathlib.Path(_NO_ROLES_DIR) / "agent.db")}
+        self.tasks = _FakeTasks(_CAT)
 
     def has(self, key):
         return self._has if key == Services.REACT_FACTORY else False
 
     def get(self, key, default=None):
         return self._factory if key == Services.REACT_FACTORY else default
+
+
+class _FakeTasks:
+    """最小 tasks 接缝：只提供角色校验所需的 catalog()。"""
+
+    def __init__(self, catalog):
+        self._catalog = catalog
+
+    def catalog(self):
+        return list(self._catalog)
+
+
+# 空角色目录（保证单测不读到真实 data/agent_roles）
+_NO_ROLES_DIR = pathlib.Path(__file__).resolve().parent / "_no_roles"
 
 
 def _fake_durable_recorder(captured):
@@ -157,7 +175,7 @@ def test_run_subagent_disjoint_tools(monkeypatch):
     ctx = _FakeCtx(factory=_FakeLoop)
     monkeypatch.setattr(
         runner_mod, "get_role",
-        lambda name: Role("custom", "d", ["a"], ""))
+        lambda name, extra=None: Role("custom", "d", ["a"], ""))
     with pytest.raises(AgentError):
         _run(runner_mod.run_subagent(
             ctx, task="t", role="custom", param_tools=["b"], max_depth=1))
@@ -241,7 +259,10 @@ def test_delegate_registered_in_real_container(tmp_path):
         assert "agent.delegate" in cat
         assert cat["agent.delegate"]["owner"] == "plugins.subagent"
         assert cat["agent.delegate"]["risk"] == "read"
-        assert cat["agent.delegate"]["required"] == ["task"]
+        # 阶段 2 起 task/tasks 二选一 ⇒ 二者皆非 required，由 handler 校验「至少给一个」
+        assert cat["agent.delegate"]["required"] == [], cat["agent.delegate"]["required"]
+        params = cat["agent.delegate"]["params"]
+        assert "task" in params and "tasks" in params and "role" in params
         await c.teardown()
     _run(s())
 
@@ -316,6 +337,284 @@ def test_delegate_with_real_react_loop_and_fixture_llm(tmp_path):
         p = json.loads(rows[-1]["payload"])
         assert p["status"] == "ok"
         assert p["child_run_id"] == out["request_id"]
+        await c.teardown()
+    _run(s())
+
+
+# ---------------------------------------------------------------------------
+# 阶段 2-B：目录式角色文件（校验 / 安全边界 / 内置优先）
+# ---------------------------------------------------------------------------
+
+_CAT = [{"name": "agent.ping", "owner": "agent.tasks"},
+        {"name": "agent.delegate", "owner": "plugins.subagent"}]
+
+
+def test_role_file_loaded_and_applied(tmp_path):
+    """放一个合法角色文件 ⇒ 可被解析并生效（加角色不用改代码）。"""
+    d = tmp_path / "agent_roles"
+    d.mkdir()
+    (d / "reviewer.json").write_text(
+        json.dumps({"description": "审查角色",
+                    "tools": ["agent.ping"],
+                    "system_note": "你是审查角色，只做复核"}), encoding="utf-8")
+    loaded = roles.load_role_files(d, _CAT)
+    assert "reviewer" in loaded
+    assert loaded["reviewer"]["tools"] == ["agent.ping"]
+    r = roles.get_role("reviewer", loaded)
+    assert r.name == "reviewer" and "审查角色" in r.system_note
+
+
+def test_role_file_unknown_tool_rejected_entirely(tmp_path):
+    """★ 安全边界：引用不存在的工具 ⇒ 整份角色拒绝（绝不静默变成「不收窄」）。"""
+    d = tmp_path / "agent_roles"
+    d.mkdir()
+    (d / "sneaky.json").write_text(
+        json.dumps({"tools": ["agent.ping", "不存在的工具"]}), encoding="utf-8")
+    loaded = roles.load_role_files(d, _CAT)
+    assert "sneaky" not in loaded, "未知工具的角色必须整份拒绝，否则白名单被静默放宽"
+    # 且该角色回落 default（不因文件坏而崩）
+    assert roles.get_role("sneaky", loaded).name == "default"
+
+
+def test_role_file_domain_reference_allowed(tmp_path):
+    """按域（owner）引用工具是合法的（与执行层拦截口径一致）。"""
+    d = tmp_path / "agent_roles"
+    d.mkdir()
+    (d / "dom.json").write_text(json.dumps({"tools": ["agent.tasks"]}), encoding="utf-8")
+    loaded = roles.load_role_files(d, _CAT)
+    assert loaded["dom.json".rsplit(".", 1)[0]] if False else True
+    assert loaded["dom"]["tools"] == ["agent.tasks"]
+
+
+def test_role_file_bad_schema_skipped_without_breaking_others(tmp_path):
+    """坏文件跳过，不影响同目录其他合法角色。"""
+    d = tmp_path / "agent_roles"
+    d.mkdir()
+    (d / "good.json").write_text(json.dumps({"tools": ["agent.ping"]}), encoding="utf-8")
+    (d / "broken.json").write_text("{not json", encoding="utf-8")
+    (d / "unknown_field.json").write_text(json.dumps({"nope": 1}), encoding="utf-8")
+    loaded = roles.load_role_files(d, _CAT)
+    assert "good" in loaded
+    assert "broken" not in loaded and "unknown_field" not in loaded
+
+
+def test_role_file_illegal_name_skipped(tmp_path):
+    """非法角色名（路径穿越/注入）⇒ 跳过。"""
+    d = tmp_path / "agent_roles"
+    d.mkdir()
+    (d / "..evil.json").write_text(json.dumps({}), encoding="utf-8")
+    loaded = roles.load_role_files(d, _CAT)
+    assert not any("evil" in k or ".." in k for k in loaded), loaded
+
+
+def test_role_file_missing_dir_returns_empty(tmp_path):
+    """目录不存在 ⇒ 空表（内置角色照常可用，零行为变化）。"""
+    assert roles.load_role_files(tmp_path / "nope", _CAT) == {}
+    assert roles.get_role("default", {}).name == "default"
+
+
+def test_builtin_role_not_overridden_by_file(tmp_path):
+    """内置角色优先：文件不得覆盖 default（升级不改变既有语义）。"""
+    d = tmp_path / "agent_roles"
+    d.mkdir()
+    (d / "default.json").write_text(
+        json.dumps({"system_note": "恶意覆盖"}), encoding="utf-8")
+    loaded = roles.load_role_files(d, _CAT)
+    r = roles.get_role("default", loaded)
+    assert r.system_note == "", "内置角色被文件覆盖了"
+
+
+def test_role_file_end_to_end_through_delegate(tmp_path):
+    """端到端：文件角色的 system_note 真到达子 prompt（不只是被解析）。"""
+    c = _build(tmp_path)
+    roles_path = pathlib.Path(tmp_path) / "agent_roles"
+    roles_path.mkdir()
+    (roles_path / "reviewer.json").write_text(
+        json.dumps({"description": "审查", "tools": None,
+                    "system_note": "你是审查角色FILEMARK"}), encoding="utf-8")
+
+    async def s():
+        await c.assemble()
+        out = await c.root.tasks.invoke(
+            c.root, "agent.delegate", task="复核一下", role="reviewer", tools=[])
+        assert out["status"] == "ok", out
+        assert "你是审查角色FILEMARK" in out["answer"], out["answer"]
+        await c.teardown()
+    _run(s())
+
+
+# ---------------------------------------------------------------------------
+# 阶段 2：并行委派（asyncio.gather + 每父 run 信号量）
+# ---------------------------------------------------------------------------
+
+class _SlowLoop:
+    """记录「在飞峰值」的假子循环：用于证明并发真发生且受限流约束。"""
+
+    def __init__(self, **kw):
+        self.kw = kw
+
+    async def run(self, ctx, prompt, *, identity=None):
+        async with _FLIGHT_LOCK:
+            _FLIGHT["now"] += 1
+            _FLIGHT["peak"] = max(_FLIGHT["peak"], _FLIGHT["now"])
+        try:
+            await asyncio.sleep(_CHILD_DELAY)          # 模拟子循环耗时
+        finally:
+            async with _FLIGHT_LOCK:
+                _FLIGHT["now"] -= 1
+        r = _result(f"done:{prompt[:20]}")
+        return r
+
+
+_FLIGHT_LOCK = asyncio.Lock()
+_FLIGHT = {"now": 0, "peak": 0}
+_CHILD_DELAY = 0.05
+
+
+def _reset_flight():
+    _FLIGHT["now"] = 0
+    _FLIGHT["peak"] = 0
+
+
+def test_parallel_delegate_returns_all_results_in_order():
+    ctx = _FakeCtx(factory=_SlowLoop)
+
+    async def s():
+        out = await runner_mod.run_subagents_parallel(
+            ctx, tasks=["任务A", "任务B", "任务C"], role="default",
+            param_tools=[], max_depth=1)
+        assert out["status"] == "ok", out
+        assert out["count"] == 3 and out["succeeded"] == 3
+        # 顺序必须与入参一致（父循环要按 index 对回子任务）
+        assert [r["index"] for r in out["results"]] == [0, 1, 2]
+        assert [r["task"] for r in out["results"]] == ["任务A", "任务B", "任务C"]
+        assert all(r["status"] == "ok" for r in out["results"])
+        assert len(out["request_ids"]) == 3
+    _run(s())
+
+
+def test_parallel_delegate_runs_concurrently_and_respects_semaphore():
+    """限流的**上限**与并发的**下限**都要验：既不串行、也不超发。"""
+    ctx = _FakeCtx(factory=_SlowLoop)
+
+    async def s():
+        _reset_flight()
+        n, limit = 6, 2
+        out = await runner_mod.run_subagents_parallel(
+            ctx, tasks=[f"t{i}" for i in range(n)], role="default",
+            param_tools=[], max_depth=1, max_threads=limit)
+        assert out["status"] == "ok", out
+        assert out["count"] == n
+        # 下限：真并发（峰值 >1，否则只是顺序执行）
+        assert _FLIGHT["peak"] > 1, f"未并发，峰值={_FLIGHT['peak']}"
+        # 上限：不得超过每父 run 的在飞上限
+        assert _FLIGHT["peak"] <= limit, f"超出限流 {limit}，峰值={_FLIGHT['peak']}"
+    _run(s())
+
+
+def test_parallel_delegate_partial_failure_isolated():
+    """单个子失败 ⇒ 整体 partial，其他子照常拿到结果（不掀翻整批）。"""
+
+    class _FlakyLoop:
+        def __init__(self, **kw):
+            self.kw = kw
+
+        async def run(self, ctx, prompt, *, identity=None):
+            if "坏" in prompt:
+                raise RuntimeError("子循环炸了")
+            return _result("ok")
+
+    ctx = _FakeCtx(factory=_FlakyLoop)
+
+    async def s():
+        out = await runner_mod.run_subagents_parallel(
+            ctx, tasks=["正常A", "坏任务", "正常B"], role="default",
+            param_tools=[], max_depth=1)
+        assert out["status"] == "partial", out
+        assert out["succeeded"] == 2 and out["failed"] == 1
+        bad = out["results"][1]
+        assert bad["status"] == "error"
+        assert "RuntimeError" in bad["evidence"]["error"]
+        assert out["results"][0]["status"] == "ok"
+        assert out["results"][2]["status"] == "ok"
+    _run(s())
+
+
+def test_parallel_delegate_all_fail_is_error():
+    class _BadLoop:
+        def __init__(self, **kw):
+            pass
+
+        async def run(self, ctx, prompt, *, identity=None):
+            raise RuntimeError("always fail")
+
+    ctx = _FakeCtx(factory=_BadLoop)
+
+    async def s():
+        out = await runner_mod.run_subagents_parallel(
+            ctx, tasks=["a", "b"], role="default", param_tools=[], max_depth=1)
+        assert out["status"] == "error", out
+        assert out["succeeded"] == 0 and out["failed"] == 2
+    _run(s())
+
+
+def test_parallel_delegate_rejects_empty_and_oversized():
+    ctx = _FakeCtx(factory=_SlowLoop)
+
+    async def s():
+        with pytest.raises(AgentError):
+            await runner_mod.run_subagents_parallel(
+                ctx, tasks=[], role="default", param_tools=[], max_depth=1)
+        with pytest.raises(AgentError):
+            await runner_mod.run_subagents_parallel(
+                ctx, tasks=["x"] * (runner_mod.MAX_SUBAGENT_BATCH + 1),
+                role="default", param_tools=[], max_depth=1)
+    _run(s())
+
+
+def test_parallel_delegate_restores_parent_shared_state(tmp_path):
+    """并行收尾后，父共享账单键必须回到父值（并发改写不得残留）。"""
+    c = _build(tmp_path)
+
+    async def s():
+        await c.assemble()
+        c.root.state[StateKeys.REACT_RUN_ID] = "PARENT_X"
+        out = await c.root.tasks.invoke(
+            c.root, "agent.delegate", tasks=["子任务甲", "子任务乙"], tools=[])
+        assert out["status"] == "ok", out
+        assert c.root.state[StateKeys.REACT_RUN_ID] == "PARENT_X"
+        await c.teardown()
+    _run(s())
+
+
+def test_parallel_delegate_real_engine_end_to_end(tmp_path):
+    """真引擎并行：多个子循环真跑完，各自有独立 run_id（审计不串号）。"""
+    c = _build(tmp_path)
+
+    async def s():
+        await c.assemble()
+        out = await c.root.tasks.invoke(
+            c.root, "agent.delegate",
+            tasks=["总结模块甲的职责", "总结模块乙的职责"], tools=[])
+        assert out["status"] == "ok", out
+        assert out["count"] == 2
+        rids = [r["request_id"] for r in out["results"]]
+        assert all(rids) and len(set(rids)) == 2, f"子 run_id 应各不相同：{rids}"
+        # 任务本体真到达各自的子循环
+        assert "模块甲" in out["results"][0]["answer"]
+        assert "模块乙" in out["results"][1]["answer"]
+        await c.teardown()
+    _run(s())
+
+
+def test_delegate_rejects_when_both_task_and_tasks_empty(tmp_path):
+    """task 与 tasks 皆空 ⇒ 诚实报错，不静默委派一个空任务。"""
+    c = _build(tmp_path)
+
+    async def s():
+        await c.assemble()
+        with pytest.raises(AgentError):
+            await c.root.tasks.invoke(c.root, "agent.delegate", task="", tools=[])
         await c.teardown()
     _run(s())
 
