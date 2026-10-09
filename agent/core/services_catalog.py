@@ -25,6 +25,13 @@ class Services:
     BUDGET = "budget"
     APPROVAL = "approval"
     REACT = "react"
+    #: **受限循环工厂**接缝（子 Agent 插件用）：``(tools_override, cfg_overrides,
+    #: components_override, governance_override, depth) -> ReactLoop``。
+    #:
+    #: ★ 引擎无关契约（子 Agent 方案 v0.3 §3.2）：签名不绑定 ReactLoop，只要求返回对象
+    #: 具备 ``run(ctx, prompt, identity) -> ReactResult`` 方法；子引擎换成 LangGraph 时
+    #: 只改工厂实现一行，派遣契约不变。未装配 ⇒ None ⇒ ``agent.delegate`` 优雅降级（不注册）。
+    REACT_FACTORY = "react.factory"
     MEMORY = "memory"
     CONTEXT = "context"
     SYSTEM_MEMORY = "system_memory"
@@ -54,6 +61,7 @@ ALL = frozenset(
         Services.BUDGET,
         Services.APPROVAL,
         Services.REACT,
+        Services.REACT_FACTORY,
         Services.MEMORY,
         Services.CONTEXT,
         Services.SYSTEM_MEMORY,

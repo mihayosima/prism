@@ -54,7 +54,7 @@ class React:
     name = "plugins.react"
     version = "0.1.0"
     layer = "system"
-    provides = [Services.REACT]
+    provides = [Services.REACT, Services.REACT_FACTORY]
     inject = [Services.LLM, Services.TASKS, Services.EVENTS, Services.DB]
     tables = ()
     description = "ReAct 多步工具循环（Think→Act+Observe→收敛；max_steps/时延/预算三把闸）"
@@ -84,6 +84,16 @@ class React:
         observer = ctx.get("react.observer") or DefaultObserver()
         finalizer = ctx.get("react.finalizer") or DefaultFinalizer()
         ctx.provide(Services.REACT, ReactLoop(reasoner, actor, observer, finalizer, rcfg))
+
+        # 子 Agent 接缝（v0.3 §3.2）：受限循环工厂。签名引擎无关，返回对象须具
+        # ``run(ctx, prompt, identity) -> ReactResult``。未来子引擎换 LangGraph 只改本闭包体。
+        def _make_loop(tools_override=None, cfg_overrides=None, components_override=None,
+                       governance_override=None, depth=0):
+            return ReactLoop(reasoner, actor, observer, finalizer, rcfg,
+                             tools_override=tools_override, cfg_overrides=cfg_overrides,
+                             components_override=components_override,
+                             governance_override=governance_override, depth=depth)
+        ctx.provide(Services.REACT_FACTORY, _make_loop)
 
     async def status(self, ctx) -> dict:
         """插件页状态摘要（未跑过则如实报 ``runs: 0``，不给笼统假状态）。"""

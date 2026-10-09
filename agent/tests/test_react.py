@@ -330,7 +330,7 @@ def test_manageable_directory_plugin_and_no_residue(tmp_path):
         react = [x for x in cands if x["name"] == "plugins.react"]
         assert react, "plugins.react 未出现在插件发现列表"
         assert react[0]["layer"] == "system"       # 系统组件（语义标签，不闸管理）
-        assert react[0]["provides"] == ["react"]
+        assert react[0]["provides"] == ["react", "react.factory"]
         assert react[0]["tables"] == []            # 无自有表 → 卸载零残留
 
     c = _build(tmp_path)

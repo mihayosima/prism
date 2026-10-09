@@ -447,7 +447,22 @@ def _reads(fn: ast.AST) -> set[str]:
 
 
 def test_plugins_declare_every_service_they_read():
-    """插件读了的服务必须在 ``inject``（或自己的 ``provides``）里声明。"""
+    """插件读了的服务必须在 ``inject``（或自己的 ``provides``）里声明。
+
+    例外（与 ``test_inject_never_couples_two_plugins`` 对齐）：由**其它插件**提供、
+    且非内核(SYS)的服务**只能走软依赖**——在 ``inject`` 里声明它们会触发那条守卫
+    （"该插件停用即装配失败，破坏 opt-in"）。故此类服务豁免"必须声明"，由代码以
+    ``ctx.get`` 取用并自行处理缺失（如 subagent 对 ``REACT_FACTORY`` 的软依赖）。
+    内核(SYS)服务仍强制声明（可安全 inject）。
+    """
+    from agent.profiles import SYS_PLUGINS
+
+    kernel = set()
+    for p in SYS_PLUGINS:
+        kernel.update(getattr(p, "provides", []) or [])
+    provides, inject = _plugin_specs()
+    provided_any = set(provides.keys())
+    soft_deps = provided_any - kernel   # 插件提供的非内核服务：只能软依赖，豁免声明要求
     bad: list[str] = []
     for fp in _py_files():
         try:
@@ -455,18 +470,18 @@ def test_plugins_declare_every_service_they_read():
         except Exception:                                    # pragma: no cover
             continue
         for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
-            inject = _declared(cls, "inject")
-            provides = _declared(cls, "provides")
-            if not inject and not provides:
+            inject_d = _declared(cls, "inject")
+            provides_d = _declared(cls, "provides")
+            if not inject_d and not provides_d:
                 continue
             for fn in cls.body:
                 if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
-                missing = _reads(fn) - inject - provides
+                missing = _reads(fn) - inject_d - provides_d - soft_deps
                 if missing:
                     rel = fp.relative_to(AGENT)
                     bad.append(f"  {rel}::{cls.name}.{fn.name} 读了 {sorted(missing)}"
-                               f" 但未声明 inject（已声明 {sorted(inject)}）")
+                               f" 但未声明 inject（已声明 {sorted(inject_d)}）")
     assert not bad, (
         "插件读取了未在 inject 声明的服务 ⇒ 装配顺序不保证，错误会推迟到运行时：\n"
         + "\n".join(bad))

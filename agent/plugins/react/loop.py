@@ -58,7 +58,7 @@ import logging
 import time
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from agent.api import (CapabilityNotImplemented, Events, Services, SessionIdentity,
@@ -189,6 +189,7 @@ class ReactResult:
     tools: list[str] = field(default_factory=list)
     observations: list[dict] = field(default_factory=list)
     summary: str = ""                     # C：收尾摘要（chat 并入 memory.remember 载荷）
+    run_id: str = ""                      # 本次 run 的自生成 run_id（uuid4.hex）；子 Agent 返回契约回填 request_id 用
 
     def as_evidence(self) -> dict:
         """机器证据（供 chat 转写 / 前端展示；纯数据）。"""
@@ -241,6 +242,24 @@ def visible_tools(ctx) -> list[dict]:
         catalog = [t for t in catalog if t.get("risk") == "read"]
     return [{**t, "description": _slim_description(t.get("description"))}
             for t in catalog]
+
+
+def _apply_whitelist(base: list[dict], whitelist: list[str] | None) -> list[dict]:
+    """按白名单收窄可见工具集（**纯函数、幂等、不改入参**；子 Agent 方案 v0.3 §3.2）。
+
+    标识符语义（与工厂 ``tools_override`` 口径一致）：
+    - ``whitelist is None`` / 空列表 ⇒ 不收窄，**原样返回同一列表对象**（默认态零行为变化）；
+    - ``"*"`` ∈ 白名单 ⇒ 不额外收窄（仍受 ``visible_tools`` 权限裁剪，白名单只能收窄不能放宽）；
+    - 具体工具名（``"agent.read"``）⇒ 命中该名工具；
+    - 域（``owner``，如 ``"plugins.explorer"`` 或 ``"web.*"``）⇒ 命中该域全部工具。
+
+    交集语义：``role.tools`` / ``param.tools`` 任意一层都只能**再收窄**，不能放宽
+    （审查意见 #2 / #R3：``role.tools`` 是安全下界）。
+    """
+    if not whitelist or "*" in whitelist:
+        return base
+    ids = set(whitelist)
+    return [t for t in base if t.get("name") in ids or _domain_of(t) in ids]
 
 
 def _trim(messages: list[dict], keep: int) -> list[dict]:
@@ -377,23 +396,81 @@ LAZY_META_TOOLS: list[dict] = [
 
 
 class ReactLoop:
-    """ctx.react —— 多步工具循环（四组件可换；三把闸）。"""
+    """ctx.react —— 多步工具循环（四组件可换；三把闸）。
+
+    子 Agent 接缝（v0.3 §3.2）：构造期可选传入 ``tools_override`` / ``cfg_overrides`` /
+    ``components_override`` / ``governance_override`` / ``depth``。全部默认 ``None``/``0``
+    ⇒ **逐字节/逐值等价于改动前**（无 override 时 ``resolve_tools`` 回落 ``visible_tools``、
+    ``resolve_cfg`` 回落 ``self._cfg``、``_resolve_governance`` 回落容器现取）。
+    未来做「子 Agent 独立上下文治理（Q4）」/「组件层按 role 解耦（Q6）」只在工厂传参，
+    调用点零改动 ⇒ 零返工。
+    """
 
     def __init__(self, reasoner: Reasoner, actor: Actor, observer: Observer,
-                 finalizer: Finalizer, cfg: ReactConfig):
-        self._reasoner = reasoner
-        self._actor = actor
-        self._observer = observer
-        self._finalizer = finalizer
+                 finalizer: Finalizer, cfg: ReactConfig, *,
+                 tools_override: list[str] | None = None,
+                 cfg_overrides: dict | None = None,
+                 components_override: dict | None = None,
+                 governance_override: object | None = None,
+                 depth: int = 0):
+        # Q6 接缝：按 key 替换组件，缺省回落构造传入组件（不传 components_override 时逐值等价）。
+        comps = components_override or {}
+        self._reasoner = comps.get("reasoner", reasoner)
+        self._actor = comps.get("actor", actor)
+        self._observer = comps.get("observer", observer)
+        self._finalizer = comps.get("finalizer", finalizer)
         self._cfg = cfg
+        # 其余接缝参数原值存储，由 resolve_* 方法在运行期应用（见下）。
+        self._tools_override = tools_override
+        self._cfg_overrides = cfg_overrides
+        self._governance_override = governance_override
+        self._depth = depth
 
     @property
     def config(self) -> ReactConfig:
         return self._cfg
 
+    @property
+    def depth(self) -> int:
+        """当前循环深度（子 Agent 递归护栏；主循环为 0）。"""
+        return self._depth
+
     def visible_tools(self, ctx) -> list[dict]:
         """当前工具可见集（读 ``permission_mode``；本次恒全量 —— 见模块级 ``visible_tools``）。"""
         return visible_tools(ctx)
+
+    # ---------- 子 Agent 接缝方法（可单测；无 override 时回落既有行为） ----------
+
+    def resolve_tools(self, ctx) -> list[dict]:
+        """最终可见工具集（接缝点）：先经 ``visible_tools(ctx)`` 权限裁剪，再按白名单收窄。
+
+        不传 ``tools_override`` ⇒ 等价于 ``visible_tools(ctx)``（决策路径与现状一致）。
+        """
+        tools = visible_tools(ctx)
+        if self._tools_override is not None:
+            tools = _apply_whitelist(tools, self._tools_override)
+        return tools
+
+    def resolve_cfg(self) -> ReactConfig:
+        """合并 ``cfg_overrides`` 后的实际配置（接缝点）；不传 ⇒ 原样返回 ``self._cfg``。
+
+        未知键被静默忽略（前向兼容未来新增字段）；已知键覆盖。
+        """
+        if not self._cfg_overrides:
+            return self._cfg
+        known = ReactConfig.__dataclass_fields__
+        return replace(self._cfg, **{k: v for k, v in self._cfg_overrides.items() if k in known})
+
+    def _resolve_governance(self, ctx):
+        """治理器取用（Q4 接缝）：优先 ``governance_override``，否则回落容器现取。
+
+        默认回落与历史行为逐值等价（``ctx.get(Services.CONTEXT)`` 现取）；
+        ``governance_override`` 为未来「子 Agent 独立上下文治理」预留——传入即覆盖，
+        本类 4 处调用点无需再改 ⇒ 零返工。
+        """
+        if self._governance_override is not None:
+            return self._governance_override
+        return ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
 
     async def run(self, ctx, prompt: str, *, session_id: str = "default",
                   prior: list[dict] | None = None, resume: bool = False,
@@ -464,7 +541,7 @@ class ReactLoop:
         请求共享，把「当前会话」塞进共享槽会互相覆盖（H5/H6）。显式传参零歧义、零竞态。
         缺失时按 ``session_id`` 退化（保持既有调用方可用，见内核 ``coerce_identity``）。
         """
-        cfg = self._cfg
+        cfg = self.resolve_cfg()       # 子 Agent 接缝：合并 cfg_overrides（无 override 时回落 self._cfg）
         # 身份 → 键空间（task_id / 快照 tenant / 会话键）一次定型，全程不变
         ident = identity if identity is not None else coerce_identity(session_id)
         session_key = ident.session_key
@@ -473,7 +550,7 @@ class ReactLoop:
             "tenant": ident.tenant, "user": ident.user,
             "max_steps": cfg.max_steps, "at": now_iso()})
 
-        tools = visible_tools(ctx)
+        tools = self.resolve_tools(ctx)   # 子 Agent 接缝：权限裁剪 + tools_override 收窄（无 override 时等价于 visible_tools）
         # G（路线 2）：投影层域裁剪——隐藏域「对模型不可见、对检索可见」。
         # 硬前提：只在懒加载时启用（非懒加载无 tool_search/tool_load 检索通道，
         # 裁剪即硬隐藏＝不可回溯）；故 allowed 在此处被 lazy_tools 一票否决。
@@ -685,7 +762,8 @@ class ReactLoop:
                 ctx.state[StateKeys.REACT_RUN_ID] = ""
                 return ReactResult(ok=True, text=out.text or "（未给出回答）", steps=steps,
                                    tokens_in=tokens_in, tokens_out=tokens_out,
-                                   tools=tool_trace, observations=observed)
+                                   tools=tool_trace, observations=observed,
+                                   run_id=run_id)
 
             # ---- Act + Observe ----
             # L1：懒加载模式下先拦截元工具与未加载调用（loop 内联处理，不进注册表）
@@ -695,6 +773,14 @@ class ReactLoop:
                 meta_results, real_calls = await self._partition_meta(
                     wm, task, out.tool_calls, tools)
             results = list(meta_results)
+            if real_calls:
+                # ★ 子 Agent 执行层白名单硬拦截（v0.3 §3.4「安全下界」的兑现）：
+                # tools_override 只裁剪**可见目录**（提示层软约束），模型幻觉/越权
+                # 仍可能点名白名单外���具。此处按同一标识符语义（工具名或域）在**执行前**
+                # 二次校验，越界 ⇒ 拒绝观察（不执行、不改 state），让模型自纠。
+                # 无 tools_override ⇒ _tools_override is None ⇒ 零行为变化。
+                denied_results, real_calls = self._split_whitelist_denied(ctx, real_calls)
+                results.extend(denied_results)
             if real_calls:
                 results.extend(await self._act_with_budget(ctx, real_calls, started, cfg))
             stop_reason: str | None = None
@@ -785,7 +871,8 @@ class ReactLoop:
         ctx.state[StateKeys.REACT_RUN_ID] = ""
         return ReactResult(ok=not hard, text=text, steps=steps, tokens_in=tokens_in,
                            tokens_out=tokens_out, exhausted=True, reason=reason,
-                           tools=tool_trace, observations=observed, summary=summary)
+                           tools=tool_trace, observations=observed, summary=summary,
+                           run_id=run_id)
 
     # ---------- 循环内上下文（S3：块内准备 → 治理器装配） ----------
 
@@ -999,7 +1086,7 @@ class ReactLoop:
         - native tools 数组作为**请求附加项**显式登记（此前「扣预算但不入账」的黑洞）；
         - 装配前注入**声明**（本阶段应有块清单），使漏报可被结构性发现。
         """
-        gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
+        gov = self._resolve_governance(ctx)
         fn = getattr(gov, "assemble", None) if gov is not None else None
         if not callable(fn):
             return _trim(messages, self._cfg.history_keep), {}
@@ -1110,7 +1197,7 @@ class ReactLoop:
             logger.warning("react context governed emit failed: %s", exc)
         # ---- G2.0（P3-2）：装配后**不变量断言**（I-3 前缀可测 / I-4 预算守恒）----
         # 记录 + 告警（不阻断）；记账面判定经治理器门面**软调用**（不 import 插件内部）。
-        gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
+        gov = self._resolve_governance(ctx)
         inv_fn = getattr(gov, "check_invariants", None)
         if callable(inv_fn):
             payload = {"stage": "react", **stats}
@@ -1141,7 +1228,7 @@ class ReactLoop:
         「取治理器 → 判水位 → 发遥测」，**不写入任何状态**；治理器缺失即静默跳过（软依赖）。
         执行点＝run 收尾存档点（§4.5 ②；与链压缩⑤同一时机闸：一 run 一次）。
         """
-        gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
+        gov = self._resolve_governance(ctx)
         assess = getattr(gov, "assess", None)
         if not callable(assess):
             return
@@ -1176,7 +1263,7 @@ class ReactLoop:
           ``CONTEXT_INVARIANT_VIOLATION``；链被替换才回写 ``task.chain``；
         - 全程**不阻断收尾**（任何异常吞掉并记日志）——治理失败不得影响用户的答复交付。
         """
-        gov = ctx.get(Services.CONTEXT) if ctx.has(Services.CONTEXT) else None
+        gov = self._resolve_governance(ctx)
         plan_fn = getattr(gov, "plan", None)
         if not callable(plan_fn):
             return
@@ -1234,6 +1321,44 @@ class ReactLoop:
         return s
 
     # ---------- L1：懒加载（目录卡 / 元工具拦截 / 按需装载） ----------
+
+    def _split_whitelist_denied(self, ctx, calls) -> tuple[list[ToolResult], list]:
+        """按 ``tools_override`` 白名单拆分调用：越界者拒绝放行，合法者交回继续执行。
+
+        为什么执行层还要再拦一道（v0.3 §3.4「role.tools 是安全下界」的兑现）：
+        - ``resolve_tools`` 只把白名单作用于**可见目录**（喂给模型的 tools 数组），
+          属提示层**软约束**——模型幻觉、被prompt 注入、或工具名被伪造时仍可能点名
+          白名单外的工具；
+        - ``sys.guard`` 的``task_allow``/``task_deny`` 是**配置驱动**的全局策略，
+          无法表达「仅本子循环内生效」的动态白名单（那必须按 asyncio task 隔离）。
+
+        语义与 ``_apply_whitelist`` 完全一致（工具名或 ``owner`` 域命中即放行），
+        保证「目录里看得见」与「执行时放得过」是同一套口径，不会出现
+        「提示说不能用、实际却调得动」的裂缝。
+
+        ``self._tools_override`` 为 None / 含 ``"*"`` ⇒ 原样返回，**零行为变化**
+        （父循环与不委派的主路径完全不受影响）。
+        """
+        wl = self._tools_override
+        if not wl or "*" in wl:
+            return [], list(calls)
+        ids = set(wl)
+        catalog = {t.get("name"): t for t in ctx.tasks.catalog()}
+        denied: list[ToolResult] = []
+        allowed: list = []
+        for c in calls:
+            t = catalog.get(c.name) or {}
+            if c.name in ids or _domain_of(t) in ids:
+                allowed.append(c)
+            else:
+                denied.append(ToolResult(
+                    c.name,
+                    f"工具 {c.name!r} 不在本次委派的允许范围内"
+                    f"（允许：{sorted(ids)}）。请改用允许范围内的工具，"
+                    f"或换个思路完成子任务。",
+                    is_error=True, denied=True, denied_by="whitelist",
+                    tool_call_id=getattr(c, "id", "") or ""))
+        return denied, allowed
 
     @staticmethod
     def _tools_for_step(tools: list[dict], task: TaskContext,

@@ -68,6 +68,11 @@ class Events:
     REACT_EXHAUSTED = "agent/react/exhausted"
     REACT_ARCHIVED = "agent/react/archived"  # P1：链存档落工作记忆（审计）
 
+    # 子 Agent 委派（plugins.subagent）：spawn 审计（durable 直写 agent_events；无 live 监听者）。
+    # 载荷：{parent_run_id, parent_session_key, child_run_id, child_session_key, role, depth, task, status}
+    # 父子 run 关联靠 child_run_id（子循环自生成的 uuid4.hex），与父经 parent_run_id 关联。
+    SUBAGENT_SPAWN = "agent/subagent/spawn"
+
     # 记忆插件
     MEMORY_REMEMBERED = "agent/memory/remembered"
     MEMORY_RECALL = "agent/memory/recall"
@@ -135,6 +140,7 @@ EVENT_MODE: dict[str, str] = {
     Events.REACT_FINAL: "emit",
     Events.REACT_EXHAUSTED: "emit",
     Events.REACT_ARCHIVED: "emit",        # P1：链存档审计（durable 由 react 直写）
+    Events.SUBAGENT_SPAWN: "emit",        # 子 Agent 委派 spawn 审计（durable 由 subagent 直写）
     Events.MEMORY_REMEMBERED: "emit",
     Events.MEMORY_RECALL: "emit",
     Events.CONTEXT_GOVERNED: "emit",      # G1：装配元数据遥测（无监听者即 no-op）
