@@ -21,8 +21,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import copy
+import hashlib
 import logging
 import pathlib
+import uuid
 
 from agent.api import (
     DEFAULT_DB_PATH, AgentError, DEFAULT_SESSION, DEFAULT_TENANT, DEFAULT_USER,
@@ -30,17 +33,23 @@ from agent.api import (
     make_identity, now_iso,
 )
 
-from .roles import combine_tools, get_role, load_role_files, roles_dir
+from .roles import apply_leaf_rule, combine_tools, get_role, load_role_files, roles_dir
 
 logger = logging.getLogger("agent.subagent")
 
-# 子循环护栏（MVP 默认；阶段 3 可经配置放宽）
+# 子循环护栏（MVP 默认；阶段 3 起角色可覆盖，见 roles.MAX_ROLE_*）
 SUBAGENT_MAX_STEPS = 6           # 子循环步数上限（比父的 8 更紧）
 SUBAGENT_DEADLINE_S = 60.0       # 子循环整体时延上限（秒）；子循环自身的 deadline 闸据此收尾
 
 # 阶段 2：并行委派护栏
 MAX_SUBAGENT_THREADS = 4         # 每**父 run** 的在飞子 Agent 上限（审查意见 #4）
 MAX_SUBAGENT_BATCH = 16          # 单次 tools 调用最多委派的子任务数（防一次 fan-out 打爆）
+
+# 阶段 3：防死循环（「打回」由父层编排 ⇒ 硬护栏必须在此，不能指望模型自觉收敛）
+MAX_DELEGATIONS_PER_RUN = 24     # 同一父 run 内委派总次数上限（含同步/异步/并行展开）
+MAX_RESEND_PER_TASK = 3          # 同一任务文本的重派上限（父反复「打回」⇒ 到此为止）
+MAX_PENDING_PER_RUN = 8          # 同一父 run 内未回收的异步句柄上限（防句柄泄漏）
+MAX_TRACKED_RUNS = 256           # 记账字典上限（父 run 无「结束」事件 ⇒ 按插入序淘汰）
 
 # 当前委派深度（ContextVar，按 task 隔离）。主循环上下文为 0；每深入一层 +1。
 _SUBAGENT_DEPTH = contextvars.ContextVar("subagent_depth", default=0)
@@ -51,10 +60,29 @@ _SUBAGENT_DEPTH = contextvars.ContextVar("subagent_depth", default=0)
 _PARENT_SEMS: dict[str, tuple[int, asyncio.Semaphore]] = {}
 _PARENT_REFS: dict[str, int] = {}
 
+# ---- 阶段 3：委派预算记账（键 = 父 run） ----
+# 父 run 没有「结束」事件可挂清理 ⇒ 靠「上限 + 按插入序淘汰」兜住内存增长。
+_RUN_DELEGATIONS: dict[str, int] = {}
+_RUN_RESEND: dict[str, dict[str, int]] = {}
+
+# ---- 阶段 3：异步委派句柄（键 = 父 run → handle） ----
+_PENDING: dict[str, dict[str, "_Pending"]] = {}
+_BG_TASKS: set = set()
+
 
 def _parent_run_key(ctx) -> str:
-    """并发限流的分桶键 = 父 run（无父 run 时回退会话）。"""
-    return (current_run_id(ctx) or current_session_key(ctx)
+    """限流/预算/句柄的分桶键 = 父 run（无父 run 时回退会话）。
+
+    ★ 只经 **ContextVar** 取父 run_id，**不回落** ``ctx.state[REACT_RUN_ID]``：
+    该共享键会被**并发在跑的子循环**改写（子写子值、收尾才复原），而异步委派
+    （``wait=false``）的取回发生在**另一次工具调用**、子可能还在跑 ⇒ 若回落共享
+    state，spawn 与 collect 会算出**不同的键**，句柄就"凭空消失"（实测命中：
+    fan-out 后 collect 恒返回 0 条）。ContextVar 按父 task 隔离且全程稳定，
+    才是"父 run"的正确载体。
+    """
+    # 两者都**不传 ctx** ⇒ 只读 ContextVar（同上：不回落易变的共享 state；
+    # 且 root ctx 与插件作用域 ctx 的 state 视图可能不同，必须取进程级稳定值）
+    return (current_run_id() or current_session_key()
             or "__anonymous_parent__")
 
 
@@ -73,35 +101,164 @@ def _catalog(ctx) -> list[dict]:
         return []
 
 
-@contextlib.asynccontextmanager
-async def _parent_slot(ctx, limit: int):
-    """占用本父 run 的一个并发槽位（退出释放；引用计数归零则销毁信号量，防泄漏）。
+class _Slot:
+    """本父 run 的一个并发槽位（审查意见 #4：限的是**同父 run 在飞子数**）。
 
     为什么不能用全局/每会话信号量：全局会把「另一个父 run 的子 Agent」算进来，
     无故压低吞吐；每会话则跨 run 串扰。每父 run 才是审查意见 #4 的语义。
+
+    阶段 3：异步委派的槽位要**跨工具调用持有**（spawn 时占用、子跑完才释放），
+    故除上下文管理器用法外，另提供 ``acquire()`` / ``release()`` 手工配对。
     """
-    if limit <= 0:                       # 0/负 ⇒ 视为不限（但 batch 上限仍生效）
-        yield
-        return
-    key = _parent_run_key(ctx)
-    if key not in _PARENT_SEMS:
-        _PARENT_SEMS[key] = (limit, asyncio.Semaphore(limit))
-        _PARENT_REFS[key] = 0
-    elif _PARENT_SEMS[key][0] != limit:  # 限额变更 ⇒ 重建（旧信号量已无引用）
-        _PARENT_SEMS[key] = (limit, asyncio.Semaphore(limit))
-    _PARENT_REFS[key] += 1
-    _, sem = _PARENT_SEMS[key]
-    try:
-        await sem.acquire()
+
+    def __init__(self, ctx, limit: int):
+        self._key = _parent_run_key(ctx) if limit > 0 else ""
+        self._sem: asyncio.Semaphore | None = None
+        if limit > 0:
+            key = self._key
+            if key not in _PARENT_SEMS:
+                _PARENT_SEMS[key] = (limit, asyncio.Semaphore(limit))
+                _PARENT_REFS[key] = 0
+            elif _PARENT_SEMS[key][0] != limit:   # 限额变更 ⇒ 重建（旧信号量已无引用）
+                _PARENT_SEMS[key] = (limit, asyncio.Semaphore(limit))
+            _PARENT_REFS[key] += 1
+            self._sem = _PARENT_SEMS[key][1]
+
+    async def acquire(self) -> None:
+        if self._sem is not None:
+            await self._sem.acquire()
+
+    def release(self) -> None:
+        """释放槽位并递减引用（归零则销毁信号量，防泄漏）；**幂等**。"""
+        if self._sem is None:
+            return
         try:
-            yield
+            self._sem.release()
         finally:
-            sem.release()
-    finally:
-        _PARENT_REFS[key] -= 1
-        if _PARENT_REFS[key] <= 0:
-            _PARENT_SEMS.pop(key, None)
-            _PARENT_REFS.pop(key, None)
+            key = self._key
+            _PARENT_REFS[key] -= 1
+            if _PARENT_REFS.get(key, 0) <= 0:
+                _PARENT_SEMS.pop(key, None)
+                _PARENT_REFS.pop(key, None)
+            self._sem = None             # 幂等：重复 release 不会二次递减
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc):
+        self.release()
+        return False
+
+
+def _parent_slot(ctx, limit: int) -> _Slot:
+    """占用本父 run 的一个并发槽位（``async with`` 用法；异步委派改用手工配对）。"""
+    return _Slot(ctx, limit)
+
+
+# ---------------------------------------------------------------------------
+# 阶段 3：委派预算（防死循环）与异步句柄（wait=false）
+# ---------------------------------------------------------------------------
+
+class _Pending:
+    """一个在飞的异步委派（句柄）。"""
+
+    __slots__ = ("handle", "parent_key", "task", "role", "depth",
+                 "child_session_key", "created_at", "task_obj")
+
+    def __init__(self, *, handle: str, parent_key: str, task: str, role: str,
+                 depth: int, child_session_key: str, task_obj):
+        self.handle = handle
+        self.parent_key = parent_key
+        self.task = task
+        self.role = role
+        self.depth = depth
+        self.child_session_key = child_session_key
+        self.created_at = now_iso()
+        self.task_obj = task_obj
+
+
+def _task_fingerprint(task: str) -> str:
+    """任务文本指纹（重派计数用；不落原文，避免长文本进内存键）。"""
+    return hashlib.sha1((task or "").strip().encode("utf-8")).hexdigest()[:16]
+
+
+def _prune_runs() -> None:
+    """记账字典超上限 ⇒ 按插入序淘汰最旧的父 run（父 run 无结束事件可挂清理）。"""
+    for store in (_RUN_DELEGATIONS, _RUN_RESEND, _PENDING):
+        while len(store) > MAX_TRACKED_RUNS:
+            store.pop(next(iter(store)), None)
+
+
+def reset_run_state(parent_key: str | None = None) -> None:
+    """清空委派预算/句柄记账（供测试与插件 teardown 使用）。"""
+    if parent_key is None:
+        _RUN_DELEGATIONS.clear()
+        _RUN_RESEND.clear()
+        _PENDING.clear()
+        return
+    _RUN_DELEGATIONS.pop(parent_key, None)
+    _RUN_RESEND.pop(parent_key, None)
+    _PENDING.pop(parent_key, None)
+
+
+def _check_budget(ctx, task: str) -> dict | None:
+    """委派预算校验；超限返回**结构化 rejected**（不抛，交父循环自行收敛）。"""
+    key = _parent_run_key(ctx)
+    used = _RUN_DELEGATIONS.get(key, 0)
+    if used >= MAX_DELEGATIONS_PER_RUN:
+        return {"status": "rejected", "answer": None, "request_id": "",
+                "evidence": {"reason": "delegation_budget_exhausted",
+                             "used": used, "limit": MAX_DELEGATIONS_PER_RUN,
+                             "detail": ("本轮已用完委派预算：请自行收敛给出结论，"
+                                        "不要再委派子 Agent。")}}
+    fp = _task_fingerprint(task)
+    resent = _RUN_RESEND.get(key, {}).get(fp, 0)
+    if resent >= MAX_RESEND_PER_TASK:
+        return {"status": "rejected", "answer": None, "request_id": "",
+                "evidence": {"reason": "resend_limit_exceeded",
+                             "used": resent, "limit": MAX_RESEND_PER_TASK,
+                             "detail": ("同一任务已被重派到上限次数（防「打回」死循环）："
+                                        "请接受现有结果或换个思路，不要再重派同一任务。")}}
+    pending_n = len(_PENDING.get(key, {}))
+    if pending_n >= MAX_PENDING_PER_RUN:
+        return {"status": "rejected", "answer": None, "request_id": "",
+                "evidence": {"reason": "pending_handles_exhausted",
+                             "used": pending_n, "limit": MAX_PENDING_PER_RUN,
+                             "detail": ("未回收的异步委派句柄已达上限：请先收集既有结果"
+                                        "（传 handle），再发起新的异步委派。")}}
+    return None
+
+
+def _charge_budget(ctx, task: str) -> None:
+    """记账一次委派（同步/异步/并行逐条都记）。"""
+    key = _parent_run_key(ctx)
+    _RUN_DELEGATIONS[key] = _RUN_DELEGATIONS.get(key, 0) + 1
+    fp = _task_fingerprint(task)
+    bucket = _RUN_RESEND.setdefault(key, {})
+    bucket[fp] = bucket.get(fp, 0) + 1
+    _prune_runs()
+
+
+def pending_handles(ctx) -> list[str]:
+    """本父 run 未回收的异步句柄（供 status 与 collect 使用）。"""
+    return sorted(_PENDING.get(_parent_run_key(ctx), {}))
+
+
+async def cancel_all(reason: str = "teardown") -> int:
+    """取消并回收全部在飞异步委派（插件 teardown 用）；返回取消数量。"""
+    tasks = [t for t in _BG_TASKS if not t.done()]
+    for t in tasks:
+        t.cancel()
+    _BG_TASKS.clear()
+    for pend in [p for bucket in _PENDING.values() for p in bucket.values()]:
+        if pend.task_obj is not None and not pend.task_obj.done():
+            pend.task_obj.cancel()
+    _PENDING.clear()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info("异步委派全部回收（reason=%s，取消 %d 个）", reason, len(tasks))
+    return len(tasks)
 
 
 async def _child_wrapper(loop, ctx, prompt: str, identity, depth: int):
@@ -111,6 +268,173 @@ async def _child_wrapper(loop, ctx, prompt: str, identity, depth: int):
         return await loop.run(ctx, prompt, identity=identity)
     finally:
         _SUBAGENT_DEPTH.reset(token)
+
+
+async def _async_child(loop, ctx, prompt: str, identity, depth: int,
+                       saved_rid, saved_skey, slot: _Slot | None):
+    """异步委派的子任务体：在独立 task 中跑，**收尾自行复原**父共享键并释放槽位。
+
+    与同步路径的差别：同步路径由 ``run_subagent`` 在 ``await`` 后复原；异步路径的
+    ``await`` 发生在**另一次工具调用**里（父可能已经跑了几步），故复原必须由子任务
+    自己在 finally 完成——否则父的共享账单键会停在子的值上。
+    """
+    token = _SUBAGENT_DEPTH.set(depth)
+    try:
+        return await loop.run(ctx, prompt, identity=identity)
+    finally:
+        _SUBAGENT_DEPTH.reset(token)
+        ctx.state[StateKeys.REACT_RUN_ID] = saved_rid
+        ctx.state[StateKeys.SESSION_KEY] = saved_skey
+        if slot is not None:
+            slot.release()
+        _BG_TASKS.discard(asyncio.current_task())
+
+
+# ---------------------------------------------------------------------------
+# 委派准备（同步/异步共用）与结果结构化（同步/异步共用）
+# ---------------------------------------------------------------------------
+
+class _Prepared:
+    """一次委派的装配结果（纯数据，便于同步/异步两条路径共用）。"""
+
+    __slots__ = ("role_name", "loop", "prompt", "identity", "depth", "tools_override")
+
+    def __init__(self, *, role_name, loop, prompt, identity, depth, tools_override):
+        self.role_name = role_name
+        self.loop = loop
+        self.prompt = prompt
+        self.identity = identity
+        self.depth = depth
+        self.tools_override = tools_override
+
+
+def _governance_for(ctx, role_obj):
+    """Q4（子 Agent 独立上下文治理）：按角色 ``context`` 派生一个治理器副本。
+
+    **解耦约束**：本模块不得 import context 插件的实现类 ⇒ 只能对容器现取到的治理器
+    实例做**浅拷贝 + 同类型属性覆盖**（duck typing）：
+    - 治理器上没有该属性 ⇒ 诚实跳过并记账（不给一个「看起来生效」的假覆盖）；
+    - 类型不一致（如治理器是 float、角色写了 int/str）⇒ 跳过，防内部比较炸；
+    - 无任何属性被覆盖 ⇒ 返回 ``None``（工厂回落容器现取 ⇒ 与无角色声明逐值等价）。
+    """
+    spec = getattr(role_obj, "context", None) or {}
+    if not spec:
+        return None
+    if not ctx.has(Services.CONTEXT):
+        logger.warning("角色 %s 声明了 context 覆盖，但容器无 context 服务 ⇒ 忽略",
+                       role_obj.name)
+        return None
+    gov = ctx.get(Services.CONTEXT)
+    if gov is None:
+        return None
+    try:
+        clone = copy.copy(gov)
+    except Exception as exc:                      # 不可拷贝 ⇒ 不冒险改原对象
+        logger.warning("治理器不可拷贝，跳过角色 context 覆盖：%s", exc)
+        return None
+    applied: dict = {}
+    for k, v in spec.items():
+        cur = getattr(clone, k, None)
+        if cur is None and not hasattr(clone, k):
+            logger.warning("角色 %s 的 context.%s 在治理器上不存在 ⇒ 跳过",
+                           role_obj.name, k)
+            continue
+        if isinstance(cur, bool) or not isinstance(cur, (int, float, str)):
+            continue
+        if isinstance(v, int) and isinstance(cur, float):
+            v = float(v)
+        if not isinstance(v, type(cur)):
+            logger.warning("角色 %s 的 context.%s 类型不匹配（%s vs %s）⇒ 跳过",
+                           role_obj.name, k, type(v).__name__, type(cur).__name__)
+            continue
+        setattr(clone, k, v)
+        applied[k] = v
+    if not applied:
+        return None
+    logger.info("角色 %s 的上下文治理覆盖生效：%s", role_obj.name, applied)
+    return clone
+
+
+def _prepare(ctx, *, task: str, role: str, param_tools: list | None,
+             max_depth: int) -> _Prepared:
+    """装配一次委派（深度护栏 / 角色 / 工具白名单 / 引擎 / 身份 / 提示）。"""
+    depth = _SUBAGENT_DEPTH.get()
+    if depth >= max_depth:
+        raise AgentError(
+            f"已达子 Agent 最大递归深度（{max_depth}），禁止继续委派；"
+            f"如需更深层次，请显式放宽 max_depth 并评估风险")
+
+    extra_roles = load_role_files(roles_dir(_data_dir(ctx)), _catalog(ctx))
+    role_obj = get_role(role, extra_roles)
+
+    # ---- 工具三层交集的下两层 + 「子永远是叶子」（R1） ----
+    try:
+        narrowed = combine_tools(role_obj.tools, param_tools)
+    except ValueError as exc:
+        raise AgentError(str(exc))
+    tools_override = apply_leaf_rule(narrowed)
+
+    factory = ctx.get(Services.REACT_FACTORY)
+    if factory is None:
+        raise AgentError("子 Agent 引擎（react.factory）未就绪：react 插件未启用或被停用")
+
+    cfg_overrides = {
+        "max_steps": int(role_obj.max_steps or SUBAGENT_MAX_STEPS),
+        "deadline_s": float(role_obj.deadline_s or SUBAGENT_DEADLINE_S),
+    }
+    loop = factory(
+        tools_override=tools_override,
+        cfg_overrides=cfg_overrides,
+        governance_override=_governance_for(ctx, role_obj),
+        depth=depth + 1,
+    )
+
+    sk = current_session_key(ctx) or ""
+    user, _, session = sk.partition(":")
+    identity = make_identity(
+        tenant=DEFAULT_TENANT,
+        user=(user or None) or DEFAULT_USER,
+        session=(session or None) or DEFAULT_SESSION,
+    )
+    prompt = (f"{role_obj.system_note}\n\n任务：{task}" if role_obj.system_note
+              else f"任务：{task}")
+    return _Prepared(role_name=role_obj.name, loop=loop, prompt=prompt,
+                     identity=identity, depth=depth + 1,
+                     tools_override=tools_override)
+
+
+def _structured(status: str, result=None, exc: BaseException | None = None) -> dict:
+    """把子循环结果/异常转成结构化返回（同步/异步共用）。"""
+    if exc is not None:
+        return {"status": "error", "answer": None, "request_id": "",
+                "evidence": {"error": type(exc).__name__,
+                             "detail": str(exc)[:500]}}
+    if result is None:
+        return {"status": "error", "answer": None, "request_id": "",
+                "evidence": {"error": "empty_result", "detail": "子循环未返回结果"}}
+    if getattr(result, "ok", False) and not getattr(result, "exhausted", False):
+        status = "ok"
+    elif getattr(result, "exhausted", False):
+        status = "exhausted"
+    else:
+        status = "error"
+    return {"status": status,
+            "answer": getattr(result, "text", None),
+            "evidence": (getattr(result, "as_evidence", lambda: {})() or {}),
+            "request_id": getattr(result, "run_id", "") or ""}
+
+
+async def _emit_spawn(ctx, *, parent_rid, child_rid, child_session_key, role,
+                      depth, task, status, error: str = "") -> None:
+    """委派审计（父子关联唯一落点）；父 run 上下文内调用 ⇒ ContextVar 正确。"""
+    payload = {"parent_run_id": parent_rid,
+               "parent_session_key": current_session_key(ctx),
+               "child_run_id": child_rid, "child_session_key": child_session_key,
+               "role": role, "depth": depth, "task": (task or "")[:500],
+               "status": status, "at": now_iso()}
+    if error:
+        payload["error"] = error
+    await durable(ctx, Events.SUBAGENT_SPAWN, payload)
 
 
 async def run_subagent(ctx, *, task: str, role: str, param_tools: list | None,
@@ -129,48 +453,12 @@ async def run_subagent(ctx, *, task: str, role: str, param_tools: list | None,
     ``{"status", "answer", "evidence", "request_id"}``
     status ∈ {ok, exhausted, error}。
     """
-    # ---- 深度护栏（基于 ContextVar，绝不动共享 state） ----
-    depth = _SUBAGENT_DEPTH.get()
-    if depth >= max_depth:
-        raise AgentError(
-            f"已达子 Agent 最大递归深度（{max_depth}），禁止继续委派；"
-            f"如需更深层次，请在阶段 3 显式放宽 max_depth 并评估风险")
-
-    # 阶段 2：目录式角色（每次委派时扫目录，改角色不用改代码；内置优先不被覆盖）
-    extra_roles = load_role_files(roles_dir(_data_dir(ctx)), _catalog(ctx))
-    role_obj = get_role(role, extra_roles)
-    role_name = role_obj.name
-
-    # ---- 工具三层交集的下两层：role.tools ∩ 请求 tools（父权限裁剪由工厂再做） ----
-    try:
-        tools_override = combine_tools(role_obj.tools, param_tools)
-    except ValueError as exc:
-        raise AgentError(str(exc))
-
-    # ---- 软依赖引擎：REACT_FACTORY 缺席 ⇒ 诚实报错（优雅降级） ----
-    factory = ctx.get(Services.REACT_FACTORY)
-    if factory is None:
-        raise AgentError("子 Agent 引擎（react.factory）未就绪：react 插件未启用或被停用")
-
-    child_loop = factory(
-        tools_override=tools_override,
-        cfg_overrides={"max_steps": SUBAGENT_MAX_STEPS,
-                       "deadline_s": SUBAGENT_DEADLINE_S},
-        depth=depth + 1,
-    )
-
-    # ---- 子身份：同父的 user/session，tenant 取服务端默认；run_id 由子循环自生成 ----
-    sk = current_session_key(ctx) or ""
-    user, _, session = sk.partition(":")
-    child_identity = make_identity(
-        tenant=DEFAULT_TENANT,
-        user=(user or None) or DEFAULT_USER,
-        session=(session or None) or DEFAULT_SESSION,
-    )
-
-    # 子任务提示 = 角色引导（如有）+ 任务本体（设计稿 §3.1a：shared_brief 由提示承载）
-    prompt = (f"{role_obj.system_note}\n\n任务：{task}" if role_obj.system_note
-              else f"任务：{task}")
+    rejected = _check_budget(ctx, task)
+    if rejected is not None:                       # 预算/重派超限：结构化，不抛
+        return rejected
+    prep = _prepare(ctx, task=task, role=role, param_tools=param_tools,
+                    max_depth=max_depth)
+    _charge_budget(ctx, task)
 
     parent_rid = current_run_id(ctx)                 # 父 run_id（父 task 的 ContextVar，隔离安全）
     saved_rid = ctx.state.get(StateKeys.REACT_RUN_ID)
@@ -183,7 +471,7 @@ async def run_subagent(ctx, *, task: str, role: str, param_tools: list | None,
         # 阶段 2：占用本父 run 的一个并发槽位（单发也走同一条限流路径 ⇒ 并行与串行口径一致）
         async with _parent_slot(ctx, max_threads):
             child_task = asyncio.create_task(
-                _child_wrapper(child_loop, ctx, prompt, child_identity, depth + 1))
+                _child_wrapper(prep.loop, ctx, prep.prompt, prep.identity, prep.depth))
             try:
                 result = await child_task
             except BaseException as exc:              # 子运行期异常：结构化，不裸抛
@@ -196,36 +484,19 @@ async def run_subagent(ctx, *, task: str, role: str, param_tools: list | None,
         ctx.state[StateKeys.SESSION_KEY] = saved_skey
 
     if exc_info is not None:
-        await durable(ctx, Events.SUBAGENT_SPAWN, {
-            "parent_run_id": parent_rid,
-            "parent_session_key": current_session_key(ctx),
-            "child_run_id": "", "child_session_key": child_identity.session_key,
-            "role": role_name, "depth": depth + 1,
-            "task": (task or "")[:500], "status": "error",
-            "error": type(exc_info).__name__, "at": now_iso(),
-        })
-        return {"status": "error", "answer": None,
-                "evidence": {"error": type(exc_info).__name__,
-                             "detail": str(exc_info)[:500]},
-                "request_id": ""}
+        await _emit_spawn(ctx, parent_rid=parent_rid, child_rid="",
+                          child_session_key=prep.identity.session_key,
+                          role=prep.role_name, depth=prep.depth, task=task,
+                          status="error", error=type(exc_info).__name__)
+        return _structured("error", exc=exc_info)
 
-    # 子正常收尾（ok/exhausted 都算「跑完了」；hard 失败 ⇒ ok=False 已落在 exc 分支）
-    status = ("ok" if (getattr(result, "ok", False)
-                      and not getattr(result, "exhausted", False))
-              else ("exhausted" if getattr(result, "exhausted", False) else "error"))
-    await durable(ctx, Events.SUBAGENT_SPAWN, {
-        "parent_run_id": parent_rid,
-        "parent_session_key": current_session_key(ctx),
-        "child_run_id": getattr(result, "run_id", "") or "",
-        "child_session_key": child_identity.session_key,
-        "role": role_name, "depth": depth + 1,
-        "task": (task or "")[:500], "status": status, "at": now_iso(),
-    })
-    return {"status": status,
-            "answer": getattr(result, "text", None),
-            "evidence": (getattr(result, "as_evidence", lambda: {})()
-                         if result is not None else {}),
-            "request_id": getattr(result, "run_id", "") or ""}
+    out = _structured("ok", result=result)
+    await _emit_spawn(ctx, parent_rid=parent_rid,
+                      child_rid=getattr(result, "run_id", "") or "",
+                      child_session_key=prep.identity.session_key,
+                      role=prep.role_name, depth=prep.depth, task=task,
+                      status=out["status"])
+    return out
 
 
 async def run_subagents_parallel(ctx, *, tasks: list[str], role: str,
@@ -277,3 +548,110 @@ async def run_subagents_parallel(ctx, *, tasks: list[str], role: str,
     return {"status": status, "count": len(results), "succeeded": ok_n,
             "failed": fail_n, "results": results,
             "request_ids": [r.get("request_id") or "" for r in results]}
+
+
+# ---------------------------------------------------------------------------
+# 阶段 3：异步委派（wait=false + 句柄；**await 语义，非轮询**）
+# ---------------------------------------------------------------------------
+#
+# 设计取舍（设计稿 v0.4 §3.2b / R2）：「完成时注入下一轮 react 的 tool_result」需要
+# react 侧提供「外部消息注入」接缝，而阶段 0 预留的五参数接缝里没有它；
+# 与其现在改共享 Actor（设计约束：并行/异步都不改共享 Actor），不如把结果回收做成
+# **一次 await**：父再次调用 ``agent.delegate(handle=...)`` 即阻塞到该句柄完成，
+# 语义上等价于「结果在下一轮被取回」，且**没有轮询**（父不会空转反复查询）。
+
+async def start_subagent(ctx, *, task: str, role: str, param_tools: list | None,
+                         max_depth: int,
+                         max_threads: int = MAX_SUBAGENT_THREADS) -> dict:
+    """发起一个异步委派并**立即返回句柄**（子在后台跑，父可继续做别的事）。
+
+    返回 ``{"status": "pending", "handle", "role", "depth", "pending": [...]}``。
+    句柄**按父 run 分桶**：别的 run 拿不到，父 run 记账随 teardown 一起清空。
+    """
+    rejected = _check_budget(ctx, task)
+    if rejected is not None:
+        return rejected
+    prep = _prepare(ctx, task=task, role=role, param_tools=param_tools,
+                    max_depth=max_depth)
+    _charge_budget(ctx, task)
+
+    parent_key = _parent_run_key(ctx)
+    saved_rid = ctx.state.get(StateKeys.REACT_RUN_ID)
+    saved_skey = current_session_key(ctx)             # 读点必须经原语（会话键守卫）
+    slot = _Slot(ctx, max_threads)
+    await slot.acquire()                              # 槽位跨调用持有，子跑完才释放
+    handle = uuid.uuid4().hex[:12]
+    child = asyncio.create_task(
+        _async_child(prep.loop, ctx, prep.prompt, prep.identity, prep.depth,
+                     saved_rid, saved_skey, slot),
+        name=f"subagent-{handle}")
+    _BG_TASKS.add(child)
+    _PENDING.setdefault(parent_key, {})[handle] = _Pending(
+        handle=handle, parent_key=parent_key, task=task, role=prep.role_name,
+        depth=prep.depth, child_session_key=prep.identity.session_key,
+        task_obj=child)
+    await _emit_spawn(ctx, parent_rid=current_run_id(ctx), child_rid="",
+                      child_session_key=prep.identity.session_key,
+                      role=prep.role_name, depth=prep.depth, task=task,
+                      status="pending")
+    return {"status": "pending", "handle": handle, "role": prep.role_name,
+            "depth": prep.depth, "task": (task or "")[:200],
+            "pending": pending_handles(ctx)}
+
+
+async def await_subagent(ctx, handle: str, timeout_s: float = 0.0) -> dict:
+    """等待一个异步委派句柄完成（**真 await，非轮询**），返回与同步委派同构的结果。
+
+    - 超时（``timeout_s``，默认取子循环 deadline）⇒ 返回 ``status="pending"``
+      且 ``timed_out=True``：**子仍在跑**（用 ``asyncio.shield``，超时不取消子任务）；
+    - 句柄不存在/已回收 ⇒ 结构化 ``error``（不抛），并回带当前可用句柄清单；
+    - 子成功/失败 ⇒ 与同步路径同构的 ``{status, answer, evidence, request_id}``
+      + ``handle``，同时落一条 ``SUBAGENT_SPAWN`` 完成审计。
+    """
+    key = _parent_run_key(ctx)
+    pend = _PENDING.get(key, {}).get(str(handle or "").strip())
+    if pend is None:
+        return {"status": "error", "answer": None, "request_id": "",
+                "evidence": {"error": "unknown_handle",
+                             "detail": (f"句柄 {handle!r} 不在当前 run（已回收或从未创建）；"
+                                        f"当前可用：{pending_handles(ctx)}")}}
+    limit = float(timeout_s or SUBAGENT_DEADLINE_S)
+    result = None
+    exc_info: BaseException | None = None
+    try:
+        # shield：超时只取消「等待」，不取消子在跑的任务
+        result = await asyncio.wait_for(asyncio.shield(pend.task_obj), limit)
+    except asyncio.TimeoutError:
+        return {"status": "pending", "handle": pend.handle, "timed_out": True,
+                "waited_s": limit, "role": pend.role,
+                "task": (pend.task or "")[:200]}
+    except BaseException as exc:                    # 含 CancelledError：结构化，不裸抛
+        exc_info = exc
+    _PENDING.get(key, {}).pop(pend.handle, None)
+    out = _structured("ok", result=result, exc=exc_info)
+    out["handle"] = pend.handle
+    await _emit_spawn(ctx, parent_rid=current_run_id(ctx),
+                      child_rid=out.get("request_id") or "",
+                      child_session_key=pend.child_session_key, role=pend.role,
+                      depth=pend.depth, task=pend.task, status=out["status"],
+                      error=(type(exc_info).__name__ if exc_info is not None else ""))
+    return out
+
+
+async def collect_pending(ctx, timeout_s: float = 0.0) -> dict:
+    """回收本父 run **全部**在飞的异步委派（join），按句柄创建序返回。
+
+    用途：父一次 fan-out 多个 ``wait=false`` 后，用一次调用把它们全部 join 回来。
+    """
+    handles = pending_handles(ctx)
+    if not handles:
+        return {"status": "ok", "count": 0, "succeeded": 0, "failed": 0,
+                "results": [], "detail": "当前 run 没有在飞的异步委派"}
+    results = [await await_subagent(ctx, h, timeout_s) for h in handles]
+    ok_n = sum(1 for r in results if r.get("status") in ("ok", "exhausted"))
+    pend_n = sum(1 for r in results if r.get("status") == "pending")
+    status = ("ok" if pend_n == 0 and ok_n == len(results)
+              else ("pending" if pend_n else ("partial" if ok_n else "error")))
+    return {"status": status, "count": len(results), "succeeded": ok_n,
+            "failed": len(results) - ok_n - pend_n, "pending": pend_n,
+            "results": results}

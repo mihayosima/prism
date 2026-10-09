@@ -18,6 +18,19 @@ from typing import Iterable
 
 logger = logging.getLogger("agent.subagent.roles")
 
+# 阶段 3（R1）：**子永远是叶子节点** —— 委派工具绝不下传给子循环。
+# 用「排除项」表达而非枚举「其余全部」：后者会随工具目录变化静默失效。
+LEAF_TOOL = "agent.delegate"
+
+# 角色可覆盖的运行时护栏与上下文治理字段（Q4 轻量形态）。
+# 只允许**收窄**子循环（更小/更短），不允许超过父级默认 ⇒ 角色不能成为放大面。
+MAX_ROLE_STEPS = 32
+MAX_ROLE_DEADLINE_S = 600.0
+# ``context`` 允许的字段 = ReactConfig / 治理器上真实存在的上下文治理旋钮。
+# 未在治理器实例上找到同名字段 ⇒ 诚实跳过（记账 warning），绝不静默塞进对象。
+CONTEXT_KEYS = ("react_keep_recent", "act_fold_tokens", "history_keep",
+                "clip_max_tokens", "clip_head_tokens", "clip_tail_tokens")
+
 # 角色文件名（= 角色名）合法字符集：与会话键净化同款口径，防路径穿越/注入。
 # ★ 首尾必须落在 [A-Za-z0-9_]，中间才允许 . 与 - —— 否则 "..evil" / ".hidden"
 # 这类以点开头（含路径穿越语义）的名字会被 {1,64} 的通配点号放行。
@@ -57,15 +70,25 @@ BUILTIN_ROLES: dict[str, dict] = {
 
 
 class Role:
-    """解析后的角色（不可变视图）。"""
+    """解析后的角色（不可变视图）。
 
-    __slots__ = ("name", "description", "tools", "system_note")
+    阶段 3 增补 ``max_steps`` / ``deadline_s`` / ``context``：前两者进 ``cfg_overrides``，
+    ``context`` 供「子 Agent 独立上下文治理（Q4）」使用（经 ``governance_override`` 生效）。
+    """
 
-    def __init__(self, name: str, description: str, tools, system_note: str) -> None:
+    __slots__ = ("name", "description", "tools", "system_note",
+                 "max_steps", "deadline_s", "context")
+
+    def __init__(self, name: str, description: str, tools, system_note: str,
+                 max_steps: int | None = None, deadline_s: float | None = None,
+                 context: dict | None = None) -> None:
         self.name = name
         self.description = description
         self.tools = tools            # list[str] | None
         self.system_note = system_note
+        self.max_steps = max_steps
+        self.deadline_s = deadline_s
+        self.context = dict(context or {})
 
 
 def get_role(name: str, extra: dict | None = None) -> Role:
@@ -82,7 +105,9 @@ def get_role(name: str, extra: dict | None = None) -> Role:
         spec = BUILTIN_ROLES["default"]
         name = "default"
     return Role(name=name, description=spec.get("description", ""),
-                tools=spec.get("tools"), system_note=spec.get("system_note", "") or "")
+                tools=spec.get("tools"), system_note=spec.get("system_note", "") or "",
+                max_steps=spec.get("max_steps"), deadline_s=spec.get("deadline_s"),
+                context=spec.get("context") or {})
 
 
 def list_roles(extra: dict | None = None) -> list[str]:
@@ -111,7 +136,8 @@ def validate_role_spec(name: str, spec: dict,
     """
     if not isinstance(spec, dict):
         raise ValueError(f"角色 {name!r}：文件内容必须是对象")
-    unknown_keys = set(spec) - {"description", "tools", "system_note"}
+    unknown_keys = set(spec) - {"description", "tools", "system_note",
+                                "max_steps", "deadline_s", "context"}
     if unknown_keys:
         raise ValueError(f"角色 {name!r}：出现未知字段 {sorted(unknown_keys)}")
     tools = spec.get("tools")
@@ -129,7 +155,36 @@ def validate_role_spec(name: str, spec: dict,
     desc = spec.get("description") or ""
     if not isinstance(desc, str):
         raise ValueError(f"角色 {name!r}：description 必须是字符串")
-    return {"description": desc, "tools": tools, "system_note": note}
+    out = {"description": desc, "tools": tools, "system_note": note}
+    # ---- 阶段 3：可覆盖的护栏（只允许收窄，不允许放大） ----
+    ms = spec.get("max_steps")
+    if ms is not None:
+        if not isinstance(ms, int) or isinstance(ms, bool) or not (1 <= ms <= MAX_ROLE_STEPS):
+            raise ValueError(
+                f"角色 {name!r}：max_steps 必须是 1..{MAX_ROLE_STEPS} 的整数")
+        out["max_steps"] = ms
+    dl = spec.get("deadline_s")
+    if dl is not None:
+        if not isinstance(dl, (int, float)) or isinstance(dl, bool) \
+                or not (1.0 <= float(dl) <= MAX_ROLE_DEADLINE_S):
+            raise ValueError(
+                f"角色 {name!r}：deadline_s 必须是 1..{MAX_ROLE_DEADLINE_S} 的数字")
+        out["deadline_s"] = float(dl)
+    cx = spec.get("context")
+    if cx is not None:
+        if not isinstance(cx, dict):
+            raise ValueError(f"角色 {name!r}：context 必须是对象")
+        bad = sorted(set(cx) - set(CONTEXT_KEYS))
+        if bad:
+            raise ValueError(f"角色 {name!r}：context 出现未知字段 {bad}"
+                             f"（允许：{list(CONTEXT_KEYS)}）")
+        for k, v in cx.items():
+            if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                raise ValueError(f"角色 {name!r}：context.{k} 必须是非负整数")
+        # 空 dict ⇒ 不写入（保持「未声明」与「声明为空」行为一致）
+        if cx:
+            out["context"] = dict(cx)
+    return out
 
 
 def load_role_files(directory: str | pathlib.Path, catalog: list[dict]) -> dict:
@@ -160,6 +215,23 @@ def load_role_files(directory: str | pathlib.Path, catalog: list[dict]) -> dict:
         except Exception as exc:                      # 单文件坏不影响其他
             logger.warning("跳过角色文件 %s：%s", fp.name, exc)
     return out
+
+
+def apply_leaf_rule(tools: list[str] | None) -> list[str]:
+    """在白名单上叠加「子永远是叶子节点」（R1）：**排除**委派工具本身。
+
+    为什么是「排除」而不是「枚举允许项」：子要继承父的宽工具面（否则角色内的
+    具体白名单会随目录变化失效），唯一要拿掉的只有委派工具 ⇒ 排除语义最贴合。
+    该函数只产出标识符（``["*", "-agent.delegate"]``），真正的过滤由 react 的
+    ``_apply_whitelist`` / ``_split_whitelist_denied`` 执行 —— 提示层与执行层同口径。
+
+    - ``None``（不收窄）⇒ ``["*", "-agent.delegate"]``；
+    - 具体名单 ⇒ 去掉委派工具 + 追加排除项（**执行层仍会再拦一次**，防提示层绕过）。
+    """
+    if tools is None:
+        return ["*", f"-{LEAF_TOOL}"]
+    kept = [t for t in tools if str(t) != LEAF_TOOL]
+    return [*kept, f"-{LEAF_TOOL}"]
 
 
 def combine_tools(role_tools: Iterable[str] | None,

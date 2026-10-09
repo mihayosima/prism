@@ -26,6 +26,19 @@ from agent.plugins.subagent.roles import Role, combine_tools, get_role
 from agent.profiles import build_agent
 
 
+@pytest.fixture(autouse=True)
+def _clean_delegation_budget():
+    """阶段 3：委派预算是**每父 run**记账的模块级状态。
+
+    单测直调工具时没有 HTTP 请求 ⇒ 无 run/会话 ContextVar ⇒ 同进程内所有委派
+    落进同一个回退桶。若不逐例清空，前例的记账会拖垮后例（实测：跑到第 25 次
+    委派开始全被 rejected）。这是**测试隔离**需要，不是放宽护栏。
+    """
+    runner_mod.reset_run_state()
+    yield
+    runner_mod.reset_run_state()
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -105,12 +118,18 @@ class _FakeCtx:
         # 阶段 2：角色文件加载需要 config(db_path) 与 tasks.catalog()
         self.config = {"db_path": str(pathlib.Path(_NO_ROLES_DIR) / "agent.db")}
         self.tasks = _FakeTasks(_CAT)
+        self.effects: list = []
 
     def has(self, key):
         return self._has if key == Services.REACT_FACTORY else False
 
     def get(self, key, default=None):
         return self._factory if key == Services.REACT_FACTORY else default
+
+    def effect(self, disposer):
+        """阶段 3：apply 会注册异步委派回收器（真 Context 同签名）。"""
+        self.effects.append(disposer)
+        return lambda: True
 
 
 class _FakeTasks:
@@ -693,7 +712,10 @@ def test_delegate_passes_seam_params_to_real_factory(tmp_path):
             tools=["agent.ping", "memory.search"])
         assert out["status"] == "ok", out
         # 1) 请求 tools 真被收窄后交给工厂（交集语义；default 不额外收窄 ⇒ 等于请求集）
-        assert seen.get("tools_override") == ["agent.ping", "memory.search"], seen
+        ov = list(seen.get("tools_override") or [])
+        assert "agent.ping" in ov and "memory.search" in ov, seen
+        # 1b) 阶段 3（R1）：委派工具被**显式排除** ⇒ 子永远是叶子
+        assert f"-{roles.LEAF_TOOL}" in ov, seen
         # 2) 深度 +1（顶层调用 ⇒ 子 depth=1）
         assert seen.get("depth") == 1, seen
         # 3) 子循环步数比父更紧（防子 Agent  runaway 烧钱）
@@ -753,7 +775,7 @@ def test_delegate_allows_whitelisted_tool(tmp_path):
 
 
 def test_whitelist_none_path_unchanged(tmp_path):
-    """无 tools_override（tools=[]，父循环 / 不委派）⇒ 执行层零行为变化，工具照常执行。"""
+    """未收窄工具面（tools=[]）⇒ 执行层不得误伤普通工具（仅排除委派工具，见下例）。"""
     c = _build(tmp_path)
 
     async def s():

@@ -18,8 +18,11 @@ import logging
 from agent.api import AgentError, Events, Services, plugin
 
 from .roles import list_roles, load_role_files, roles_dir
-from .runner import (MAX_SUBAGENT_BATCH, MAX_SUBAGENT_THREADS, _catalog, _data_dir,
-                     run_subagent, run_subagents_parallel)
+from .runner import (MAX_DELEGATIONS_PER_RUN, MAX_PENDING_PER_RUN,
+                     MAX_RESEND_PER_TASK, MAX_SUBAGENT_BATCH, MAX_SUBAGENT_THREADS,
+                     _catalog, _data_dir, await_subagent, collect_pending,
+                     cancel_all, pending_handles, run_subagent,
+                     run_subagents_parallel, start_subagent)
 
 logger = logging.getLogger("agent.subagent")
 
@@ -46,6 +49,8 @@ class SubAgent:
         if not ctx.has(Services.REACT_FACTORY):
             logger.warning("REACT_FACTORY 未就绪，agent.delegate 不注册（子 Agent 不可用）")
             return
+        # 阶段 3：异步委派有在飞任务 ⇒ 卸载时必须回收（否则后台子循环脱离容器继续跑）
+        ctx.effect(self._dispose)
         ctx.tasks.register(
             ctx, "agent.delegate",
             schema={
@@ -64,30 +69,80 @@ class SubAgent:
                 "tools": {"type": "array", "required": False, "default": [],
                           "description": ("在角色白名单基础上**进一步收窄**的工具名列表；"
                                           "与角色白名单取交集（只能更窄，不能更宽）")},
+                "wait": {"type": "bool", "required": False, "default": True,
+                         "description": ("True（默认）= 同步等待子 Agent 完成并取回结果；"
+                                         "False = **异步委派**：立即返回一个 handle，"
+                                         "子 Agent 在后台继续跑，你可先做别的事，"
+                                         "之后用 handle 取回结果（取回是一次 await，"
+                                         "不是轮询）")},
+                "handle": {"type": "str", "required": False, "default": "",
+                           "description": ("取回异步委派的结果：传 start 时返回的 handle；"
+                                           "传 '*' 或 'all' 表示**一次性取回本轮所有**"
+                                           "在飞的异步委派。给了 handle 则忽略 task/tasks")},
+                "wait_timeout_s": {"type": "float", "required": False, "default": 0,
+                                   "description": ("取回异步结果时最多等待的秒数（0 = 用子"
+                                                   "循环自身的时限）。超时不会取消子 Agent，"
+                                                   "只是这次没取回，可稍后再取")},
             },
             handler=self._delegate,
             owner="plugins.subagent",
             description=(
                 "委派一个子 Agent 在**受限、独立**的上下文中完成任务并返回结构化结果"
                 "{status, answer, evidence, request_id}。"
-                "适用：需要隔离上下文的专注子任务、可独立验收的子问题、前期调研/审查。"
+                "适用：需要隔离上下文的专注子任务、可独立验收的子问题、前期调研/审查、"
+                "可并行的多个独立子任务（tasks 数组）。"
                 "不适用：需要直接读写父会话即时状态、或在 plan 模式下执行写操作——"
                 "子 Agent 在独立上下文中运行，不共享父循环的对话历史与草稿；"
-                "实际写操作仍受 guard/approval 制约。"),
+                "实际写操作仍受 guard/approval 制约。"
+                "**子 Agent 是叶子节点**：不能再委派，协作一律经父中转。"
+                "被反复「打回」重派的子任务会在达到上限后被拒绝（防死循环），"
+                "此时请接受现有结果或换思路。"),
             risk="read",      # plan 模式仍可见（只读语义；写操作仍受 guard/approval 硬兜底）
         )
 
+    async def _dispose(self) -> bool:
+        """回收在飞的异步委派（插件卸载对称；否则后台子循环脱离容器继续跑）。"""
+        try:
+            await cancel_all("teardown")
+        except Exception as exc:                      # 卸载路径不因清理失败而中断
+            logger.warning("异步委派回收失败：%s", exc)
+        return True
+
     async def _delegate(self, *, task: str = "", role: str = "default",
-                        tools: list | None = None,
-                        tasks: list | None = None) -> dict:
+                        tools: list | None = None, tasks: list | None = None,
+                        wait: bool = True, handle: str = "",
+                        wait_timeout_s: float = 0) -> dict:
         ctx = self._ctx
+        timeout_s = float(wait_timeout_s or 0)
+        handle = str(handle or "").strip()
+
+        # ---- 阶段 3：取回异步结果（handle 优先；'*'/'all' = 一次性 join 全部） ----
+        if handle:
+            if handle in ("*", "all"):
+                return await collect_pending(ctx, timeout_s)
+            return await await_subagent(ctx, handle, timeout_s)
+
         batch = [t for t in (tasks or []) if str(t or "").strip()]
         if batch:                                     # 并行路径（阶段 2）
+            if wait is False:                         # 阶段 3：并行 + 异步 ⇒ 逐个 spawn
+                spawned = [await start_subagent(
+                    ctx, task=t, role=role, param_tools=tools or [],
+                    max_depth=MAX_SUBAGENT_DEPTH) for t in batch]
+                handles = [s.get("handle") or "" for s in spawned
+                           if s.get("status") == "pending"]
+                rejected = [s for s in spawned if s.get("status") == "rejected"]
+                return {"status": "pending" if handles else "rejected",
+                        "count": len(spawned), "handles": handles,
+                        "rejected": rejected, "results": spawned}
             return await run_subagents_parallel(
                 ctx, tasks=batch, role=role, param_tools=tools or [],
                 max_depth=MAX_SUBAGENT_DEPTH)
         if not str(task or "").strip():
             raise AgentError("agent.delegate 需要 task 或 tasks（两者皆空，无法委派）")
+        if wait is False:                             # 阶段 3：异步单发
+            return await start_subagent(
+                ctx, task=task, role=role, param_tools=tools or [],
+                max_depth=MAX_SUBAGENT_DEPTH)
         return await run_subagent(
             ctx, task=task, role=role, param_tools=tools or [],
             max_depth=MAX_SUBAGENT_DEPTH)
@@ -102,6 +157,10 @@ class SubAgent:
                 "max_depth": MAX_SUBAGENT_DEPTH,
                 "max_threads": MAX_SUBAGENT_THREADS,
                 "max_batch": MAX_SUBAGENT_BATCH,
+                "max_delegations_per_run": MAX_DELEGATIONS_PER_RUN,
+                "max_resend_per_task": MAX_RESEND_PER_TASK,
+                "pending": pending_handles(ctx) if enabled else [],
+                "max_pending_per_run": MAX_PENDING_PER_RUN,
                 "roles_dir": str(roles_dir(_data_dir(ctx))),
                 "roles": list_roles(extra) if enabled else [],
                 "file_roles": sorted(extra) if enabled else []}

@@ -244,22 +244,62 @@ def visible_tools(ctx) -> list[dict]:
             for t in catalog]
 
 
+def _split_whitelist_ids(whitelist) -> tuple[set[str], set[str]]:
+    """把白名单拆成 ``(放行标识符, 排除标识符)``（**纯函数**；阶段 3 新增排除项）。
+
+    - ``"agent.read"`` / ``"web.*"`` ⇒ 放行标识符（工具名或 ``owner`` 域）；
+    - ``"-agent.delegate"`` ⇒ **排除**标识符（``-`` 前缀）；
+    - 放行集为空（只写了排除项）⇒ 语义为「其余全放行」（由调用方归一为 ``{"*"}``）。
+
+    为什么需要排除项（设计稿 v0.4 §3.2a / R1）：「除了某几个工具以外都要」表达不出来，
+    而「子 Agent 永远是叶子节点」正是这一形态——子必须继承父的宽工具面，
+    但**委派工具本身绝不能下传**（否则形成子↔子 mesh）。用具体名单枚举「其余全部」
+    会在目录变化时静默失效，故必须有排除语义。
+    """
+    pos: set[str] = set()
+    neg: set[str] = set()
+    for w in whitelist or ():
+        s = str(w or "")
+        if not s or s == "-":                # "" 与裸 "-" 都不是有效标识符 ⇒ 丢弃
+            continue                          # 注意："*" 是合法标识符，不能按长度裁掉
+        if s.startswith("-"):
+            neg.add(s[1:])
+        else:
+            pos.add(s)
+    return pos, neg
+
+
 def _apply_whitelist(base: list[dict], whitelist: list[str] | None) -> list[dict]:
     """按白名单收窄可见工具集（**纯函数、幂等、不改入参**；子 Agent 方案 v0.3 §3.2）。
 
     标识符语义（与工厂 ``tools_override`` 口径一致）：
     - ``whitelist is None`` / 空列表 ⇒ 不收窄，**原样返回同一列表对象**（默认态零行为变化）；
-    - ``"*"`` ∈ 白名单 ⇒ 不额外收窄（仍受 ``visible_tools`` 权限裁剪，白名单只能收窄不能放宽）；
+    - ``"*"`` ∈ 白名单且无排除项 ⇒ 不额外收窄（仍受 ``visible_tools`` 权限裁剪，
+      白名单只能收窄不能放宽）；
     - 具体工具名（``"agent.read"``）⇒ 命中该名工具；
-    - 域（``owner``，如 ``"plugins.explorer"`` 或 ``"web.*"``）⇒ 命中该域全部工具。
+    - 域（``owner``，如 ``"plugins.explorer"`` 或 ``"web.*"``）⇒ 命中该域全部工具；
+    - ``"-x"`` 前缀 ⇒ **排除**该工具名/域（阶段 3；排除优先级高于放行）。
+    - 只写排除项（放行集为空）⇒ 视为 ``"*"`` + 排除项。
 
     交集语义：``role.tools`` / ``param.tools`` 任意一层都只能**再收窄**，不能放宽
     （审查意见 #2 / #R3：``role.tools`` 是安全下界）。
     """
-    if not whitelist or "*" in whitelist:
+    if not whitelist:
         return base
-    ids = set(whitelist)
-    return [t for t in base if t.get("name") in ids or _domain_of(t) in ids]
+    pos, neg = _split_whitelist_ids(whitelist)
+    if not neg and "*" in pos:
+        return base
+    if not pos:                       # 只有排除项 ⇒ 其余全放行
+        pos = {"*"}
+    out = []
+    for t in base:
+        name = t.get("name")
+        dom = _domain_of(t)
+        if name in neg or dom in neg:
+            continue
+        if "*" in pos or name in pos or dom in pos:
+            out.append(t)
+    return out
 
 
 def _trim(messages: list[dict], keep: int) -> list[dict]:
@@ -1336,19 +1376,33 @@ class ReactLoop:
         保证「目录里看得见」与「执行时放得过」是同一套口径，不会出现
         「提示说不能用、实际却调得动」的裂缝。
 
-        ``self._tools_override`` 为 None / 含 ``"*"`` ⇒ 原样返回，**零行为变化**
-        （父循环与不委派的主路径完全不受影响）。
+        ``self._tools_override`` 为 None / 含 ``"*"``（且无排除项）⇒ 原样返回，
+        **零行为变化**（父循环与不委派的主路径完全不受影响）。
         """
         wl = self._tools_override
-        if not wl or "*" in wl:
+        if not wl:
             return [], list(calls)
-        ids = set(wl)
+        pos, neg = _split_whitelist_ids(wl)
+        if not neg and "*" in pos:
+            return [], list(calls)
+        if not pos:
+            pos = {"*"}
+        ids = pos
         catalog = {t.get("name"): t for t in ctx.tasks.catalog()}
         denied: list[ToolResult] = []
         allowed: list = []
         for c in calls:
             t = catalog.get(c.name) or {}
-            if c.name in ids or _domain_of(t) in ids:
+            dom = _domain_of(t)
+            if c.name in neg or dom in neg:
+                denied.append(ToolResult(
+                    c.name,
+                    f"工具 {c.name!r} 已被本次委派**显式排除**（子 Agent 是叶子节点，"
+                    f"不得再委派/使用该工具）。请改用其它工具完成子任务，"
+                    f"或把这一步交回父 Agent。",
+                    is_error=True, denied=True, denied_by="whitelist",
+                    tool_call_id=getattr(c, "id", "") or ""))
+            elif "*" in ids or c.name in ids or dom in ids:
                 allowed.append(c)
             else:
                 denied.append(ToolResult(
