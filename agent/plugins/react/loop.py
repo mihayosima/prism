@@ -775,6 +775,12 @@ class ReactLoop:
                 reason = f"推理失败：{type(exc).__name__}: {exc}"
                 hard = True
                 break
+            # A 重试：收敛步若 reasoning 吃满输出（truncated）导致正文为空，
+            # 临时调大 max_tokens + 抑制思考重试一次，避免直接降级为空响应。
+            if (not out.text) and (not out.tool_calls) and getattr(out, "truncated", False):
+                retried = await self._reason_retry_once(ctx, window, tools_step)
+                if retried.text:
+                    out = retried
             tokens_in += int(out.tokens_in or 0)
             tokens_out += int(out.tokens_out or 0)
             turn = {"role": "assistant", "content": out.text,
@@ -808,7 +814,18 @@ class ReactLoop:
                     await wm.finish(task_id)
                 set_current_run_id("")          # R1：两通道同步置空（见 run 开头注释）
                 ctx.state[StateKeys.REACT_RUN_ID] = ""
-                return ReactResult(ok=True, text=out.text or "（未给出回答）", steps=steps,
+                # A（空响应静默失败防护）：正文为空时不再以 ok=True 占位，
+                # 而是明确判失败 + 降级提示（截断时给出针对性引导）。
+                final_text = out.text
+                final_ok = True
+                if not out.text:
+                    final_ok = False
+                    if getattr(out, "truncated", False):
+                        final_text = ("（模型把输出额度都用在了思考过程上，正文被截断为空。"
+                                      "请在「设置 → 模型」调大 max_tokens 后重试，或换用推理较轻的模型。）")
+                    else:
+                        final_text = "（模型未返回任何正文，请重试。）"
+                return ReactResult(ok=final_ok, text=final_text, steps=steps,
                                    tokens_in=tokens_in, tokens_out=tokens_out,
                                    tools=tool_trace, observations=observed,
                                    run_id=run_id)
@@ -1387,6 +1404,21 @@ class ReactLoop:
             await ctx.events.emit(Events.CONTEXT_WATERLINE, payload)
         except Exception as exc:                     # noqa: BLE001 —— 遥测失败不阻断
             logger.warning("react waterline emit failed: %s", exc)
+
+    async def _reason_retry_once(self, ctx, window: list[dict],
+                                 tools_step: list[dict] | None):
+        """A 重试：正文被 reasoning 截断时，调大 max_tokens + 抑制思考重试一次。
+
+        仅在收敛步（无 tool_calls）正文为空且 truncated 时调用；调用方只在拿到正文后才替换。
+        单次覆盖 max_tokens（不改动全局配置），并注入抑制思考的 system note 降低 reasoning 占比。
+        """
+        llm_cfg = (((ctx.config or {}).get("agent") or {}).get("llm") or {})
+        base = int(llm_cfg.get("max_tokens", 8192) or 0)
+        big = min(max(base * 2, 16384), 65536) if base > 0 else 16384
+        note = ("请直接给出最终答复，不要展开思考过程或推理链；只输出答案本身，"
+                "避免把输出额度消耗在内部推理上。")
+        return await self._reasoner.reason(ctx, window, tools_step,
+                                          max_tokens=big, system_note=note)
 
     async def _govern_at_teardown(self, ctx, task: TaskContext, used: int, *,
                                   system_prompt: str, head_prompt: str,

@@ -74,6 +74,7 @@ class ReasonOutput:
     reasoning_content: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
+    truncated: bool = False      # 下游截断信号（finish_reason=length）：reasoning 吃满 output 额度、正文被挤空
 
 
 class Reasoner(Protocol):
@@ -113,15 +114,22 @@ class DefaultReasoner:
     def __init__(self, *, caller: str = "plugins.react"):
         self._caller = caller
 
-    async def reason(self, ctx, messages, tools) -> ReasonOutput:
-        lr = await ctx.llm.complete(ctx, messages, tools=tools, caller=self._caller)
+    async def reason(self, ctx, messages, tools, *,
+                     max_tokens: int | None = None,
+                     system_note: str | None = None) -> ReasonOutput:
+        msgs = list(messages)
+        if system_note:
+            msgs = [{"role": "system", "content": system_note}] + msgs
+        lr = await ctx.llm.complete(ctx, msgs, tools=tools, caller=self._caller,
+                                    max_tokens=max_tokens)
         data = lr.data if isinstance(lr.data, dict) else {}
         calls = [ToolCall.from_dict(c) for c in (data.get("tool_calls") or [])
                  if isinstance(c, dict)]
         return ReasonOutput(text=str(data.get("text") or ""), tool_calls=calls,
                             reasoning_content=str(data.get("reasoning_content") or ""),
                             tokens_in=int(lr.tokens_in or 0),
-                            tokens_out=int(lr.tokens_out or 0))
+                            tokens_out=int(lr.tokens_out or 0),
+                            truncated=bool(data.get("truncated")))
 
 
 class DefaultActor:

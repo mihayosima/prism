@@ -93,7 +93,8 @@ class LlmService:
 
     async def complete(self, ctx, messages: list[dict], *,
                        schema: dict | None = None, tools: list[dict] | None = None,
-                       caller: str = "unknown", finalize: bool = False) -> LlmResult:
+                       caller: str = "unknown", finalize: bool = False,
+                       max_tokens: int | None = None) -> LlmResult:
         """模型调用（消费方视角，契约见 ``core/contract.LlmProvider``）。
 
         pre-call waterfall（guard→budget 预借）→ provider.complete → post-call 入账；
@@ -118,6 +119,11 @@ class LlmService:
                 "agent.llm.complete", decision.get("reason", "被 guard/budget 否决")
             )
         try:
+            data = await self._provider.complete(ctx, messages, schema=schema, tools=tools,
+                                                 max_tokens=max_tokens)
+        except TypeError as exc:                       # 兼容未实现 max_tokens 的 provider
+            if "max_tokens" not in str(exc):
+                raise
             data = await self._provider.complete(ctx, messages, schema=schema, tools=tools)
         except Exception as exc:
             # S1：失败路径——durable 审计 + live 通知（budget 同步退款），随后原样抛出。
@@ -364,7 +370,8 @@ class DeepSeekLlm:
 
     async def complete(self, ctx: Any, messages: list[dict],
                        schema: dict | None = None,
-                       tools: list[dict] | None = None) -> dict:
+                       tools: list[dict] | None = None, *,
+                       max_tokens: int | None = None) -> dict:
         cfg = (((ctx.config or {}).get("agent") or {}).get("llm") or {})
         stream_on = bool(cfg.get("stream", True))      # D5 默认 true
         # #3：重试参数（默认 3 次指数退避；max_retries=0 退化为旧行为：零重试）
@@ -379,9 +386,11 @@ class DeepSeekLlm:
         # E：显式生成上限——「不设」等于接受服务端默认（deepseek-flash 非思考 8K），
         # 长参数（如写章节全文进工具 arguments）极易被 finish_reason="length" 腰斩。
         # 取值来自 config.agent.llm.max_tokens（默认 8192；<=0 视为不设置，交还服务端）。
-        max_tokens = int(cfg.get("max_tokens", 8192) or 0)
-        if max_tokens > 0:
-            payload["max_tokens"] = max_tokens
+        # max_tokens 入参为单次覆盖（重试时临时调大），None 回落配置值。
+        base_max = int(cfg.get("max_tokens", 8192) or 0)
+        eff_max = int(max_tokens) if max_tokens is not None else base_max
+        if eff_max > 0:
+            payload["max_tokens"] = eff_max
         name_map: dict[str, str] = {}
         if tools:
             wired_tools, name_map = _wire_tools(tools)

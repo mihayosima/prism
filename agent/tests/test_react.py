@@ -384,3 +384,69 @@ def test_status_hook_reports_last_run(tmp_path):
         await c.teardown()
 
     _run(s())
+
+
+# ---------------------------------------------------------------------------
+# A：空响应静默失败防护（reasoning 吃满 output 额度 → 截断空回复必须判失败）
+# ---------------------------------------------------------------------------
+
+
+def test_truncated_empty_reply_reports_failure_not_silent(tmp_path):
+    """A：模型把 output 额度全花在思考上（finish_reason=length）→ 正文为空时，
+    收敛必须判失败（ok=False）+ 明确降级提示，而非 ok=True + 静默占位「未给出回答」。
+
+    走真实链路：``ctx.llm.complete`` 返回带 ``truncated`` 的 ``LlmResult`` →
+    ``DefaultReasoner.reason`` 透传（本次新增） → loop 收敛判失败。
+    """
+    from unittest.mock import patch
+    from agent.sys.llm import LlmResult
+
+    c = _build(tmp_path)
+
+    async def fake_complete(ctx, messages, schema=None, tools=None, **kw):
+        # 模拟 DeepSeek 把 max_tokens 全花在 reasoning → finish_reason=length → 正文空
+        return LlmResult(data={"text": "", "truncated": True}, tokens_in=10, tokens_out=0)
+
+    async def s():
+        await c.assemble()
+        _register_echo(c.root)
+        with patch.object(type(c.root.llm), "complete", fake_complete):
+            r = await c.root.react.run(c.root, "请认真思考后回答")
+        assert r.ok is False, "截断空响应必须以失败上报，不得静默 ok=True"
+        assert "截断" in r.text, "降级提示须指出正文被截断"
+        await c.teardown()
+
+    _run(s())
+
+
+def test_truncated_empty_reply_retries_once_then_succeeds(tmp_path):
+    """A 重试：收敛步 reasoning 吃满输出（truncated）→ 正文为空时，应临时调大
+    max_tokens + 抑制思考重试一次；重试拿到正文则收敛成功（ok=True），而非降级为空响应。
+    """
+    from unittest.mock import patch
+    from agent.sys.llm import LlmResult
+
+    c = _build(tmp_path)
+    calls = {"n": 0}
+
+    async def fake_complete(ctx, messages, schema=None, tools=None, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # 首次：reasoning 占满 output → finish_reason=length → 正文空
+            return LlmResult(data={"text": "", "truncated": True}, tokens_in=10, tokens_out=0)
+        # 重试：模型直接给最终答复 → 正文非空
+        return LlmResult(data={"text": "这是重试后拿到的真实答复", "truncated": False},
+                         tokens_in=20, tokens_out=50)
+
+    async def s():
+        await c.assemble()
+        _register_echo(c.root)
+        with patch.object(type(c.root.llm), "complete", fake_complete):
+            r = await c.root.react.run(c.root, "请认真思考后回答")
+        assert calls["n"] == 2, "truncated 空响应应触发恰好一次重试"
+        assert r.ok is True, "重试成功须收敛为 ok=True"
+        assert r.text == "这是重试后拿到的真实答复", "须返回重试拿到的正文"
+        await c.teardown()
+
+    _run(s())
+

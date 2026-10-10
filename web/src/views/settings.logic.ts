@@ -138,6 +138,7 @@ export const GUARD_DECISION_LABELS: Record<string, string> = {
 /** 保存时收集的数值键顺序（legacy app.js:552，原样） */
 export const SETTINGS_NUMERIC_KEYS = [
   'max_tokens_per_run',
+  'max_tokens',
   'finalize_reserve_tokens',
   'compact_trigger_tokens',
   'max_context_tokens',
@@ -279,6 +280,21 @@ export function renderSettingsHtml(j: SettingsResponse, scope: SettingsScope = '
     '<div class="muted" style="' +
     HINT +
     '">当前默认 200000；本会话预算独立累计，网页「新会话」只清零<b>本会话</b>已用量</div></label>' +
+    '<label style="' +
+    LABEL +
+    '"><div style="font-weight:600;margin-bottom:3px">单次生成上限 max_tokens (token)' +
+    sessTag('max_tokens') +
+    '</div>' +
+    '<input id="set_max_tokens" type="number" step="1024" min="1024" value="' +
+    esc(v.max_tokens) +
+    '" style="' +
+    INP +
+    '"' +
+    dis('max_tokens') +
+    '>' +
+    '<div class="muted" style="' +
+    HINT +
+    '">单次 API 调用的输出 token 上限（reasoning 与正文共享此额度）。默认 8192；若模型频繁「思考占满、无正文」（空响应），调大到 16384~32768 为长正文预留空间。保存后重建容器生效（容器级）。</div></label>' +
     '<label style="' +
     LABEL +
     '"><div style="font-weight:600;margin-bottom:3px">收尾预留额度 finalize_reserve_tokens (token)' +
