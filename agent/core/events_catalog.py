@@ -77,6 +77,9 @@ class Events:
     MEMORY_REMEMBERED = "agent/memory/remembered"
     MEMORY_RECALL = "agent/memory/recall"
 
+    # 规划插件（plugins.todo）：完成度实时帧（live emit，不落库；前端进度条消费）
+    TODO_PROGRESS = "agent/todo/progress"
+
     # 上下文治理插件（G1 分块装配）：装配元数据
     # （各块实占 / 裁剪 / 命中 / 刚性超限 / 回吐；遥测性质，非安全 seam）
     CONTEXT_GOVERNED = "agent/context/governed"
@@ -143,6 +146,7 @@ EVENT_MODE: dict[str, str] = {
     Events.SUBAGENT_SPAWN: "emit",        # 子 Agent 委派 spawn 审计（durable 由 subagent 直写）
     Events.MEMORY_REMEMBERED: "emit",
     Events.MEMORY_RECALL: "emit",
+    Events.TODO_PROGRESS: "emit",       # 规划完成度（进度条；遥测性质，不进 required seam）
     Events.CONTEXT_GOVERNED: "emit",      # G1：装配元数据遥测（无监听者即 no-op）
     Events.CONTEXT_PREFIX_UNSTABLE: "emit",  # P0：前缀稳定性体检（durable 由 react 直写）
     Events.CONTEXT_WATERLINE: "emit",        # P1：水位体检（遥测；无监听者即 no-op）

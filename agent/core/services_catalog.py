@@ -46,6 +46,8 @@ class Services:
     #: 就把桥和某一实现焊死了 —— 换实现要改桥，正是解耦要避免的。
     #: 桥侧因此消费的是"内核定义的机制"，提供方是**可替换**的；未装配 ⇒ None ⇒ 不劣化。
     CHILD_SPAWN_OPTIONS = "mcp.child_spawn_options"
+    #: **结构化待办/规划插件**服务键（P2-1）：暴露 TodoWrite 能力；react 经 ctx.get 取实例读计划/进度。
+    TODO = "todo"
 
 
 # 全部“内核服务键”值集合（供 AST 契约测试比对）
@@ -70,6 +72,7 @@ ALL = frozenset(
         Services.WINDOWS_MCP,
         Services.PLAYWRIGHT_MCP,
         Services.CHILD_SPAWN_OPTIONS,
+        Services.TODO,
     }
 )
 

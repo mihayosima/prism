@@ -35,6 +35,7 @@ PROGRESS_EVENTS: tuple[str, ...] = (
     Events.APPROVAL_ANSWERED,                      # 第 2 期：审批了结（前端弹窗消隐）
     Events.ASK_USER_PENDING,                       # 澄清问询卡片（ask_user 工具）
     Events.ASK_USER_ANSWERED,                      # 问询了结（前端卡片消隐）
+    Events.TODO_PROGRESS,                          # 规划插件：完成度实时帧（进度条）
 )
 
 # 内核事件名 → 传输层帧类型（其余默认 "progress"）。
@@ -47,6 +48,7 @@ FRAME_TYPES: dict[str, str] = {
     Events.APPROVAL_ANSWERED: "approval_done",
     Events.ASK_USER_PENDING: "ask_user",
     Events.ASK_USER_ANSWERED: "ask_user_done",
+    Events.TODO_PROGRESS: "todo",                  # 规划完成度帧（前端进度条）
 }
 
 
