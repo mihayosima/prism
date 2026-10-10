@@ -105,6 +105,28 @@ def _react_reply(messages: list[dict]) -> dict:
     if "触顶" in prompt:                     # 永不收敛 → 触发 max_steps
         return {"text": "", "tool_calls": [
             {"id": f"call_{rounds}", "name": "test.echo", "arguments": {"text": "loop"}}]}
+    if "多调用" in prompt:                    # 一步内多个调用（曾误伤无进展检测）
+        # ★ 必须复现真实误伤条件：**参数不同但返回内容相同**。
+        #   实测误伤源于 `tool_search` 连续检索不同关键词、返回**高度相似的候选列表文本**
+        #   ⇒ `hash(content)` 自然相同。若参数/内容都不同（初版用 test.echo 回显 q0..q3），
+        #   旧判据也不命中 ⇒ 用例测不到缺陷（已实测：破坏实验全绿）。
+        #   另：参数全同会命中**启发式1**（真死循环，判对），也会掩盖启发式2 的缺陷。
+        if rounds == 0:
+            return {"text": "", "tool_calls": [
+                {"id": f"call_{i}", "name": "test.same", "arguments": {"q": f"kw{i}"}}
+                for i in range(4)]}
+        return {"text": "单步多调用完成（fixture）。"}
+    if "待办" in prompt or "todo" in t:       # TodoWrite 插件 e2e：round0 列计划，round1 收尾
+        if rounds == 0:
+            return {"text": "", "tool_calls": [
+                {"id": "call_1", "name": "todo.write", "arguments": {"todos": [
+                    {"content": "读取需求文档", "status": "completed",
+                     "activeForm": "正在读取需求文档"},
+                    {"content": "实现核心逻辑", "status": "in_progress",
+                     "activeForm": "正在实现核心逻辑"},
+                    {"content": "编写测试", "status": "pending",
+                     "activeForm": "正在编写测试"}]}}]}
+        return {"text": "计划已建立并完成（fixture）。"}
     return {"text": f"直接回答（fixture）：{prompt[:40]}"}
 
 

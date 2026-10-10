@@ -66,6 +66,9 @@ class React:
             deadline_s=float(cfg.get("deadline_s", 120.0)),
             history_keep=int(cfg.get("history_keep", 20)),
             max_rejects=int(cfg.get("max_rejects", 3)),
+            # P1-1（2026-10-10）：无进展检测阈值 —— 配置旋钮，设极大（如 999）即关闭。
+            no_progress_window=int(cfg.get("no_progress_window", 5)),
+            no_progress_repeat=int(cfg.get("no_progress_repeat", 3)),
             finalize_on_exceed=bool(cfg.get("finalize_on_exceed", True)),
             # S3 兜底默认（折叠阈值归治理器 clip_*；此处仅最近保留条数）
             react_keep_recent=int(cfg.get("react_keep_recent", 6)),

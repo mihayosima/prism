@@ -83,6 +83,10 @@ class ReactConfig:
     #     旧 ``tool_result_max_chars``（字符口径）已删除，避免与治理器口径打架。
     history_keep: int = 20             # 喂给模型的最近消息条数（**降级路径**裁剪口径）
     max_rejects: int = 3               # 同一工具被拒多少次即终止（防死循环）
+    # P1-1（2026-10-10）：无进展检测 —— 泛化上方连拒护栏到「同参数重复调用」。
+    # 把 no_progress_repeat 设极大（如 999）即等效关闭检测器（一键回退旧行为）。
+    no_progress_window: int = 5        # 滑动窗口步数（只看最近 N 步的请求指纹）
+    no_progress_repeat: int = 3        # 窗口内同一 (工具, 参数) 指纹出现次数阈值
     finalize_on_exceed: bool = True    # 触顶时再答一次（不给工具）
     # ---- S3 循环内上下文：**兜底默认**（治理器缺该方法时才用到） ----
     # 注：折叠**阈值**（单条上限 / 头尾保留量）归治理器（``clip_*``），本插件不持该策略；
@@ -702,8 +706,12 @@ class ReactLoop:
         steps = 0
         tokens_in = tokens_out = 0
         rejected: dict[str, int] = defaultdict(int)
+        call_sigs: list[tuple[str, str]] = []   # P1-1：本 run 每步请求的 (工具名, 参数指纹)
         tool_trace: list[str] = []
         observed: list[dict] = []
+        # P1-1：无进展检测的**步级**结果指纹（每步一条；None = 该步无调用）。
+        # 与 observed（调用级，供收尾摘要用）并存，互不干扰。
+        step_fps: list[str | None] = []
         chain_peak = 0                         # 循环内 chain 实占峰值（可观测）
         chain_clips = 0                        # 累计逐条折叠次数（可观测）
         chain_act_folds = 0                    # D2：累计 act 参数折叠次数（可观测）
@@ -809,6 +817,11 @@ class ReactLoop:
             # L1：懒加载模式下先拦截元工具与未加载调用（loop 内联处理，不进注册表）
             meta_results: list[ToolResult] = []
             real_calls = out.tool_calls
+            # P1-1：收集本步请求的 (工具名, 参数指纹) —— 先于一切过滤/执行，
+            # 使「被拒/被放行但原地打转」都计入无进展检测（泛化连拒护栏）。
+            for _c in out.tool_calls:
+                call_sigs.append((getattr(_c, "name", "?"),
+                                  self._arg_fp(getattr(_c, "arguments", None))))
             if cfg.lazy_tools:
                 meta_results, real_calls = await self._partition_meta(
                     wm, task, out.tool_calls, tools)
@@ -872,6 +885,14 @@ class ReactLoop:
                     "head": dict(task.head) if task.head else None,
                     "step": steps, "budget_used": int(win.get("total_used", 0)),
                     "status": "running", "retry_count": 0, "ts": now_iso()})
+            # P1-1：无进展检测（泛化连拒护栏）—— 命中即复用既有触顶收尾，零新增分支。
+            # ★ 步级指纹**无条件**采集（不放在 if 内）：否则触发连拒的那一步会被漏记，
+            #   使 step_fps 比实际步数少一位、后续"连续 N 步"判定错位。
+            step_fps.append(self._step_fp(results))
+            if not stop_reason:
+                _np = self._detect_no_progress(call_sigs, observed, cfg, step_fps)
+                if _np:
+                    stop_reason = _np
             if stop_reason:
                 reason = stop_reason
                 break
@@ -947,6 +968,83 @@ class ReactLoop:
                                    is_error=True, tool_call_id=getattr(c, "id", ""))
                         for c in calls]
         return await self._actor.act(ctx, calls)
+
+    # ---------- P1-1：无进展检测（泛化连拒护栏，零新增收尾逻辑） ----------
+
+    @staticmethod
+    def _arg_fp(args) -> str:
+        """工具调用参数的稳定指纹（无序、可 JSON 序列化）。"""
+        try:
+            return json.dumps(args, sort_keys=True, ensure_ascii=False)
+        except TypeError:
+            return repr(args)
+
+    @staticmethod
+    def _step_fp(results: list) -> str | None:
+        """一步内全部工具结果的**聚合指纹**（步级，非调用级）。
+
+        ★ 为什么必须有这一步：``observed`` 是按**工具调用**累积的（一步内 N 个
+        tool_calls 就 append N 次），而启发式2 原本把它当**步**切片 ⇒ 单步内多调用
+        即可凑满 ``no_progress_repeat``，实测出现 ``steps=1`` 就报"最近 3 步"的误伤。
+        本方法把一步内的结果合成**一个**指纹，交由启发式2 按步比较。
+
+        返回 ``None`` 表示"本步无可比内容"（无调用）⇒ 调用方跳过该步，
+        避免空串被当成"内容相同"而误判。
+        """
+        parts: list[str] = []
+        for r in results or ():
+            name = str(getattr(r, "name", "") or "")
+            content = str(getattr(r, "content", "") or "")
+            # 工具名进指纹：不同工具返回同文本不算"无进展"（如两个空列表查询）。
+            parts.append(f"{name}:{hash(content)}")
+        return "|".join(sorted(parts)) if parts else None
+
+    @staticmethod
+    def _detect_no_progress(call_sigs: list[tuple[str, str]],
+                           observed: list[dict], cfg: "ReactConfig",
+                           step_fps: list[str | None] | None = None) -> str | None:
+        """同 (工具, 参数) 在窗口内反复出现 ⇒ 视为无进展。
+
+        泛化 ``run`` 内连拒护栏（``rejected[r.name] > max_rejects``）：那只对「被拒」
+        触发，本方法对「反复用同一参数调用同一工具」（含被放行但原地打转）也触发。
+        命中返回原因串（走既有 ``stop_reason → break → REACT_EXHAUSTED`` 诚实收尾）；
+        返回 ``None`` 表示正常。
+
+        ``step_fps``：**步级**聚合指纹序列（每步一条，见 :meth:`_step_fp`）。
+        启发式2 只在该序列上判定；缺失时（未传）退回旧的调用级判据以兼容旧调用方。
+        """
+        if len(call_sigs) < cfg.no_progress_repeat:
+            return None
+        # 启发式1：窗口内同一指纹超阈值（严格同参；迭代精修因参数不同而豁免）
+        recent = call_sigs[-cfg.no_progress_window:]
+        counts: dict[tuple[str, str], int] = {}
+        for sig in recent:
+            counts[sig] = counts.get(sig, 0) + 1
+        for sig, n in counts.items():
+            if n >= cfg.no_progress_repeat:
+                return (f"无进展检测触发：最近 {cfg.no_progress_window} 步内重复调用 "
+                        f"{sig[0]!r}（同参数）{n} 次")
+        # 启发式2：最近 N **步**的结果指纹相同（反复读回同一结果，未产生新信息）
+        #
+        # ★ 2026-10-10 真模型实测修误伤：原实现直接切 ``observed``（**调用级**），
+        #   一步内多个 tool_search 就凑满阈值，报出 ``steps=1`` 的"最近 3 步"——
+        #   且 ``tool_search`` 连续检索返回**高度相似的候选文本**，hash 自然相同。
+        #   改为步级指纹后，单步多调用只占 1 条、不再误判；跨步重复才命中。
+        if step_fps is not None:
+            tail = [fp for fp in step_fps[-cfg.no_progress_repeat:] if fp is not None]
+            # 要求**连续** N 步都有内容且全同（中间有 None = 空步，不算重复）
+            if len(tail) == cfg.no_progress_repeat and len(set(tail)) == 1:
+                return (f"无进展检测触发：最近 {cfg.no_progress_repeat} 步结果"
+                        f"高度重复（未产生新信息）")
+            return None
+        # 兼容路径：未传 step_fps（保留旧语义，仅供旧调用方）
+        if len(observed) >= cfg.no_progress_repeat:
+            tail = observed[-cfg.no_progress_repeat:]
+            hashes = {hash(str(o.get("content", ""))) for o in tail}
+            if len(hashes) == 1:
+                return (f"无进展检测触发：最近 {cfg.no_progress_repeat} 步观察结果"
+                        f"高度重复（未产生新信息）")
+        return None
 
     def _prepare_chain(self, gov, chain: list[dict], keep_recent: int, *,
                        wm=None, task_id: str = "",
