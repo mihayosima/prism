@@ -15,6 +15,7 @@ export const FLOAT_KEYS = new Set([
   'history_ratio',
   'window_high_ratio',
   'window_low_ratio',
+  'deadline_s',
 ])
 
 export const isFloatKey = (k: string): boolean => FLOAT_KEYS.has(k)
@@ -156,6 +157,9 @@ export const SETTINGS_NUMERIC_KEYS = [
   'on_demand_cap_tokens',
   'prompt_cap_tokens',
   'clear_at_least_tokens',
+  // ---- 执行闸门（2026-10-10）----
+  'max_steps',
+  'deadline_s',
 ] as const
 
 /** 输入框通用内联样式（legacy 多处重复，原样保留字符串以逐字符对拍） */
@@ -351,7 +355,45 @@ export function renderSettingsHtml(j: SettingsResponse, scope: SettingsScope = '
     '</div></div>' +
     '<div class="muted" style="' +
     HINT +
-    '">放行制：勾选的域对模型可见，其余域被隐藏（仍可经 tool_search 检索加载）；<b>一个都不勾 = 不裁剪</b>（不做「全隐藏」）。域 = 工具注册来源 owner（插件 id），新增 MCP 插件会自动成为一个新域，在此自动出现。</div></div></div>'
+    '">放行制：勾选的域对模型可见，其余域被隐藏（仍可经 tool_search 检索加载）；<b>一个都不勾 = 不裁剪</b>（不做「全隐藏」）。域 = 工具注册来源 owner（插件 id），新增 MCP 插件会自动成为一个新域，在此自动出现。</div></div></div>' +
+    // ---- 执行闸门（2026-10-10 基线驱动）----
+    // 独立卡片而非并入上面的「上下文治理」：这两个是**循环的执行闸**（步数/时限），
+    // 与「装配什么上下文」是不同关注点，混在一张卡里会让用户为调步数而去动上下文参数。
+    '<div class="card" style="margin-top:16px"><h3 style="margin-top:0">执行闸门（plugins.react）</h3>' +
+    '<div class="muted" style="margin-bottom:10px">多步循环的<b>停止条件</b>：步数用尽或时限用尽即触发「诚实收尾」（基于已有信息作答，不静默截断）。' +
+    '实测基线（298 次运行）显示 <b>步数上限是最大触顶原因（占 44%）</b>，故一并暴露；无进展检测（防原地打转）已默认启用，无需设置。容器级保存后立即重建容器生效。</div>' +
+    '<label style="' +
+    LABEL +
+    '"><div style="font-weight:600;margin-bottom:3px">最大步数 max_steps' +
+    sessTag('max_steps') +
+    '</div>' +
+    '<input id="set_max_steps" type="number" step="1" min="1" max="200" value="' +
+    esc(v.max_steps) +
+    '" style="' +
+    INP +
+    '"' +
+    dis('max_steps') +
+    '>' +
+    '<div class="muted" style="' +
+    HINT +
+    '">一次任务最多几轮「推理 + 工具调用」。<b>默认 8</b>；复杂任务若频繁触顶（表现为「已达步数上限」），可调到 16~25。' +
+    '调大前请确认：模型若在原地打转，加步数只是让它转得更久——无进展检测会兜底，但代价是 token。</div></label>' +
+    '<label style="' +
+    LABEL +
+    '"><div style="font-weight:600;margin-bottom:3px">单次运行时限 deadline_s (秒)' +
+    sessTag('deadline_s') +
+    '</div>' +
+    '<input id="set_deadline_s" type="number" step="5" min="5" max="3600" value="' +
+    esc(v.deadline_s) +
+    '" style="' +
+    INP +
+    '"' +
+    dis('deadline_s') +
+    '>' +
+    '<div class="muted" style="' +
+    HINT +
+    '">一次任务的墙钟时限（秒），<b>默认 120</b>。与步数闸<b>成对</b>生效：先到者触发收尾。' +
+    '工具调用是串行执行的，轮数多时可能先撞时限——此时应同时看 max_steps。</div></label></div>'
 
   if (j.context_plugin_enabled !== true) {
     h +=

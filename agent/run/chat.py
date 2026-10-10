@@ -323,6 +323,22 @@ _SETTING_META: dict[str, dict] = {
         "spec": ("bool",), "plugin": "plugins.react",
         "default": _REACT_DEFAULTS.get("alignment_enabled", True),
         "scope": "container"},
+    # ---- 执行闸门两旋钮（2026-10-10 基线驱动：max_steps 是 44% 触顶的主因）----
+    # 背景：P0-1 实测 298 run → 触顶 64 次中 ``step_limit`` 占 24（44%，最大头），
+    # 触顶任务平均已用 5.2 步。而此前 max_steps **只存在于配置文件**、设置页不可见，
+    # 用户想拧只能手改 json（且改完要记得重启）。
+    # ★ 默认值**不能**从 _REACT_DEFAULTS 取：max_steps 的真实默认在
+    # ``plugins/react/__init__.py`` 的 ``cfg.get("max_steps", 8)``，
+    # ``profiles.BASE_AGENT_CONFIG`` 的 react 节**没有这个键**（已核实）。
+    # 口径纪律：此处与那处必须一致；改此处须同步改 react/__init__.py（下方有守卫测试）。
+    "max_steps": {
+        "spec": (int, 1, 200), "plugin": "plugins.react",
+        "default": 8, "scope": "container"},
+    # 同批放行 deadline_s：它与 max_steps 是**成对**的执行闸（实测 timeout 占触顶 14%），
+    # 只暴露一个会让用户"拧完步数又撞时限"，反而更难归因。
+    "deadline_s": {
+        "spec": (float, 5.0, 3600.0), "plugin": "plugins.react",
+        "default": 120.0, "scope": "container"},
     # ---- 准入名单四键（2026-10-03 策略收口：plugins.sandbox → plugins.guard）----
     # 键名取**裸名**（与 approval 的 ask/provider 同款）：设置层是扁平单值命名空间，
     # 由 _PLUGIN_OF_KEY 保证不歧义。``risk`` 刻意**不进设置页**——已核实 MCP 工具
