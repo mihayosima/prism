@@ -48,7 +48,15 @@ _SCHEMA: dict[str, Any] = {
         # 未知值回落 open 并计数，不再"任何非 open 值都锁死全部模型调用"。
         "permissions": {"default": str, "task_allow": list, "task_deny": list, "llm": str,
                         "risk": dict,          # S5：按风险级裁决 {"read":"allow","danger":"deny",...}
-                        "targets": list},      # 域限定；不在此列表的工具完全不过问
+                        "targets": list,       # 域限定；不在此列表的工具完全不过问
+                        # ★ 2026-10-10 补登：`allow`/`deny` 是**设置页已注册的可写键**
+                        #   （`run/chat.py::_SETTING_META`，归属 `plugins.guard`，经
+                        #   `_SECTION_ALIAS` 映射到本节），但本节漏登记 ⇒ 用户在设置页
+                        #   保存准入名单时 `validate_config` fail-fast 报
+                        #   「未知配置键 'allow'（不在 schema 中）」，保存整体失败。
+                        #   责任在 schema 漏登记（G7 那笔加了设置键却没同步这里），
+                        #   与本仓「同一事实 N 处同步」的纪律相符：补齐即可。
+                        "allow": list, "deny": list},
         "loop": {"deadline_s": (int, float)},
         # 阶段 2（2.2）：会话/租户身份的服务端配置面（session 另从请求头取，不在此配置）。
         # 严格校验（非 _any）：拼错键（如 ``tennat``）在装配期即 fail-fast。
