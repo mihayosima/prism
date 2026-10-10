@@ -22,6 +22,7 @@ from agent.api import (
     Events,
     Services,
     current_plugin,
+    durable,
     guard_source,
     inc_counter,
     now_iso,
@@ -29,6 +30,41 @@ from agent.api import (
 )
 
 logger = logging.getLogger("agent.tasks")
+
+#: 落 durable 时**必须截断/脱敏**的键名（小写子串匹配）——工具参数里可能有文件正文、
+#: 密钥、用户隐私；``agent_events`` 是可长期查询的审计表，不能裸存。
+#: 命中即把该键的值替换为占位符（保留"传了这个键"的事实，不留内容）。
+_REDACT_KEYS: tuple[str, ...] = (
+    "content", "text", "body", "data", "payload", "input", "output",
+    "secret", "token", "key", "password", "passwd", "credential",
+    "api_key", "apikey", "auth", "cookie", "session_key",
+)
+
+#: 单个键的**保留长度**（超出即截断）：防大对象把审计表撑爆。
+_REDACT_MAX = 200
+
+
+def _redact_kwargs(kwargs: Mapping[str, Any] | None) -> dict:
+    """工具入参脱敏（落 durable 前）：敏感键只留存在性，长值截断。
+
+    审计要回答"调了什么工具、参数形状如何"，**不需要**参数内容。
+    绝不落原始正文/密钥——``agent_events`` 会被前端与 SQL 长期读取。
+    """
+    out: dict = {}
+    for k, v in (kwargs or {}).items():
+        if any(s in str(k).lower() for s in _REDACT_KEYS):
+            out[k] = f"<redacted:{type(v).__name__}>"
+            continue
+        if isinstance(v, str) and len(v) > _REDACT_MAX:
+            out[k] = v[:_REDACT_MAX] + f"…<+{len(v) - _REDACT_MAX}字>"
+        elif isinstance(v, str):
+            out[k] = v            # ★ 短字符串原样保留（path/query/命令 等审计要看的）
+        elif isinstance(v, (int, float, bool)) or v is None:
+            out[k] = v
+        else:
+            # 复杂结构只记形状（长度/类型），不展开内容
+            out[k] = f"<{type(v).__name__}:{len(v) if hasattr(v, '__len__') else '?'}>"
+    return out
 
 
 # ---- 源头护栏（S4）--------------------------------------------------------
@@ -175,6 +211,13 @@ class TaskRegistry:
         if cmd is None:
             raise AgentError(f"任务不存在: {name!r}")
         caller = caller or current_plugin() or "unknown"
+        # ★ 落 durable（2026-10-10）：与 post-execute 成对，供"请求了多少次 vs 真正
+        # 执行了多少次"对比（差额＝被 guard/approval/白名单拒绝的），是审批与护栏
+        # 的事后审计依据。waterfall 的**闸门语义不受影响**（那是 emit 的职责）。
+        await durable(ctx, Events.TASKS_PRE_EXECUTE, {
+            "task": name, "caller": caller, "kwargs": _redact_kwargs(kwargs),
+            "risk": cmd.risk,
+        })
         decision = await ctx.events.waterfall(
             Events.TASKS_PRE_EXECUTE,
             {"task": name, "kwargs": kwargs, "caller": caller,
@@ -216,12 +259,25 @@ class TaskRegistry:
             raise
         finally:
             span_ms = int((time.monotonic() - started) * 1000)
-            await ctx.events.emit(Events.TASKS_POST_EXECUTE, {
+            payload = {
                 "task": name, "caller": caller,
-                "ok": ok, "span_ms": span_ms, "error": error,
+                "ok": ok, "span_ms": span_ms,
+                # ★ error 也可能是长文本/含敏感片段 ⇒ 截断（不是脱敏键，是自由文本）
+                "error": (str(error)[:_REDACT_MAX] if error else None),
                 "clipped": clipped, "omitted_tokens": omitted, "limit_tokens": limit,
                 "timed_out": bool(ok is False and error and "超时" in error),
-            })
+            }
+            await ctx.events.emit(Events.TASKS_POST_EXECUTE, payload)
+            # ★ 同事件再落 durable（2026-10-10）：emit 是 live 遥测、**不落库**，
+            # 导致「每任务工具调用数 / 一轮多调用分布 / 工具耗时」等度量在
+            # agent_events 里取不到（基线实测 tasks/post-execute 落库 0 条）。
+            # 经 core.audit.durable 直写——它是 agent_events 的**唯一写入点**
+            # （有守卫测试断言），故自动带上 request_id/run_id/session 关联列，
+            # 可与 react/llm 事件按同一 id 串起来。
+            # 载荷用同一 dict（纯数据、无 tool 返回值）⇒ 不泄密、不膨胀。
+            # durable 内部自带 db 为 None 的保护与写失败兜底，绝不影响主链路；
+            # **不额外给 TasksPlugin inject DB**（那会引入装配顺序依赖）。
+            await durable(ctx, Events.TASKS_POST_EXECUTE, payload)
         return result
 
     def resolve(self, ctx, name: str) -> Callable[..., Any] | None:
