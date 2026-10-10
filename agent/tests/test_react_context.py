@@ -292,16 +292,28 @@ def test_ten_plus_step_chain_stays_within_budget(tmp_path):
     """12 步大观察工具链：循环内每步装配 **total_used <= input_budget**，chain 不超额度。
 
     这是 S3 的原始动机——旧 ``_trim`` 只按**条数**裁剪，一条大观察即可撑爆窗口。
+
+    ★ 2026-10-10 修测试债：原先每步都是"同参 + 完全相同返回"，客观构成原地
+    打转 ⇒ 被无进展检测启发式1 抢先收尾（steps=3 而非 12），本例要验的
+    「治理遥测每步不溢出」根本没跑到 12 步。本例要验**上下文治理**、不是无进展
+    检测，故每步内容/参数均带序号递进 + 显式关掉启发式1。
+    **破坏实验已执行**：把内容与参数都改回恒定 ⇒ 本例立即转红 ⇒ 证明递进是真
+    正起作用的那一层。
     """
     c = _build(tmp_path, patch={"agent": {
-        "react": {"max_steps": 12},
+        "react": {"max_steps": 12, "no_progress_repeat": 999},
         "context": {"max_context_tokens": 4096, "reserve_output_tokens": 0}}})
 
     async def s():
         await c.assemble()
 
+        # 每步内容带序号（仍是 ~6000 token，不影响本例的窗口/额度断言）
+        # 两个计数器互不干扰（内容计数 vs 参数计数），避免共享一个造成跳号。
+        seq = {"content": 0, "args": 0}
+
         async def _big():
-            return "D" * 6000                                  # 每步 ≈1500 token
+            seq["content"] += 1
+            return "D" * 5998 + f"{seq['content']:02d}"          # 每步 ≈1500 token          # 每步 ≈1500 token
 
         c.root.tasks.register(c.root, "test.big", schema={}, handler=_big,
                               owner="test", description="返回大结果")
@@ -309,14 +321,20 @@ def test_ten_plus_step_chain_stays_within_budget(tmp_path):
         class _AlwaysTool:
             async def reason(self, ctx, messages, tools):
                 from agent.plugins.react.components import ReasonOutput, ToolCall
-                return ReasonOutput(text="继续取数", tool_calls=[ToolCall("test.big", {}, "c1")],
-                                    tokens_in=1, tokens_out=1)
+                # 参数亦随步递进（原先恒定 {} + 恒定 call_id，同样构成"同参死循环"）
+                seq["args"] += 1
+                return ReasonOutput(
+                    text="继续取数",
+                    tool_calls=[ToolCall("test.big", {"i": seq["args"]}, f"c{seq['args']}")],
+                    tokens_in=1, tokens_out=1)
 
         loop = c.root.react
         loop._reasoner = _AlwaysTool()                          # 恒定请求工具 → 必然多步
         got = _capture_governed(c.root)
         r = await loop.run(c.root, "请反复取数直到触顶")
         assert r.exhausted and r.steps == 12                    # 确实跑到步数闸
+        assert "max_steps" in (r.reason or ""), (
+            f"应由步数闸收尾，实际 reason={r.reason!r}")
         assert len(got) >= 10, f"步数不足（治理遥测 {len(got)} 条）"
         for p in got:
             assert p["total_used"] <= p["input_budget"]         # 每步都不溢出

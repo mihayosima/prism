@@ -136,15 +136,35 @@ def test_guard_deny_observed_and_repeat_terminates(tmp_path):
 
 
 def test_max_steps_exhausted_is_honest(tmp_path):
-    """用例 5：触顶（max_steps）→ ``exhausted=True``、文本如实说明、不抛异常。"""
+    """用例 5：触顶（max_steps）→ ``exhausted=True``、文本如实说明、不抛异常。
+
+    ★ 2026-10-10 修测试债：本例原先用 fixture「触顶」脚本（**每轮同参**
+    ``test.echo``）驱动，而那正是无进展检测启发式1（同参指纹）的判据 ⇒ 循环
+    走到第 3 步就被无进展检测收尾，``reason`` 是「无进展检测触发…」而非
+    ``max_steps``，本例断言 ``"max_steps" in reason`` 失败。
+
+    修法：换 fixture 分支「推进到顶」——**每轮参数递进**（``iter0/iter1/…``），
+    客观在推进、不构成原地打转 ⇒ 无进展检测（默认启用）不触发，循环由**步数闸**
+    收尾，本例真正要验的东西回来了。
+
+    **破坏实验已执行**：把 prompt 改回「触顶循环」⇒ 本例立即转红，reason 变
+    「无进展检测触发：最近 5 步内重复调用 'test.echo'（同参数）3 次」⇒ 证明
+    fixture 隔离是**真正起作用**的那一层（而非恰好通过）。
+    ★ 顺带结论：另加的 ``no_progress_repeat=999`` 属**冗余**——破坏实验显示去掉它
+      用例仍全绿，故已移除（避免给后人"两处都必需"的错觉）。
+
+    ⚠️ 不改「触顶」fixture 本身——它被 8+ 个用例共用，且 test_no_progress 的
+       A/B 用例**依赖**它每轮同参来触发启发式1。
+    """
     c = _build(tmp_path, patch={"agent": {"react": {"max_steps": 3}}})
 
     async def s():
         await c.assemble()
         _register_echo(c.root)
-        r = await c.root.react.run(c.root, "请触顶循环")
+        r = await c.root.react.run(c.root, "请把任务推进到顶")
         assert r.ok and r.exhausted and r.steps == 3
-        assert "max_steps" in (r.reason or "")
+        assert "max_steps" in (r.reason or ""), (
+            f"应由步数闸收尾，实际 reason={r.reason!r}")
         assert "上限" in r.text
         rows = await c.root.db.query(
             c.root, "SELECT event FROM agent_events WHERE event='agent/react/exhausted'")

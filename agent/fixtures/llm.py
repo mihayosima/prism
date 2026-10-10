@@ -105,6 +105,14 @@ def _react_reply(messages: list[dict]) -> dict:
     if "触顶" in prompt:                     # 永不收敛 → 触发 max_steps
         return {"text": "", "tool_calls": [
             {"id": f"call_{rounds}", "name": "test.echo", "arguments": {"text": "loop"}}]}
+    if "推进到顶" in prompt:
+        # ★ 每轮**参数递进**（故不触发无进展检测的启发式1），用于验证「跑满步数闸」
+        #   本身的用例。**不是**给「触顶」分支用的：那个被 8+ 个用例共用，其中
+        #   test_no_progress 的 A/B 依赖它每轮同参来触发启发式1 ⇒ 不能改它。
+        #   客观上「12 步同参同返回」本就是原地打转，被无进展检测拦下是对的。
+        return {"text": "", "tool_calls": [
+            {"id": f"call_{rounds}", "name": "test.echo",
+             "arguments": {"text": f"iter{rounds}"}}]}
     if "多调用" in prompt:                    # 一步内多个调用（曾误伤无进展检测）
         # ★ 必须复现真实误伤条件：**参数不同但返回内容相同**。
         #   实测误伤源于 `tool_search` 连续检索不同关键词、返回**高度相似的候选列表文本**
