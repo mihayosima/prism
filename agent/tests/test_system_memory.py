@@ -113,6 +113,19 @@ def test_react_build_system_includes_sm():
     assert "ReAct 循环" in out                    # REACT_SYSTEM 常量内容
 
 
+def test_planning_discipline_injected():
+    """P0-2 静态守卫：规划纪律（02-planning.md）必须进入注入后的系统提示词。
+
+    防止该声明文件被误删/改名后悄悄失效——届时 build_system 输出将不再含
+    「规划纪律 / plan 围栏 / 重复 3 次」标记，本测试即失败。
+    """
+    sm = load_system_memory()
+    out = build_system([], system_memory=sm)
+    assert "规划纪律" in out, "02-planning.md 未进入系统记忆装配"
+    assert "plan" in out, "规划纪律协议缺少 plan 围栏块"
+    assert "3 次" in out, "规划纪律缺少「重复 3 次即死循环」提示"
+
+
 def test_disabled_graceful_when_dir_missing(tmp_path: Path):
     """外部目录指向不存在路径 → 提供空串，chat 仍可正常工作（不注入、不报错）。"""
     async def _coro():
