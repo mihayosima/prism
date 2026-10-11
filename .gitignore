@@ -29,9 +29,13 @@ agent_chat_server.log
 # 旧的 `.frontend-*.log` 只覆盖短横线形式，导致点号形式一直漏网、干扰 git status。
 .backend*.log
 .frontend*.log
+# 临时起服务验证时的重定向日志（.scratch*.log 等）
+.scratch*.log
 
 # 诊断件的**生成物**（脚本本身入库，产物不入库）
 _diag_final2/
+# 根目录下一次性的会话诊断转储（如 _diag_recent_session.txt）
+/_diag_*.txt
 _diag_mcp/*.json
 _diag_mcp/*.log
 _diag_mcp/*.txt

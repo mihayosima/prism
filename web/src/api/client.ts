@@ -171,6 +171,16 @@ export function post<T>(path: string, body?: unknown, signal?: AbortSignal): Pro
   return request<T>(path, { method: 'POST', body, signal })
 }
 
+/** PUT 语法糖 */
+export function put<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+  return request<T>(path, { method: 'PUT', body, signal })
+}
+
+/** DELETE 语法糖 */
+export function del<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+  return request<T>(path, { method: 'DELETE', body, signal })
+}
+
 /** 安全 JSON 解析：非 JSON 响应不抛异常，返回 null */
 async function safeJson(res: Response): Promise<unknown> {
   try {

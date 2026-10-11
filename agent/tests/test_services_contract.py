@@ -72,6 +72,19 @@ def _list_elements_bad(lst: ast.AST, allowed: set[str]) -> list[str]:
     return bad
 
 
+def _module_imports(path: pathlib.Path) -> set[str]:
+    """收集单个模块的全部 import 目标（``ast.Import`` 的 name / ``ImportFrom`` 的 module）。"""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                out.add(a.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            out.add(node.module)
+    return out
+
+
 def test_provides_inject_literals_belong_to_services():
     """① provides=/inject= 的字面量必须 ∈ Services ∪ ALLOWLIST。"""
     allowed = SERVICE_VALUES | ALLOWLIST
@@ -149,8 +162,56 @@ def test_every_service_constant_has_provider():
     assert not missing, f"以下 Services 常量无提供方（死常量）: {missing}"
 
 
+# ---- 技能 MCP 适配器（只读对外暴露）零耦合守卫 ----
+
+_ADAPTER = AGENT / "run" / "skills_mcp_adapter.py"
+_SKILLS_MCP_BRIDGE = AGENT / "plugins" / "skills_mcp" / "__init__.py"
+
+
+def test_skills_mcp_adapter_import_purity():
+    """④ 只读技能 MCP 适配器：不得依赖工具表 / 反应器子系统（零耦合）。
+
+    适配器是**独立子进程**，只应从磁盘重建技能目录；一旦 import ``sys.tasks`` 或
+    ``plugins.react``，就会把技能与工具两个子系统焊死——正是当初绕开
+    ``register_meta_tool``、改走 ``Services.SKILLS`` 反向读取要杜绝的事。
+    """
+    if not _ADAPTER.exists():
+        return
+    banned_prefixes = ("agent.sys.tasks", "agent.plugins.react")
+    mods = _module_imports(_ADAPTER)
+    bad = sorted(m for m in mods if m.startswith(banned_prefixes))
+    assert not bad, f"技能 MCP 适配器不得 import 工具/reactor 子系统: {bad}"
+
+
+def test_skills_mcp_bridge_import_purity():
+    """⑤ 技能 MCP 桥插件：只经 ``agent.api`` 接线，不得直连技能/工具/反应器的实现模块。
+
+    桥的职责是「起子进程 + 注册工具」，与 ``playwright_mcp`` / ``windows_mcp`` 同形态；
+    它不该知道技能目录怎么建、工具表怎么管。
+    """
+    if not _SKILLS_MCP_BRIDGE.exists():
+        return
+    # 技能目录已下沉到 core，故禁的是「绕过 api 直连 core」：桥应只 import agent.api。
+    banned_prefixes = ("agent.sys.tasks", "agent.core.skills",
+                       "agent.plugins.react", "agent.plugins.skills")
+    mods = _module_imports(_SKILLS_MCP_BRIDGE)
+    # 排除自身包路径（agent.plugins.skills_mcp 不是 agent.plugins.skills）
+    bad = sorted(m for m in mods
+                 if m.startswith(banned_prefixes) and not m.startswith("agent.plugins.skills_mcp"))
+    assert not bad, f"技能 MCP 桥插件不得直连这些子系统: {bad}"
+
+
+def test_skills_mcp_service_key_registered():
+    """⑥ ``Services.SKILLS_MCP`` 必须登记进 ``ALL``（漏登记 ⇒ 契约守卫与装配期静默失效）。"""
+    assert Services.SKILLS_MCP in SERVICE_KEYS, \
+        "Services.SKILLS_MCP 未登记进 services_catalog.ALL"
+
+
 __all__ = [
     "test_provides_inject_literals_belong_to_services",
     "test_ctx_service_key_literals_use_constants",
     "test_every_service_constant_has_provider",
+    "test_skills_mcp_adapter_import_purity",
+    "test_skills_mcp_bridge_import_purity",
+    "test_skills_mcp_service_key_registered",
 ]

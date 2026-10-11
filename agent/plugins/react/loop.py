@@ -125,6 +125,7 @@ class TaskContext:
     task_id: str = ""
     step: int = 0
     loaded: set[str] = field(default_factory=set)   # L1：已加载完整定义的工具名
+    skill_docs: list[str] = field(default_factory=list)   # 技能说明（经 skill 工具按需注入，下一轮喂给模型；循环内草稿，不持久化）
     # G2.0（P0/F-1）：**冻结的头部快照** ``{system_text, prior, prompt}``。
     # 一旦冻结，本会话后续每个 run 都复用同一份头部字节——这是「续接请求的前缀
     # 不被头部变更打断」的前提（否则易变的头部会让整条链在缓存上失效）。
@@ -600,11 +601,20 @@ class ReactLoop:
         # 裁剪即硬隐藏＝不可回溯）；故 allowed 在此处被 lazy_tools 一票否决。
         allowed = allowed_domains(ctx) if cfg.lazy_tools else None
         allowed, tools_vis, hidden = _clip_with_fallback(tools, allowed)
+        # 技能常驻元工具：独立于 lazy_tools 开关，non-lazy 模式下也须可见（否则默认失效）
+        _cat = ctx.get(Services.SKILLS, None)
+        if _cat is not None:
+            tools_vis = list(tools_vis) + [dict(m) for m in _cat.meta_tools()]
         # L1：懒加载时系统提示只挂目录卡（完整定义按需经 native tools 分步装载）；
         # 目录同样按域裁剪（只裁 native 不裁目录 ⇒ 模型仍从名册看见隐藏域，「隐藏」不成立）。
         prompt_catalog = ([_card(t) for t in tools_vis] if cfg.lazy_tools else tools_vis)
-        system_prompt = build_system(prompt_catalog, ctx.get(Services.SYSTEM_MEMORY) or "",
-                                     hidden_domains=hidden)
+        _sys_mem = ctx.get(Services.SYSTEM_MEMORY) or ""
+        _cat_skills = ctx.get(Services.SKILLS, None)
+        if _cat_skills is not None:
+            _idx = _cat_skills.index_block()
+            if _idx:
+                _sys_mem = f"{_sys_mem}\n\n{_idx}" if _sys_mem else _idx
+        system_prompt = build_system(prompt_catalog, _sys_mem, hidden_domains=hidden)
 
         # 工作记忆（第 3 层）：任务级进度缓存。接缝获取，缺失则跳过（不破解耦）。
         wm = ctx.get(Services.WORK_MEMORY)
@@ -730,7 +740,7 @@ class ReactLoop:
 
             # ---- 窗口构造（S3：块内准备 → 治理器装配；无治理器退降级） ----
             # L1：懒加载时本步 native tools = 元工具 + 已加载完整定义 + 放行域目录卡
-            tools_step = (self._tools_for_step(tools, task, allowed)
+            tools_step = (self._tools_for_step(tools, task, allowed, ctx)
                           if cfg.lazy_tools else tools_vis)
             window, win = self._window(ctx, task, system_prompt, head_prompt, messages,
                                       steps, tools=tools_step)
@@ -766,7 +776,12 @@ class ReactLoop:
 
             # ---- Think ----
             try:
-                out = await self._reasoner.reason(ctx, window, tools_step)
+                skill_note = "\n\n".join(task.skill_docs) if task.skill_docs else None
+                # 仅当确有技能说明要注入时才带 system_note——保持与抽象 ``Reasoner`` 协议
+                # （``reason(ctx, messages, tools)``）的默认契约一致，避免破坏未实现该关键字的
+                # reasoner 实现（含既有测试桩）。无技能加载时等价于不传该参数。
+                reason_kwargs = {"system_note": skill_note} if skill_note else {}
+                out = await self._reasoner.reason(ctx, window, tools_step, **reason_kwargs)
             except CapabilityNotImplemented as exc:      # guard/预算拒绝 → 触顶收尾，不崩
                 reason = f"模型调用被拒：{exc}"
                 break
@@ -831,9 +846,24 @@ class ReactLoop:
                                    run_id=run_id)
 
             # ---- Act + Observe ----
-            # L1：懒加载模式下先拦截元工具与未加载调用（loop 内联处理，不进注册表）
+            # 技能元工具路由（独立于 lazy_tools 开关，常驻可用）：把 skill 调用交给
+            # SkillsCatalog.handle_meta，剩余调用走既有（懒加载/真实）通道。react 不
+            # import skills 插件——只经 ctx.get(Services.SKILLS) 反向读取契约。
             meta_results: list[ToolResult] = []
-            real_calls = out.tool_calls
+            _skill_calls = [c for c in out.tool_calls
+                            if getattr(c, "name", "") == "skill"]
+            for _c in _skill_calls:
+                if _cat is not None:
+                    _text, _err = await _cat.handle_meta(task, _c, ctx)
+                    meta_results.append(ToolResult("skill", _text, is_error=_err,
+                                                   tool_call_id=getattr(_c, "id", "")))
+                else:
+                    meta_results.append(ToolResult(
+                        "skill", "技能系统未启用", is_error=True,
+                        tool_call_id=getattr(_c, "id", "")))
+            real_calls = [c for c in out.tool_calls
+                          if getattr(c, "name", "") != "skill"]
+            # L1：懒加载模式下先拦截元工具与未加载调用（loop 内联处理，不进注册表）
             # P1-1：收集本步请求的 (工具名, 参数指纹) —— 先于一切过滤/执行，
             # 使「被拒/被放行但原地打转」都计入无进展检测（泛化连拒护栏）。
             for _c in out.tool_calls:
@@ -841,7 +871,7 @@ class ReactLoop:
                                   self._arg_fp(getattr(_c, "arguments", None))))
             if cfg.lazy_tools:
                 meta_results, real_calls = await self._partition_meta(
-                    wm, task, out.tool_calls, tools)
+                    wm, task, real_calls, tools)
             results = list(meta_results)
             if real_calls:
                 # ★ 子 Agent 执行层白名单硬拦截（v0.3 §3.4「安全下界」的兑现）：
@@ -1546,7 +1576,7 @@ class ReactLoop:
 
     @staticmethod
     def _tools_for_step(tools: list[dict], task: TaskContext,
-                        allowed: set[str] | None = None) -> list[dict]:
+                        allowed: set[str] | None = None, ctx: object = None) -> list[dict]:
         """本步 native tools：元工具 + 已加载完整定义 + **放行域**的目录卡。
 
         放行条件（《治理方案》§3.3）：``name in task.loaded``（已加载 ⇒ 完整定义，
@@ -1556,8 +1586,16 @@ class ReactLoop:
         ``allowed is None`` ⇒ 全放行（与改造前**逐字节等价**）。
         隐藏域的工具虽然不在此处出现，但 ``_partition_meta`` 仍用**全量** ``tools``
         做 ``tool_search`` / ``tool_load`` ⇒ 「对模型不可见、对检索可见」（G3）。
+
+        ``ctx``（可选）：传入时把技能常驻元工具（``Services.SKILLS.meta_tools``）
+        前置进本步工具集——确保 skill 工具在懒加载模式下同样默认可见。
         """
         out: list[dict] = [dict(m) for m in LAZY_META_TOOLS]
+        # 技能常驻元工具（独立于 lazy_tools，常驻可见）
+        if ctx is not None:
+            _cat = ctx.get(Services.SKILLS, None)
+            if _cat is not None:
+                out = [dict(m) for m in _cat.meta_tools()] + out
         for t in tools:
             if t.get("name") in task.loaded:
                 out.append(t)

@@ -244,6 +244,28 @@ export interface PluginActionResponse {
   [k: string]: unknown
 }
 
+// ---------- 技能（Skill） ----------
+
+/** 单个技能卡片（与后端 SkillsCatalog._card 对齐） */
+export interface SkillRow {
+  name: string
+  description: string
+  risk: string
+  owner: string
+  tags: string[]
+  version: string
+  has_run: boolean
+  enabled: boolean
+  source: string
+  content?: string
+  [k: string]: unknown
+}
+
+export interface SkillsResponse {
+  skills: SkillRow[]
+  enabled: boolean
+}
+
 // ---------- 设置 ----------
 
 /** 可用工具域选项（设置页以此渲染 tool_domains 的可勾选清单） */

@@ -1551,6 +1551,8 @@ def _register_routes(app, deps):
     _register_probes(app, deps)
     _register_approval(app, deps)
     _register_resources(app, deps)
+    from agent.run.skills_routes import register_skills_routes
+    register_skills_routes(app, deps)
 
 async def _serve(args: argparse.Namespace) -> int:
     import uvicorn

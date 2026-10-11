@@ -32,6 +32,12 @@ from agent.core.obs import (bind_request_id, configure_logging, counters_snapsho
                             new_request_id, trace_fields)
 from agent.core.request_cost import (estimate_request_cost, wire_messages,
                                      wire_tools)
+from agent.core.skill import Skill, skill
+# 技能目录与文件发现/持久化：随 ``Skill`` 一并落在 core 并经本出口导出，使插件与传输层
+# 合规取用（它们只被允许 import agent.api）。
+from agent.core.skills_catalog import SkillsCatalog
+from agent.core.skills_loader import (delete_skill_file, discover_skills, load_state,
+                                      parse_skill_file, save_state, write_skill_file)
 from agent.core.scope_config import (DEFAULT_SESSION_LIMIT, evict_lru,
                                      merge_overrides, section_of, touch)
 from agent.core.services_catalog import ALL as SERVICE_KEYS, Services
@@ -93,42 +99,11 @@ def cost_factor(ctx, default: float = 1.0) -> float:
 # 审批闸。读写两侧经本处归一，**已存在的 str 旧值仍被识别**（视作容器级默认）以兼容直接
 # 写 state 的既有调用点与测试。
 
-_PERMISSION_BUCKET_LIMIT = 512          # 只防长期运行无限增长（同 budget 的桶上限口径）
-
-
-def current_permission_mode(ctx, default: str = "default") -> str:
-    """当前**会话**的权限档位（跨插件共享键的形状容错读取，SSOT）。
-
-    解析顺序：``dict`` 桶中本会话的值 → 整值为 ``str`` 的旧形状（视作容器级默认）
-    → ``default``。读取异常一律退 ``default``（绝不阻断主链路）。
-    """
-    try:
-        raw = (getattr(ctx, "state", None) or {}).get(StateKeys.PERMISSION_MODE)
-    except Exception:                   # noqa: BLE001
-        return str(default)
-    if isinstance(raw, dict):
-        return str(raw.get(current_session_key(ctx)) or default)
-    if isinstance(raw, str) and raw:
-        return raw
-    return str(default)
-
-
-def set_permission_mode(ctx, mode: str) -> None:
-    """把**当前会话**的档位写入分桶（整值替换，不做原地改 ⇒ 并发下无半更新态）。
-
-    非 ``dict`` 的旧值按容器级默认丢弃（该旧值只可能是单值形态，无法归属到会话）。
-    """
-    sk = current_session_key(ctx)
-    try:
-        raw = (getattr(ctx, "state", None) or {}).get(StateKeys.PERMISSION_MODE)
-    except Exception:                   # noqa: BLE001
-        raw = None
-    bucket = dict(raw) if isinstance(raw, dict) else {}
-    bucket.pop(sk, None)                          # 重插以把本会话推到"最新"侧
-    bucket[sk] = str(mode)
-    while len(bucket) > _PERMISSION_BUCKET_LIMIT:
-        bucket.pop(next(iter(bucket)), None)      # dict 保序：最早插入者先淘汰
-    ctx.state[StateKeys.PERMISSION_MODE] = bucket
+#: 权限档位助手已下沉到 ``agent.core.permissions``（内核层），此处**原样再导出**：
+#: 一是保持既有调用点（approval / react / guard）零改动；二是让 ``core`` 侧的公共组件
+#: （如技能目录 ``core/skills_catalog``）也能取用——api 不得反向依赖 sys，而插件与传输层
+#: 又只能经 api 消费，故这类共用原语必须落在 core。
+from agent.core.permissions import current_permission_mode, set_permission_mode
 
 __all__ = [
     "__version__",
@@ -145,6 +120,16 @@ __all__ = [
     # services
     "Services",
     "SERVICE_KEYS",
+    # 技能数据模型（实现位于 core/skill；插件/系统层经本出口取用）
+    "Skill",
+    "skill",
+    "SkillsCatalog",
+    "discover_skills",
+    "parse_skill_file",
+    "write_skill_file",
+    "delete_skill_file",
+    "load_state",
+    "save_state",
     # ctx.state 共享键（跨插件契约）
     "StateKeys",
     # 会话/租户身份原语（阶段 2.2；实现位于 core/session，纯值对象 + 纯函数）

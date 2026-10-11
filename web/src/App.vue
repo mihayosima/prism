@@ -59,6 +59,9 @@
       <section :class="{ active: current === 'plugins' }" data-view="plugins">
         <PluginsView ref="views.plugins" />
       </section>
+      <section :class="{ active: current === 'skills' }" data-view="skills">
+        <SkillsView ref="views.skills" />
+      </section>
     </div>
   </div>
 </template>
@@ -86,6 +89,7 @@ import MemoryView from './views/MemoryView.vue'
 import ToolsView from './views/ToolsView.vue'
 import SettingsView from './views/SettingsView.vue'
 import PluginsView from './views/PluginsView.vue'
+import SkillsView from './views/SkillsView.vue'
 
 interface NavItem {
   view: string
@@ -99,6 +103,7 @@ const NAV_MACHINE: NavItem[] = [
   { view: 'events', icon: '📡', label: '事件' },
   { view: 'perms', icon: '🔐', label: '权限' },
   { view: 'plugins', icon: '🔌', label: '插件' },
+  { view: 'skills', icon: '📚', label: '技能' },
   { view: 'memory', icon: '🧠', label: '记忆' },
   { view: 'tools', icon: '🛠️', label: '工具' },
   { view: 'settings', icon: '⚙️', label: '设置' },
@@ -110,6 +115,7 @@ const views = reactive<Record<string, { reload?: () => void } | null>>({
   events: null,
   perms: null,
   plugins: null,
+  skills: null,
   memory: null,
   tools: null,
   settings: null,

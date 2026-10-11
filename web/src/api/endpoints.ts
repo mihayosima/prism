@@ -22,7 +22,7 @@
  * 时间：2026-09-30 11:06 (GMT+8)
  */
 
-import { get, post } from './client'
+import { get, post, put, del } from './client'
 import type {
   StatusResponse,
   SessionResponse,
@@ -78,7 +78,7 @@ export function getApprovalPending(): Promise<ApprovalPendingResponse> {
 // ---------- 通用资源加载 ----------
 
 /** `load(name)` 支持的名字（对应 GET /api/{name}） */
-export type ResourceName = 'events' | 'perms' | 'memory' | 'tools' | 'settings' | 'plugins' | 'context'
+export type ResourceName = 'events' | 'perms' | 'memory' | 'tools' | 'settings' | 'plugins' | 'context' | 'skills'
 
 /** legacy app.js:379 — 通用列表加载；返回体形状随资源而异，交由调用方按需收窄 */
 export function loadResource<T = Row[] | Row>(name: ResourceName): Promise<T> {
@@ -90,6 +90,38 @@ export function loadResource<T = Row[] | Row>(name: ResourceName): Promise<T> {
 /** legacy app.js:452 — 插件启停/脚手架/移除（act 拼进路径） */
 export function pluginAction(payload: PluginActionRequest): Promise<PluginActionResponse> {
   return post<PluginActionResponse>('/plugins/' + payload.act, payload.body || {})
+}
+
+// ---------- 技能（Skill 管理面） ----------
+
+/** GET /api/skills（?q= 搜索）→ 技能清单 */
+export function skillsList(q = ''): Promise<SkillsResponse> {
+  return q ? get<SkillsResponse>('/skills', { q }) : get<SkillsResponse>('/skills')
+}
+
+/** GET /api/skills/{name} → 单个技能完整内容 */
+export function skillGet(name: string): Promise<SkillRow> {
+  return get<SkillRow>('/skills/' + encodeURIComponent(name))
+}
+
+/** POST /api/skills → 新增技能（默认写盘） */
+export function skillAdd(body: Record<string, unknown>): Promise<SkillRow> {
+  return post<SkillRow>('/skills', body)
+}
+
+/** PUT /api/skills/{name} → 更新/启停 */
+export function skillUpdate(name: string, body: Record<string, unknown>): Promise<SkillRow> {
+  return put<SkillRow>('/skills/' + encodeURIComponent(name), body)
+}
+
+/** DELETE /api/skills/{name} → 移除（默认写盘删文件） */
+export function skillRemove(name: string, body?: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return del<Record<string, unknown>>('/skills/' + encodeURIComponent(name), body)
+}
+
+/** POST /api/skills/{name}/reload → 从磁盘重载（仅文件型） */
+export function skillReload(name: string): Promise<SkillRow> {
+  return post<SkillRow>('/skills/' + encodeURIComponent(name) + '/reload')
 }
 
 // ---------- 设置 ----------

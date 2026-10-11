@@ -85,6 +85,13 @@ _SCHEMA: dict[str, Any] = {
         "system_memory": "_any",
         "work_memory": "_any",
         "short_term": "_any",
+        # 技能子系统（plugins.skills）与只读技能 MCP 桥（plugins.skills_mcp）。
+        # ★ 必须登记：``_merge_cfg`` 把容器级覆盖按 ``plugins.<名>`` → ``agent.<名>`` 映射，
+        #   而 ``agent`` 节是**严格校验**节（非 ``_any``）⇒ 漏登记时用户一写配置就在装配期
+        #   ``ConfigError`` ⇒ 服务起不来（与 sandbox 节同一教训）。顶层另有一份同名
+        #   ``skills_mcp`` 登记（沿用 windows_mcp / playwright_mcp 的既有先例）。
+        "skills": "_any",
+        "skills_mcp": "_any",
         # G7 外部工具隔离（plugins.sandbox）：**逐键严格**而非 "_any"（沿用 context/budget 的纪律：
         # 拼错键在装配期即 fail-fast）。登记这一节是**硬前提**——``_merge_cfg`` 把容器级
         # 覆盖按 ``plugins.<名>`` → ``agent.<名>`` 映射进来，而 ``validate_config`` 在每次
@@ -99,6 +106,10 @@ _SCHEMA: dict[str, Any] = {
     # 插件自管顶层节
     "windows_mcp": "_any",
     "playwright_mcp": "_any",
+    # 只读技能 MCP 桥（plugins/skills_mcp）：与上面两个 MCP 桥同款 `_any` 宽松节。
+    # ★ 用 `_any` 而非严格键集：`skills_mcp.enabled` / `data_dir` / `timeout_s` 等由插件自管，
+    #   标严格节会让设置页保存（validate_config fail-fast）因漏登记而失败。
+    "skills_mcp": "_any",
 }
 
 

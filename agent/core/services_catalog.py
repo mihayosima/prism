@@ -48,6 +48,15 @@ class Services:
     CHILD_SPAWN_OPTIONS = "mcp.child_spawn_options"
     #: **结构化待办/规划插件**服务键（P2-1）：暴露 TodoWrite 能力；react 经 ctx.get 取实例读计划/进度。
     TODO = "todo"
+    #: **技能目录**服务键（Skill 插件）：暴露 ``SkillsCatalog``（``meta_tools`` / ``handle_meta``
+    #: / ``index_block`` / ``catalog`` / ``load`` / ``invoke`` / ``add`` / ``remove`` / ``set_enabled``）。
+    #: react 经 ``ctx.get(Services.SKILLS)`` **反向读取**，不 import skill 插件 ⇒ 单向解耦。
+    #: 未装配 ⇒ None ⇒ react 回落「无技能」分支，零劣化。
+    SKILLS = "skills.catalog"
+    #: **只读技能 MCP 桥**服务键（``plugins/skills_mcp``）：暴露桥实例供 status/探活。
+    #: 桥把本仓技能目录以 MCP 工具（``skill_list`` / ``skill_view``）对外暴露；
+    #: 未启用（``skills_mcp.enabled=false``）时插件早退、不起子进程，但仍 provide 自身。
+    SKILLS_MCP = "skills_mcp"
 
 
 # 全部“内核服务键”值集合（供 AST 契约测试比对）
@@ -73,6 +82,8 @@ ALL = frozenset(
         Services.PLAYWRIGHT_MCP,
         Services.CHILD_SPAWN_OPTIONS,
         Services.TODO,
+        Services.SKILLS,
+        Services.SKILLS_MCP,
     }
 )
 
