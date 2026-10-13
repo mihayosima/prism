@@ -1440,7 +1440,9 @@ def _register_resources(app, deps):
         # 经 ``container.plugin_statuses()``（公开 API，自带"单插件失败不拖垮"语义）取，
         # 插件未启用时如实报 ``none``（不谎报），前端据此显示「⚠ 无隔离」。
         sb_status: dict = {"mode": "none", "enforcement": "none", "gap": False,
-                           "targets": ["mcp.*"], "reason": "沙箱插件未启用"}
+                           "targets": ["mcp.*"], "reason": "沙箱插件未启用",
+                           "backend": "null", "enforced_by": "none",
+                           "backend_error": False, "unportable_targets": []}
         if sb_enabled:
             try:
                 for row in await c.container.plugin_statuses():
@@ -1467,6 +1469,15 @@ def _register_resources(app, deps):
                 # 这两个字段只回答一件事："东西落在哪"。
                 "sandbox_workspace": sb_status.get("workspace", ""),
                 "sandbox_env_redirected": bool(sb_status.get("env_redirected")),
+                # ★ P4/P5/P8（2026-10-14 分级沙箱）：实际生效的**后端**与强制者。
+                # 没有这四个字段，前端只能显示"无隔离"——但后端已经能兑现
+                # partial/full 了（wsl2/container），不显示等于把"有隔离"藏起来。
+                "sandbox_backend": sb_status.get("backend", "null"),
+                "sandbox_enforced_by": sb_status.get("enforced_by", "none"),
+                "sandbox_backend_error": bool(sb_status.get("backend_error")),
+                # ★ P8：在该后端下**跑不了**、已被单独降级为无隔离的桥
+                # （如 windows_mcp 进 WSL/容器）。必须可见，否则运维会以为全都隔离了。
+                "sandbox_unportable_targets": sb_status.get("unportable_targets") or [],
                 "values": values,
                 "session_id": sk,
                 "scopable": sorted(_SETTING_SCOPABLE),

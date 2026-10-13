@@ -24,7 +24,8 @@ import sys
 from pathlib import Path
 
 from agent.api import (DEFAULT_DB_PATH, McpStdioClient, Services, StateKeys,
-                       build_task_schema, current_session_key, plugin)
+                       build_task_schema, call_spawn_provider, current_session_key,
+                       plugin)
 
 logger = logging.getLogger("agent.plugins.skills_mcp")
 
@@ -125,7 +126,9 @@ class SkillsMcp:
         if not callable(fn):
             return None
         try:
-            return fn(current_session_key(self._ctx))
+            # ★ P8：把桥 id 一起传进去 —— 可移植性是**按桥**判定的，
+            # 提供方据此决定本桥要不要降级（不传 ⇒ 按单参 provider 调用，不破兼容）。
+            return call_spawn_provider(fn, current_session_key(self._ctx), _BRIDGE)
         except Exception:                       # noqa: BLE001 —— 沙箱故障 ⇒ 退回无落点
             logger.warning("skills_mcp 取沙箱落点失败 ⇒ 沿用宿主 cwd")
             return None

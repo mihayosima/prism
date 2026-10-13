@@ -83,6 +83,57 @@ describe('沙箱档位渲染（前后端契约）', () => {
   })
 })
 
+describe('沙箱后端展示（P4/P5/P8 · 前后端契约）', () => {
+  const sandboxOn: SettingsResponse = {
+    ...base,
+    sandbox_enabled: true,
+    sandbox_mode: 'workspace-write',
+  }
+
+  it('必须显示当前后端与强制者（只报强度不报"谁做到的"，排障时抓瞎）', () => {
+    const html = renderSettingsHtml({
+      ...sandboxOn,
+      sandbox_enforcement: 'full',
+      sandbox_backend: 'container',
+      sandbox_enforced_by: 'docker-container',
+    })
+    expect(html).toContain('container')
+    expect(html).toContain('docker-container')
+  })
+
+  it('不可移植桥必须显式警告（否则"声明档位 ⇒ 所有桥都被隔离"的错觉无人拆穿）', () => {
+    const html = renderSettingsHtml({
+      ...sandboxOn,
+      sandbox_enforcement: 'partial',
+      sandbox_backend: 'wsl2',
+      sandbox_unportable_targets: ['windows_mcp'],
+    })
+    expect(html).toContain('windows_mcp')
+    expect(html).toContain('降级为无隔离')
+  })
+
+  it('backend_error 必须显式警示（与"沙箱正常评估为无隔离"是两件事）', () => {
+    const html = renderSettingsHtml({
+      ...sandboxOn,
+      sandbox_enforcement: 'none',
+      sandbox_backend_error: true,
+    })
+    expect(html).toContain('backend-error')
+  })
+
+  it('后端名/强制者/不可移植列表同样要转义（后端自述字段也按外部输入对待）', () => {
+    const html = renderSettingsHtml({
+      ...sandboxOn,
+      sandbox_backend: '<script>alert(1)</script>',
+      sandbox_enforced_by: '<img src=x onerror=alert(1)>',
+      sandbox_unportable_targets: ['<svg onload=alert(1)>'],
+    })
+    expect(html).not.toContain('<script>')
+    expect(html).not.toContain('<img src=x')
+    expect(html).not.toContain('<svg onload')
+  })
+})
+
 describe('isFloatKey', () => {
   it('浮点键集合与后端口径一致', () => {
     expect(isFloatKey('memory_ratio')).toBe(true)

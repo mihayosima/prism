@@ -22,7 +22,7 @@ import os
 import shutil
 
 from agent.api import Services, StateKeys, current_session_key, plugin
-from agent.api import McpStdioClient, build_task_schema
+from agent.api import McpStdioClient, build_task_schema, call_spawn_provider
 
 logger = logging.getLogger("agent.plugins.playwright_mcp")
 
@@ -123,7 +123,9 @@ class PlaywrightMcp:
         if not callable(fn):
             return None
         try:
-            return fn(current_session_key(self._ctx))
+            # ★ P8：传桥 id，供沙箱侧按桥判定可移植性（见 core/sandbox_backend 的
+            # ``BRIDGE_PORTABILITY``）。不传也能跑（单参 provider 兼容），传了才能按桥降级。
+            return call_spawn_provider(fn, current_session_key(self._ctx), _BRIDGE)
         except Exception:                       # noqa: BLE001 —— 沙箱故障 ⇒ 退回无落点
             logger.warning("playwright_mcp 取沙箱落点失败 ⇒ 沿用宿主 cwd")
             return None

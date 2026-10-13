@@ -13,11 +13,17 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
-from agent.core.sandbox_backend import (BackendUnavailable, NullBackend, SpawnOptions,
-                                        Wsl2Backend, apply_wrap, describe_backend,
-                                        select_backend, to_wsl_path)
+from agent.core.sandbox_backend import (BackendUnavailable, ContainerBackend,
+                                        DEFAULT_CONTAINER_IMAGE, NullBackend,
+                                        SpawnOptions, Wsl2Backend, apply_wrap,
+                                        call_spawn_provider, describe_backend,
+                                        is_portable, runnable_in, select_backend,
+                                        to_wsl_path, unportable_bridges)
+from agent.core.sandbox_backend import _AUTO_CANDIDATES, _map_path, _probe
 
 
 def _bridge_style_read(opts: dict | None):
@@ -105,11 +111,13 @@ def test_off_and_null_are_first_class_tiers():
 def test_auto_selects_available_or_off_without_error():
     """★ 用户裁定：进程级运行时不满足 ⇒ off，**不报错**；满足则选中它。
 
-    P4 后 wsl2 已实现：本机有 WSL2+bwrap ⇒ auto 选中 wsl2（这正是"能用就用"的语义）；
-    换机/无 WSL ⇒ 回落 null 且**不得**报 error。两种都锁死，跨环境稳定。
+    P4/P5 后 wsl2 与 container 都已实现：本机有 WSL2+bwrap ⇒ auto 选中 wsl2；
+    否则有 Docker ⇒ 选中 container（"能用就用"的语义，v1.4 裁定 auto 顺序
+    wsl2 → container）；都不可得 ⇒ 回落 null 且**不得**报 error。跨环境稳定。
     """
     backend, info = select_backend("auto")
-    expected = "wsl2" if Wsl2Backend().capability_probe().get("available") else "null"
+    expected = next((c for c in _AUTO_CANDIDATES
+                     if _probe(c).get("available")), "null")
     assert backend.name == expected and info["backend"] == expected
     assert info["error"] is False and info["fell_back"] is False
 
@@ -117,9 +125,10 @@ def test_auto_selects_available_or_off_without_error():
 def test_explicit_unavailable_backend_is_visible_not_silent():
     """显式点名却要不到 ⇒ **可见**（fell_back + error + enforced_by=backend-error）。
 
-    用 ``container``（P5 未实现，恒不可用）作样例 ⇒ 不依赖本机有没有 WSL。
+    用 ``win-token`` 作样例：P1 spike 实测恒不可用（0xC0000142），**不依赖本机
+    有没有 WSL/Docker**（P5 后 container 在本机可用，不能再当"恒不可得"样例）。
     """
-    backend, info = select_backend("container")
+    backend, info = select_backend("win-token")
     assert backend.name == "null"                 # 回落
     assert info["fell_back"] is True and info["error"] is True
     assert info["enforced_by"] == "backend-error"
@@ -127,24 +136,27 @@ def test_explicit_unavailable_backend_is_visible_not_silent():
 
 def test_unknown_backend_name_falls_back_to_auto_semantics():
     backend, info = select_backend("乱写的后端")
-    assert backend.name in ("wsl2", "null") and info["error"] is False
+    assert backend.name in ("wsl2", "container", "null") and info["error"] is False
 
 
 def test_strict_raises_when_explicit_backend_unavailable():
-    """strict=true：显式要求不可得 ⇒ 抛（fail-closed 的**告警侧**）。"""
+    """strict=true：显式要求不可得 ⇒ 抛（fail-closed 的**告警侧**）。
+
+    用 win-token（spike 实测恒不可得）⇒ 不依赖本机 Docker/WSL  availability。
+    """
     with pytest.raises(BackendUnavailable):
-        select_backend("container", strict=True)
+        select_backend("win-token", strict=True)
 
 
 def test_strict_does_not_affect_auto():
     """auto 的本意就是"尽力给、没有就 off"⇒ strict 不该把 auto 变成硬失败。"""
     backend, info = select_backend("auto", strict=True)
-    assert backend.name in ("wsl2", "null") and info["error"] is False
+    assert backend.name in ("wsl2", "container", "null") and info["error"] is False
 
 
 def test_describe_backend_never_raises():
     """``status()`` / 审计路径用：即使 strict 也吞异常，但要留 error 标记。"""
-    info = describe_backend("container", strict=True)
+    info = describe_backend("win-token", strict=True)
     assert info["error"] is True and info["enforced_by"] == "backend-error"
     assert describe_backend("auto")["error"] is False
 
@@ -297,10 +309,171 @@ def test_win_token_is_verdict_unavailable():
 
 
 def test_auto_selects_by_real_capability():
-    """按**真实能力**断言：本机有 WSL2+bwrap ⇒ wsl2；没有 ⇒ 诚实回落 off。
+    """按**真实能力**断言：有 WSL2+bwrap ⇒ wsl2；否则有 Docker ⇒ container；
+    都不可得 ⇒ 诚实回落 null。
 
-    不做"本机一定有 WSL"的硬断言（CI/换机会红），只锁"不谎报"这一不变量。
+    不做"本机一定有 WSL/Docker"的硬断言（CI/换机会红），只锁"不谎报"这一不变量。
     """
     probe = Wsl2Backend().capability_probe()          # 真实探测（带缓存，只跑一次）
     be, _info = select_backend("auto")
-    assert be.name == ("wsl2" if probe.get("available") else "null")
+    expected = "wsl2" if probe.get("available") else "null"
+    if expected == "null" and ContainerBackend().capability_probe().get("available"):
+        expected = "container"
+    assert be.name == expected
+
+
+# --------------------------------------------------------------------------- #
+# P8：目标可移植性（纯函数，不依赖本机有无 WSL/Docker）
+# --------------------------------------------------------------------------- #
+
+def test_portability_declaration():
+    assert runnable_in("windows_mcp") == ("off",)
+    assert "wsl2" in runnable_in("skills_mcp")
+    # 未登记的桥按"可移植"处理 ⇒ 新桥不因漏登记被误降级（不劣化）
+    assert "wsl2" in runnable_in("某个新桥")
+
+
+def test_runnable_in_accepts_both_id_and_domain():
+    """审计按工具名推域（``windows``），桥按 id 自称（``windows_mcp``）⇒ 两种都要认。
+
+    ★ 只认一种会让 ``is_portable("windows", "wsl2")`` 落到默认值 True
+    ⇒ 把**不可移植**目标误判为可移植（硬套包装 ⇒ 子进程必崩）。
+    """
+    assert runnable_in("windows") == runnable_in("windows_mcp") == ("off",)
+    assert is_portable("windows", "wsl2") is False
+    assert is_portable("windows_mcp", "wsl2") is False
+    assert is_portable("windows_mcp", "container") is False
+
+
+def test_off_is_always_portable():
+    """不隔离 ⇒ 一定能跑。off/null 是**一等档位**，不是失败态。"""
+    for b in ("windows_mcp", "skills_mcp", "unknown"):
+        for backend in ("off", "null", ""):
+            assert is_portable(b, backend) is True
+
+
+def test_unportable_bridges_lists_only_blocked():
+    assert unportable_bridges("wsl2") == ["windows_mcp"]
+    assert unportable_bridges("off") == []
+    assert unportable_bridges("null") == []
+
+
+def test_call_spawn_provider_adapts_arity():
+    """升级到双参 **不能** 打破单参 provider（历史/第三方可能只收 session_key）。"""
+    seen = {}
+
+    def one_arg(sk):
+        seen["args"] = (sk,)
+        return {"cwd": "ws"}
+
+    def two_arg(sk, owner):
+        seen["args"] = (sk, owner)
+        return {"cwd": "ws", "owner": owner}
+
+    assert call_spawn_provider(one_arg, "s1", "skills_mcp") == {"cwd": "ws"}
+    assert seen["args"] == ("s1",)                       # 单参就单参调，不试错
+    assert call_spawn_provider(two_arg, "s1", "windows_mcp")["owner"] == "windows_mcp"
+    assert seen["args"] == ("s1", "windows_mcp")
+    assert call_spawn_provider(None, "s1") is None       # 不可调用 ⇒ 安全返回
+
+
+# --------------------------------------------------------------------------- #
+# P5：容器级后端（Docker）
+# --------------------------------------------------------------------------- #
+
+_DOCKER_OK = {"available": True, "reason": "注入：Docker 可用", "version": "29.4.0"}
+
+
+def _docker_opts(mode: str = "workspace-write", network: str = "deny") -> dict:
+    # ★ 路径必须落在**真实项目根**（``os.getcwd()``）下：``ContainerBackend`` 的
+    # ``path_map`` 以 ``os.getcwd()`` 为前缀，用虚构的 ``C:/repo`` 会映射不命中
+    # （那正是 ``test_apply_wrap_argv_mode_order`` 曾经红掉的原因）。
+    repo = os.getcwd()
+    be = ContainerBackend(probe_result=_DOCKER_OK)
+    opts = be.spawn_options(
+        SpawnOptions(cwd=os.path.join(repo, "data", "sandbox", "s1"),
+                     env={"SKILLS_DATA_DIR": os.path.join(repo, "data")}),
+        {"mode": mode, "network": network}, "s1")
+    return opts.to_dict()
+
+
+def test_container_hardening_flags():
+    d = _docker_opts()
+    argv = d["wrap"]["argv"]
+    joined = " ".join(argv)
+    assert d["backend"] == "container" and d["strength"] == "full"
+    assert d["enforced_by"] == "docker-container"
+    assert "-i" in argv and "--rm" in argv                  # stdio 保活 + 不留残容器
+    assert "--cap-drop ALL" in joined and "--security-opt no-new-privileges" in joined
+    assert "--network none" in joined                       # deny ⇒ 内核级无网
+    assert "--pids-limit" in joined
+
+
+def test_container_mounts_are_read_only_for_repo():
+    d = _docker_opts()
+    joined = " ".join(d["wrap"]["argv"])
+    assert ":ro" in joined and "/repo" in joined            # 项目根只读挂载
+    assert "/workspace:rw" in joined                        # 工作目录可写
+
+
+def test_container_read_only_has_no_writable_mount():
+    d = _docker_opts(mode="read-only")
+    joined = " ".join(d["wrap"]["argv"])
+    assert "--read-only" in joined
+    assert "/workspace:rw" not in joined
+
+
+def test_container_allow_network_keeps_default_net():
+    d = _docker_opts(network="allow")
+    assert "--network none" not in " ".join(d["wrap"]["argv"])
+
+
+def test_container_wrap_is_argv_mode_with_image():
+    w = _docker_opts()["wrap"]
+    assert w["mode"] == "argv" and w["image"] == DEFAULT_CONTAINER_IMAGE
+    assert w["path_map"] and w["path_map"][0][1] == "/repo"
+
+
+def test_apply_wrap_argv_mode_order():
+    """★ 顺序铁律：``-e`` 必须在 **image 之前**，命令在 image 之后。
+
+    反了会被 docker 当成"要在容器内执行的命令"，桥直接起不来。
+    """
+    d = _docker_opts()
+    cmd, args, _env, _cwd, applied = apply_wrap(
+        "python.exe", ["-m", "agent.run.skills_mcp_adapter"],
+        {"SKILLS_DATA_DIR": os.path.join(os.getcwd(), "data")},
+        os.path.join(os.getcwd(), "data", "sandbox", "s1"), d["wrap"])
+    assert applied is True and cmd == "docker"
+    seq = args
+    assert "python3" in seq and seq[-2:] == ["-m", "agent.run.skills_mcp_adapter"]
+    img = seq.index("python:3.12-alpine")
+    assert seq.index("-e") < img < seq.index("python3"), \
+        f"顺序错误（-e 应在 image 前、命令应在 image 后）: {seq}"
+    # 环境变量值按挂载点映射（Windows 路径在容器内无效）
+    assert "SKILLS_DATA_DIR=/repo/data" in seq
+
+
+def test_apply_wrap_argv_miss_degrades():
+    """容器里也没有 Windows 原生程序的位置 ⇒ 未命中翻译就原样启动（不硬套）。"""
+    d = _docker_opts()
+    cmd, args, _env, _cwd, applied = apply_wrap(
+        r"C:/Tools/native.exe", ["--win"], {}, None, d["wrap"])
+    assert applied is False and cmd.endswith("native.exe")
+
+
+def test_map_path_rewrites_host_prefix_only():
+    wrap = {"path_map": [[r"C:/repo", "/repo"]]}
+    assert _map_path(r"C:/repo/data/skills", wrap) == "/repo/data/skills"
+    assert _map_path("C:/repo/data", wrap) == "/repo/data"
+    assert _map_path("/already/posix", wrap) == "/already/posix"   # 非映射前缀原样
+    assert _map_path("anything", {}) == "anything"                 # 无 path_map 不炸
+
+
+def test_container_unavailable_is_reported():
+    be, info = select_backend("container")
+    # 本机有 Docker ⇒ 真选上；没有 ⇒ 显式点名不可得必须**可见**（error + fell_back）
+    if info["backend"] == "container":
+        assert info["error"] is False
+    else:
+        assert info["error"] is True and info["fell_back"] is True

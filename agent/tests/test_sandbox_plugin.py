@@ -46,14 +46,21 @@ PLUGIN_DIR = AGENT_DIR / "plugins"
 MCP_TOOLS = ("mcp.windows.open", "mcp.playwright.nav")
 
 
-def _expected_enforcement() -> str:
-    """**真实后端**驱动下的强度（本机有 WSL2+bwrap ⇒ partial；否则 none）。
+def _expected_enforcement(target: str = "") -> str:
+    """**真实后端**驱动下的强度（与插件同路：``describe_backend("auto")`` + 可移植降级）。
 
-    P4 落地 wsl2 后，声明了隔离档位就**真的**可能兑现 ⇒ 断言不能再写死 "none"，
-    否则等于把"有隔离"谎报成"没隔离"。两种环境都靠这个函数保持诚实。
+    P4/P5 落地后 auto 可能是 wsl2(partial) / container(full) / null(none)；
+    对**不可移植**的桥（windows_mcp 进 wsl2/container），spawn 与审计都单独降级 none。
+    本机有什么、目标是什么，就期望什么 —— 跨环境稳定，且锁死"不谎报"。
     """
-    from agent.core.sandbox_backend import Wsl2Backend
-    return "partial" if Wsl2Backend().capability_probe().get("available") else "none"
+    from agent.core.sandbox_backend import describe_backend, is_portable
+    info = describe_backend("auto")
+    if target:
+        parts = target.split(".")
+        bridge = parts[1] if len(parts) >= 3 and parts[0] == "mcp" else ""
+        if not is_portable(bridge, str(info.get("backend") or "null")):
+            return "none"
+    return str(info.get("strength") or "none")
 
 
 def _run(coro):
@@ -408,20 +415,26 @@ def test_plugin_is_off_by_default(tmp_path):
 
 
 def test_untouched_surfaces_stay_untouched():
-    """守卫：桥**不参与准入裁决**（裁决权在 guard/approval），两个 MCP 插件一行不动。
+    """守卫：桥**不参与准入裁决**（裁决权在 guard/approval）。
 
     ★ P4 修订：跨边界隔离（WSL2/容器）必须作用在**命令本身**，光给 cwd/env 挡不住
     ⇒ ``core/mcp_client.py`` 现在会引用 ``apply_wrap``（**只应用包装、不做判断**）。
-    这是机制层面的必要耦合；被守住的边界是"**裁决**不进桥"——桥不为允许/拒绝负责。
+    ★ P8 修订：可移植性是**按桥**判定的 ⇒ 桥要把自己的 id 传给落点接缝
+    （``call_spawn_provider``）。这不是裁决，只是**自报身份**；降级由沙箱插件决定。
+    ⇒ 桥里出现 "sandbox" 字样**不再**是违规；被守住的边界是"**裁决**不进桥"。
     """
     bridge = (AGENT_DIR / "core" / "mcp_client.py").read_text(encoding="utf-8")
     assert "apply_wrap" in bridge, "跨边界隔离必须作用在命令上（P4：光 cwd/env 挡不住）"
     # 守住的边界是"**裁决**不进桥"：选择哪个后端、是否允许调用，都是插件/guard 的活。
     for banned in ("select_backend", "describe_backend", "decision", "risk"):
         assert banned not in bridge, f"MCP 桥不得做后端选择/准入裁决：{banned}"
-    for rel in ("plugins/playwright_mcp/__init__.py", "plugins/windows_mcp/__init__.py"):
-        assert "sandbox" not in (AGENT_DIR / rel).read_text(encoding="utf-8").lower(), \
-            f"{rel} 不应改动（沙箱在准入层，不进桥）"
+    for rel in ("plugins/playwright_mcp/__init__.py", "plugins/windows_mcp/__init__.py",
+                "plugins/skills_mcp/__init__.py"):
+        src = (AGENT_DIR / rel).read_text(encoding="utf-8")
+        assert "call_spawn_provider" in src, f"{rel} 应自报桥 id（P8 可移植性按桥判定）"
+        # 桥可以**消费**沙箱落点，但不得引入裁决/后端选择
+        for banned in ("select_backend", "describe_backend", "decision"):
+            assert banned not in src, f"{rel} 不得做后端选择/准入裁决：{banned}"
 
 
 # ---------------------------------------------------------------------------
@@ -495,8 +508,10 @@ def test_confinement_audit_carries_workspace(tmp_path):
     payload = json.loads(rows[0]["payload"])
     assert payload["cwd"].startswith("data/sandbox/u_A-")
     assert payload["env_redirected"] is True
-    # ★ 关键：落点收拢**不是**强制 —— enforcement 不得因此抬升（抬了就是谎报）
-    expected = _expected_enforcement()
+    # ★ 关键：落点收拢**不是**强制 —— enforcement 不得因此抬升（抬了就是谎报）。
+    # 本目标是 **windows 桥**：后端若为 wsl2/container ⇒ spawn 侧已对它降级 off，
+    # 审计必须同样报 none（P8 一致性）；后端为 null 时本来就是 none。
+    expected = _expected_enforcement("mcp.windows.open")
     assert payload["enforcement"] == expected, "强度必须由后端真实能力驱动"
     assert payload["gap"] is (expected == "none")
 
@@ -534,8 +549,9 @@ def test_status_reports_workspace(tmp_path):
     sb = st.get("plugins.sandbox") or {}
     assert (sb.get("workspace") or "").startswith("data/sandbox/u_B-")
     assert sb.get("env_redirected") is True
-    # ★ P4 后：声明了档位且本机 wsl2 可用 ⇒ 真的兑现了 partial；不可得才回落 none。
-    # 两种都属"不谎报"，关键是**由真实后端能力驱动**，不是硬编码。
+    # ★ P4/P5 后：声明了档位且本机有 wsl2/container ⇒ 真的兑现 partial/full；
+    # 都不可得才回落 none。status 是**容器级**视图（不按桥降级，不可移植目标
+    # 另由 unportable_targets 暴露）⇒ 期望值取 auto 选中的后端真实强度。
     expected = _expected_enforcement()
     assert sb.get("enforcement") == expected, "强度必须由后端真实能力驱动"
     assert bool(sb.get("gap")) is (expected == "none")
@@ -598,3 +614,95 @@ def test_plugin_defaults_match_settings_defaults():
     assert _SETTING_DEFAULTS["default"] == GUARD_POLICY["default"]
     assert _SETTING_DEFAULTS["allow"] == GUARD_POLICY["task_allow"]
     assert _SETTING_DEFAULTS["deny"] == GUARD_POLICY["task_deny"]
+
+
+# ---------------------------------------------------------------------------
+# P8：目标可移植性（不可移植目标 ⇒ 单独降级 off 并暴露）
+# ---------------------------------------------------------------------------
+
+def test_spawn_provider_actually_returns_options(tmp_path):
+    """★ 回归守卫（修过一个真 bug）：``_workspace`` 里曾**直接用未定义的 ``policy``**。
+
+    ⇒ 每次调用抛 ``NameError`` ⇒ 被桥侧 ``except`` 吞掉 ⇒ 桥只当"沙箱不可用"，
+    **落点收拢与后端隔离在运行时从未真正生效**（表面上一切正常）。
+    本用例把这条接缝**真跑一遍**，确保它不再抛异常且给出 cwd/env。
+    """
+    c = _container(tmp_path, config_agent={"sandbox": {"mode": "workspace-write"}})
+
+    async def s():
+        await c.assemble()
+        fn = c.root.get("mcp.child_spawn_options")
+        out = fn("", "skills_mcp") if fn else None
+        await c.teardown()
+        return out
+
+    out = _run(s())
+    assert isinstance(out, dict), f"接缝必须给出落点字典，实际={out!r}"
+    assert out.get("cwd"), "落点字典必须带 cwd（桥只消费 cwd/env）"
+    assert isinstance(out.get("env"), dict)
+
+
+def test_unportable_bridge_is_degraded_not_wrapped(tmp_path):
+    """★ P8 核心：``windows_mcp`` 在 wsl2/container 下**不可运行** ⇒ 对它降级 off。
+
+    硬套包装会必崩（WSL 里没有 Windows 窗口可碰），所以必须**单独**降级，
+    且不能牵连可移植的桥（skills_mcp 该隔离还得隔离）。
+    """
+    c = _container(tmp_path, config_agent={"sandbox": {"mode": "workspace-write",
+                                                       "backend": "auto"}})
+
+    async def s():
+        await c.assemble()
+        fn = c.root.get("mcp.child_spawn_options")
+        out = {"windows": fn("", "windows_mcp"), "skills": fn("", "skills_mcp")} \
+            if fn else {}
+        await c.teardown()
+        return out
+
+    out = _run(s())
+    assert out.get("windows"), "不可移植桥也要拿到**降级后**的落点（不能是 None）"
+    assert not out["windows"].get("wrap"), \
+        "windows_mcp 绝不能被套包装（跨不了边界，硬套必崩）"
+    assert out["windows"].get("backend") in ("null", "off", None), \
+        f"不可移植桥应降级为 off，实际 backend={out['windows'].get('backend')!r}"
+    # 可移植桥不受牵连：本机有 wsl2 ⇒ 它应该真的拿到隔离包装
+    if out["skills"].get("backend") == "wsl2":
+        assert out["skills"].get("wrap"), "可移植桥该隔离就得隔离，不可被误降级"
+
+
+def test_status_exposes_unportable_targets(tmp_path):
+    """不可隔离的桥必须**可见**（status 暴露），否则运维会以为全都隔离了。"""
+    from agent.core.sandbox_backend import Wsl2Backend, unportable_bridges
+
+    backend = "wsl2" if Wsl2Backend().capability_probe().get("available") else "null"
+    expected = sorted(unportable_bridges(backend))
+    if backend == "wsl2":
+        assert "windows_mcp" in expected, "windows_mcp 在 wsl2 下应被标为不可移植"
+    else:
+        assert expected == [], "off/null 档下没有不可移植目标（不隔离总能跑）"
+
+
+def test_audit_carries_portable_flag(tmp_path):
+    """审计行带 ``portable`` —— 否则事后无法回答"这次调用到底有没有被隔离"。"""
+    c = _container(tmp_path, config_agent={"sandbox": {"mode": "workspace-write"}})
+
+    async def s():
+        await c.assemble()
+        _register(c, names=("mcp.windows.click",))
+        await c.root.tasks.invoke(c.root, "mcp.windows.click", caller="test")
+        rows = await _sandbox_rows(c)
+        await c.teardown()
+        return [json.loads(r["payload"]) for r in rows]
+
+    rows = _run(s())
+    assert len(rows) == 1
+    assert "portable" in rows[0], f"审计缺 portable 字段: {rows[0]}"
+    assert rows[0]["bridge"] == "windows"
+    # ★ P8 一致性：portable=False ⇒ spawn 侧已对该桥单独降级 off ⇒ 审计**必须**
+    # 同样报 none/backend=null。否则一行审计同时写着 full 和 portable=False，
+    # 读的人以为这次调用被隔离了（"看起来健康"式谎报）。
+    if rows[0]["portable"] is False:
+        assert rows[0]["enforcement"] == "none", \
+            f"不可移植桥的 enforcement 必须与 spawn 降级一致: {rows[0]}"
+        assert rows[0]["backend"] == "null"
+        assert rows[0]["gap"] is True

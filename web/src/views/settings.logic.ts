@@ -62,12 +62,29 @@ export const APPROVAL_PROVIDER_LABELS: Record<string, string> = {
 /**
  * 沙箱**隔离档位**（2026-03 收口后沙箱只做 confinement，不再判准入）。
  * 取值域与后端 `agent/plugins/sandbox/__init__.py::MODES` 逐字一致 —— 改一处必须改两处。
+ *
+ * ★ 2026-10-14（P4/P5）：措辞去掉"当前无进程级隔离可兑现"——后端已能兑现
+ * partial/full（wsl2/container），能否兑现改看上方「当前实际强度」徽标，
+ * 档位标签本身保持**后端无关**（本机有什么后端是运行态事实，不是档位语义）。
  */
 export const SANDBOX_MODES = ['none', 'read-only', 'workspace-write'] as const
 export const SANDBOX_MODE_LABELS: Record<string, string> = {
-  none: '不启用隔离（当前唯一能兑现的档位）',
-  'read-only': '声明只读（⚠ 当前无进程级隔离可兑现）',
-  'workspace-write': '声明工作区可写（⚠ 当前无进程级隔离可兑现）',
+  none: '不启用隔离（未声明档位 ⇒ 落点不收拢、后端不叠加）',
+  'read-only': '声明只读（能否兑现看上方「当前实际强度」）',
+  'workspace-write': '声明工作区可写（能否兑现看上方「当前实际强度」）',
+}
+
+/**
+ * 隔离**后端**中文名（P4/P5/P8，2026-10-14）。
+ * 取值域与后端 `agent/core/sandbox_backend.py::BACKENDS` 对应；
+ * 未列出的名字原样显示（新后端不让前端渲染成空白）。
+ */
+export const SANDBOX_BACKEND_LABELS: Record<string, string> = {
+  null: '无隔离（off/null）',
+  wsl2: 'wsl2（WSL2 内 bwrap 进程级）',
+  container: 'container（Docker 容器级）',
+  'win-token': 'win-token（Windows 受限令牌 · spike 实测不可用）',
+  cloud: 'cloud（云系统级 · 未实现）',
 }
 
 /**
@@ -118,6 +135,43 @@ function sandboxWorkspaceBlock(j: SettingsResponse): string {
     '它只收窄相对路径的写入落点，<b>绝对路径仍然写得进去</b> —— 强度看上方的徽标。' +
     '</div></div>'
   )
+}
+
+/**
+ * 当前生效的**隔离后端**块（P4/P5/P8，2026-10-14）。
+ *
+ * ★ 为什么单独一块：`enforcement` 只回答"做到了多少"，不回答"谁做到的"。
+ * 运维需要知道现在是 wsl2-bwrap 还是 docker-container 在强制（排障/汇报口径），
+ * 以及**哪些桥其实没被隔离**（不可移植目标在所选后端下已被单独降级为 off）——
+ * 没有这块，"声明了档位 ⇒ 所有桥都被隔离了"的错觉无人拆穿。
+ */
+function sandboxBackendBlock(j: SettingsResponse): string {
+  const be = String(j.sandbox_backend || 'null')
+  const by = String(j.sandbox_enforced_by || 'none')
+  const label = SANDBOX_BACKEND_LABELS[be] || be
+  let h =
+    '<div style="margin-top:12px;padding:10px 12px;border:1px solid var(--line);border-radius:8px">' +
+    '<div style="font-weight:600">当前隔离后端：<code>' +
+    esc(label) +
+    '</code>（强制者：<code>' +
+    esc(by) +
+    '</code>）</div>'
+  if (j.sandbox_backend_error === true) {
+    h +=
+      '<div style="margin-top:6px;color:var(--danger,#dc2626)">' +
+      '⚠ 显式要求的后端不可得，已回落无隔离（<code>backend-error</code>）。' +
+      '这不是"沙箱正常评估为无隔离"，是沙箱自身没要到隔离 —— 排障看插件日志。</div>'
+  }
+  const unportable = (j.sandbox_unportable_targets || []) as string[]
+  if (unportable.length) {
+    h +=
+      '<div style="margin-top:6px;color:var(--warn,#d97706)">' +
+      '⚠ 以下桥在当前后端下<b>无法运行</b>（Windows 原生依赖，跨不了 WSL/容器边界），' +
+      '已被单独降级为无隔离：<code>' +
+      esc(unportable.join(', ')) +
+      '</code>。其余桥不受影响，该隔离的仍隔离。</div>'
+  }
+  return h + '</div>'
 }
 
 /** 准入名单四键的中文标签（归属已改 guard：sys/guard.py 是策略唯一持有者） */
@@ -599,7 +653,7 @@ export function renderSettingsHtml(j: SettingsResponse, scope: SettingsScope = '
   // 目录插件默认关 ⇒ 未启用时明确提示"不受本层管辖"，避免"以为受保护"的错觉。
   if (j.sandbox_enabled === false) {
     h +=
-      '<div class="card muted" style="margin-top:16px">外部工具隔离档位（plugins.sandbox）未启用 —— 在「插件」页点「启用」后，可在此调整。<b>启用 ≠ 有隔离</b>：当前后端无任何进程级隔离实现，启用只增加可追溯性。</div>'
+      '<div class="card muted" style="margin-top:16px">外部工具隔离档位（plugins.sandbox）未启用 —— 在「插件」页点「启用」后，可在此调整。<b>启用 ≠ 有隔离</b>：启用后首先获得的是可追溯性（每次调用落 <code>agent/sandbox/confinement</code> 审计）；有没有隔离取决于所选后端（见启用后的强度徽标）。</div>'
   } else {
     const enf = (j.sandbox_enforcement || 'none') as string
     const badge = ENFORCEMENT_BADGES[enf] || ENFORCEMENT_BADGES.none
@@ -642,7 +696,7 @@ export function renderSettingsHtml(j: SettingsResponse, scope: SettingsScope = '
       ).join('') +
       '</select><div class="muted" style="' +
       HINT +
-      '">声明<b>想</b>限制到什么。<b>当前后端无进程级隔离实现 ⇒ 声明了也兑现不了</b>（审计里会记 <code>gap=true</code>）。这比"看起来受保护"诚实。</div></label>' +
+      '">声明<b>想</b>限制到什么；能否兑现由<b>真实后端能力</b>决定（见上方「当前实际强度」）。声明了但兑现不了时，审计记 <code>gap=true</code>、强度徽标显示「⚠ 无隔离」—— 这比"看起来受保护"诚实。</div></label>' +
       '<label style="' +
       LABEL +
       '"><div style="font-weight:600;margin-bottom:3px">自述范围 targets' +
@@ -654,6 +708,7 @@ export function renderSettingsHtml(j: SettingsResponse, scope: SettingsScope = '
       '<div class="muted" style="' +
       HINT +
       '">本层只自述 <code>mcp.*</code> 域（隔离是<b>按桥</b>配置的：每个 MCP 桥一个子进程）。改管辖范围请用上一张卡的 <code>targets</code>。</div></label>' +
+      sandboxBackendBlock(j) +
       sandboxWorkspaceBlock(j) +
       '</div>'
   }

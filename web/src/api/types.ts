@@ -293,11 +293,26 @@ export interface SettingsResponse {
   sandbox_mode?: string
   /**
    * ★ 沙箱自报的**实际隔离强度**（`full` / `partial` / `none`）。
-   * **当前后端无进程级隔离实现 ⇒ 恒为 `none`**。这不是缺陷陈述，是事实陈述 ——
-   * 但绝不是"受保护"。缺这个字段时前端只能猜"正常"，那正是此前的误导源，
+   * 由**真实后端能力**驱动（P4/P5 后 wsl2=partial、container=full，均不可得才 none）。
+   * 这不是缺陷陈述，是事实陈述 —— 缺这个字段时前端只能猜"正常"，
    * 所以它必须由后端**自报**而非前端推断（对齐 DeepSeek Harness 的 `SandboxEnforcement`）。
    */
   sandbox_enforcement?: string
+  /**
+   * ★ P4/P5/P8（2026-10-14）：实际生效的**后端**（`null` / `wsl2` / `container`）。
+   * `auto` 按本机真实能力选择；显式点名不可得时回落并置 `sandbox_backend_error`。
+   */
+  sandbox_backend?: string
+  /** 谁在强制（`none` / `wsl2-bwrap` / `docker-container` / `backend-error`） */
+  sandbox_enforced_by?: string
+  /** 显式要求的后端不可得（fail-closed 告警侧：可见，不静默） */
+  sandbox_backend_error?: boolean
+  /**
+   * ★ P8：在该后端下**跑不了**、已被单独降级为无隔离的桥 id 列表
+   * （典型 `windows_mcp`：Windows 原生 UI 自动化跨不了 WSL/容器边界）。
+   * 必须可见 —— 否则运维会以为"声明了档位 ⇒ 所有桥都被隔离了"。
+   */
+  sandbox_unportable_targets?: string[]
   /** 声明了档位但兑现不了（当前仅 mode≠none 时为 true） */
   sandbox_gap?: boolean
   /** 沙箱自述覆盖的工具名模式（隔离按桥配置，固定 mcp.* 域） */

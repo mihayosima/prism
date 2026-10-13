@@ -41,10 +41,12 @@ from agent.core.skills_loader import (delete_skill_file, discover_skills, load_s
 # 沙箱 confinement 后端（P0 骨架）：与 SkillsCatalog 同一纪律——插件/传输层只被允许
 # import agent.api，而 api 不得 import agent.sys ⇒ 需被插件构造的对象必须落 core。
 # NullBackend/select_backend 供 plugins.sandbox 驱动 enforcement（不再硬编码天花板）。
-from agent.core.sandbox_backend import (BACKENDS, STRENGTHS, BackendUnavailable,
-                                        ConfinementBackend, NullBackend, SpawnOptions,
-                                        Wsl2Backend, apply_wrap, describe_backend,
-                                        select_backend, to_wsl_path)
+from agent.core.sandbox_backend import (BACKENDS, BRIDGE_PORTABILITY, STRENGTHS,
+                                        BackendUnavailable, ConfinementBackend,
+                                        ContainerBackend, NullBackend, SpawnOptions,
+                                        Wsl2Backend, apply_wrap, call_spawn_provider,
+                                        describe_backend, is_portable, runnable_in,
+                                        select_backend, to_wsl_path, unportable_bridges)
 from agent.core.scope_config import (DEFAULT_SESSION_LIMIT, evict_lru,
                                      merge_overrides, section_of, touch)
 from agent.core.services_catalog import ALL as SERVICE_KEYS, Services
@@ -142,6 +144,7 @@ __all__ = [
     "ConfinementBackend",
     "NullBackend",
     "Wsl2Backend",
+    "ContainerBackend",
     "BackendUnavailable",
     "select_backend",
     "describe_backend",
@@ -149,6 +152,12 @@ __all__ = [
     "to_wsl_path",
     "BACKENDS",
     "STRENGTHS",
+    # P8：目标可移植性（桥能否在某个后端下跑；不可移植 ⇒ 降级 off 并暴露）
+    "BRIDGE_PORTABILITY",
+    "runnable_in",
+    "is_portable",
+    "unportable_bridges",
+    "call_spawn_provider",
     # ctx.state 共享键（跨插件契约）
     "StateKeys",
     # 会话/租户身份原语（阶段 2.2；实现位于 core/session，纯值对象 + 纯函数）

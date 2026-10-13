@@ -69,7 +69,8 @@ waterfall 位置（★ 与文档旧说法相反，此处是更准的版本）
 审计
 ----------------------------------------
 每次调用落 ``agent/sandbox/confinement``（durable 直写，**另立**事件——用户 2026-10-03 裁定）。
-载荷含 ``mode``/``enforcement``/``ceiling``/``gap``/``enforced_by``/``bridge``/``session``。
+载荷含 ``mode``/``enforcement``/``ceiling``/``gap``/``enforced_by``/``bridge``/
+``portable``/``session``（P8：不可移植桥的 enforcement 已同步降级，与 spawn 一致）。
 事件名由 ``agent/sandbox/decision`` 改名而来：留着 "decision" 会让读者误以为它仍在做准入决策。
 """
 
@@ -85,7 +86,8 @@ from agent.api import (SESSION_CFG_VIEW, Events, Services, current_session_key,
 # P0 分级沙箱后端（core/sandbox_backend，经 api 导出）：enforcement 改由后端真实强度驱动，
 # 不再硬编码"所有档位恒 none"的天花板。
 from agent.api import (BackendUnavailable, NullBackend, SpawnOptions,
-                       describe_backend, select_backend)
+                       describe_backend, is_portable, select_backend,
+                       unportable_bridges)
 
 logger = logging.getLogger("agent.plugins.sandbox")
 
@@ -331,10 +333,18 @@ class Sandbox:
     inject = [Services.EVENTS, Services.DB]
 
     async def apply(self, ctx) -> None:
+        # P8：运行时**观测到**被降级为 off 的桥（不可移植）。status() 会把它与
+        # 静态可移植性表合并后暴露 ⇒ "哪个桥实际没隔离"可见，不静默。
+        self._unportable = set()
         # 落点接缝：**提供能力，不替调用方决定**。MCP 桥装配时取本函数算 cwd/env；
         # 沙箱未装配 ⇒ 桥侧 ``ctx.get`` 返回 None ⇒ 行为与今天完全一致（不劣化）。
-        def _workspace(session_key: str = "") -> dict | None:
-            ws = workspace_for(_config(ctx), session_key)
+        def _workspace(session_key: str = "", owner: str = "") -> dict | None:
+            # ★ 修缺陷（2026-10-14）：此前本函数**直接使用未定义的 ``policy``** ⇒
+            # 每次调用都抛 ``NameError`` ⇒ 被桥侧 ``except`` 吞掉 ⇒ **落点收拢与后端
+            # 隔离在运行时从未真正生效**（桥只当"沙箱不可用"，静默沿用宿主 cwd）。
+            # 这里补上取配置，并让后端选择真正跑起来。
+            policy = _config(ctx)
+            ws = workspace_for(policy, session_key)
             if not ws:
                 return None
             # ★ 目录**必须真的存在**：``create_subprocess_exec(cwd=...)`` 指向不存在的
@@ -361,6 +371,15 @@ class Sandbox:
                 inc_counter("agent_sandbox_backend_error_total")
                 logger.warning("沙箱后端不可得（strict=true）：%s ⇒ 回落无隔离", exc)
                 backend = NullBackend()
+            # ★ P8：目标可移植性 —— 该桥**跑不了**这个后端（如 windows_mcp 进 WSL/容器）
+            # ⇒ 对它**单独降级为 off**，绝不硬套包装（硬套必崩：原生 UI 自动化在 WSL 内
+            # 根本没有 Windows 窗口可碰）。降级必须**可见**：计数 + 告警 + status 暴露。
+            if owner and not is_portable(owner, backend.name):
+                inc_counter("agent_sandbox_unportable_total")
+                logger.warning("桥 %s 在后端 %s 下不可运行（Windows 原生依赖）⇒ 本桥降级 off",
+                               owner, backend.name)
+                self._unportable.add(owner)
+                backend = NullBackend()
             opts = SpawnOptions(cwd=ws.get("cwd"), env=dict(ws.get("env") or {}),
                                 mode=str(ws.get("mode") or "none"))
             return backend.spawn_options(opts, policy, session_key).to_dict()
@@ -377,6 +396,20 @@ class Sandbox:
             binfo = describe_backend(str(policy.get("backend") or "auto"),
                                      strict=bool(policy.get("strict")))
             info = describe(policy, target, binfo)
+            bridge = _bridge_of(target)
+            # ★ P8：该桥在所选后端下**跑不了**（如 windows_mcp 进 WSL/容器）⇒
+            # spawn 侧（``_workspace``）已对它单独降级 off。审计必须与**实际生效**
+            # 的一致：否则同一行审计会同时写着 enforcement=full 和 portable=False，
+            # 读的人以为这次调用被隔离了 —— 那正是本项目最警惕的"看起来健康"。
+            # ★ 顺序：portable 必须在覆盖 info["backend"] **之前**算（覆盖成 null 后
+            # is_portable 恒 True，portable 位就假了）。
+            portable = is_portable(bridge, info["backend"])
+            if not portable:
+                sel = info["backend"]
+                info = {**info, "enforcement": "none", "ceiling": "none", "gap": True,
+                        "backend": "null", "enforced_by": "none",
+                        "reason": f"桥 {bridge or target} 在后端 {sel} 下不可运行"
+                                  f"（Windows 原生依赖）⇒ 已单独降级为无隔离"}
             if binfo.get("error"):
                 # 显式要求了后端却不可得 ⇒ **不静默**（可见计数，运维能查到）
                 inc_counter("agent_sandbox_backend_error_total")
@@ -389,6 +422,9 @@ class Sandbox:
                 "who": str(payload.get("caller") or "unknown"), "level": "task",
                 "target": target, "risk": str(payload.get("risk") or ""),
                 "bridge": _bridge_of(target),
+                # ★ P8：该桥能否在选中的后端下运行（不可移植 ⇒ 已对它降级 off，
+                # 且上方 enforcement 已同步降为 none —— 审计与 spawn 实际生效一致）。
+                "portable": portable,
                 "mode": info["mode"], "enforcement": info["enforcement"],
                 "ceiling": info["ceiling"], "gap": info["gap"],
                 # ★ P0：后端与"谁在强制" —— 旧实现恒填 "none"，无法区分
@@ -447,6 +483,11 @@ class Sandbox:
             "session": current_session_key(ctx) or "container",
             "deprecated_used": list(info["deprecated_used"]),
             "decides_admission": False,      # 恒 False：准入不归本插件
+            # ★ P8：该后端下**跑不了**的桥（如 windows_mcp 在 wsl2/container 下）。
+            # 它们被**单独降级为 off**（无隔离）—— 必须可见，否则运维会以为全都隔离了。
+            "unportable_targets": sorted(
+                set(unportable_bridges(info["backend"]))
+                | set(getattr(self, "_unportable", ()))),
         }
 
 

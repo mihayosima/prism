@@ -25,7 +25,7 @@ import logging
 import os
 
 from agent.api import Services, StateKeys, current_session_key, plugin
-from agent.api import McpStdioClient, build_task_schema
+from agent.api import McpStdioClient, build_task_schema, call_spawn_provider
 
 logger = logging.getLogger("agent.plugins.windows_mcp")
 
@@ -109,7 +109,9 @@ class WindowsMcp:
         if not callable(fn):
             return None
         try:
-            return fn(current_session_key(self._ctx))
+            # ★ P8：传桥 id —— windows_mcp 是**不可移植目标**（跨不了 WSL/容器边界），
+            # 由沙箱侧据此把本桥降级为 off，而不是硬套包装把它弄崩。
+            return call_spawn_provider(fn, current_session_key(self._ctx), _BRIDGE)
         except Exception:                       # noqa: BLE001 —— 沙箱故障 ⇒ 退回无落点
             logger.warning("windows_mcp 取沙箱落点失败 ⇒ 沿用宿主 cwd")
             return None
