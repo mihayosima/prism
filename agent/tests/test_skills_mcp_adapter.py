@@ -167,9 +167,14 @@ class _FakeTasks:
     def __init__(self):
         self.registered: dict[str, dict] = {}
 
-    def register(self, ctx, name, schema=None, handler=None, owner=None, description=None):
+    def register(self, ctx, name, schema=None, handler=None, owner=None,
+                 description=None, risk=None, timeout_s=None):
+        # ★ ``risk`` 形参是 P3 修的缺陷：真实 ``TaskRegistry.register`` 早已支持 risk，
+        # 但三个 MCP 桥此前都没传 ⇒ 连纯读工具也是默认的 write 级。桩必须能接到 risk，
+        # 否则会掩盖回归（见 test_read_only_tools_register_with_read_risk）。
         self.registered[name] = {"schema": schema, "handler": handler,
-                                 "owner": owner, "description": description}
+                                 "owner": owner, "description": description,
+                                 "risk": risk}
 
 
 class _FakeCtx:
@@ -217,6 +222,27 @@ def test_bridge_enabled_spawns_and_registers(tmp_path):
         assert "content" not in lres["text"], "skill_list 不应返回正文"
         assert "skill.docker" in lres["text"]
         # 收尾关子进程（同一事件循环内，避免跨 loop 的 transport 告警）
+        if ctx.effect_fn is not None:
+            await ctx.effect_fn()
+
+    asyncio.run(_flow())
+
+
+def test_read_only_tools_register_with_read_risk(tmp_path):
+    """★ P3 回归：只读工具必须标 ``risk="read"``，不能吃默认的 ``write``。
+
+    缺陷原貌：``sys/tasks.py`` 的 ``register(risk="write")`` 是默认值，三个 MCP 桥
+    注册时都没传 ⇒ 连 ``skill_list`` 这种纯读工具也是 write 级 ⇒ guard 在
+    ``risk.ask`` 下"读个技能也要问人"、plan 模式被裁。这条锁死修好的状态。
+    """
+    _write_skill(tmp_path, "skill.docker", "构建 docker 镜像", "步骤：docker build")
+    ctx = _FakeCtx({"skills_mcp": {"enabled": True, "timeout_s": 30.0},
+                    "db_path": str(tmp_path / "agent.db")})
+    async def _flow():
+        await SkillsMcp.apply(ctx)
+        risks = {n: (rec or {}).get("risk") for n, rec in ctx.tasks.registered.items()}
+        assert risks == {"mcp.skills.skill_list": "read",
+                         "mcp.skills.skill_view": "read"}, f"risk 未修正: {risks}"
         if ctx.effect_fn is not None:
             await ctx.effect_fn()
 

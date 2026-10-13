@@ -82,6 +82,10 @@ import re
 
 from agent.api import (SESSION_CFG_VIEW, Events, Services, current_session_key,
                        durable, inc_counter, now_iso, plugin)
+# P0 分级沙箱后端（core/sandbox_backend，经 api 导出）：enforcement 改由后端真实强度驱动，
+# 不再硬编码"所有档位恒 none"的天花板。
+from agent.api import (BackendUnavailable, NullBackend, SpawnOptions,
+                       describe_backend, select_backend)
 
 logger = logging.getLogger("agent.plugins.sandbox")
 
@@ -99,6 +103,11 @@ DEFAULT_POLICY: dict = {
     "allow": [],
     "deny": [],
     "risk": {},
+    # ---- P0（2026-10-13 分级沙箱骨架）新增三键（★ 与 core/config_schema.py 的 sandbox
+    # 严格节**同步登记**，漏登记 ⇒ 用户一写就 ConfigError ⇒ 服务起不来）。
+    "backend": "auto",   # state 轴：auto|off|null|win-token|wsl2|container|cloud
+    "network": {},       # 网络策略（P7）；dict，内含 allow_domains 等
+    "strict": False,     # true ⇒ 显式要求后端不可得时抛错（默认告警+回落，不打断操作）
 }
 
 # 插件自管默认（与 core/config_schema.py 登记的键集一致）。
@@ -209,28 +218,31 @@ def in_scope(policy: dict, target: str) -> bool:
 MODES = ("none", "read-only", "workspace-write")
 ENFORCEMENTS = ("full", "partial", "none")
 
-# 能力矩阵：mode ⇒ 能给出的最大强度。**诚实的一侧是下限**：
-# 当前无任何进程级隔离实现 ⇒ 所有 mode 的实际强度都是 ``none``。
-# 未来落地 restricted token 后才可变，且**必须由实测决定**（DSH 的 Windows 后端恒 partial：
-# Everyone SID 必须在 keep-alive 组 + NTFS 硬链接能跨路径别名）。
-_ENFORCEMENT_CEILING: dict[str, str] = {
-    "none": "none",
-    "read-only": "none",          # 尚无进程级隔离可兑现只读承诺
-    "workspace-write": "none",
-}
-
+# ---------------------------------------------------------------------------
+# ★ P0（2026-10-13）：enforcement **不再硬编码**
+# ---------------------------------------------------------------------------
+# 旧实现在此处放了一张 ``_ENFORCEMENT_CEILING`` 表，把所有 mode 一律映射到 ``none``。
+# 那张表是"当前无隔离实现"这一**事实**的忠实记录，但它把"能力上限"写死在插件里：
+# 后端一落地就得改插件，且**无法表达 partial**（只能全 none 或改代码）。
+# 现改由 ``core/sandbox_backend.py`` 的后端**自报真实强度**驱动：
+#   - 传了 ``backend_info`` ⇒ enforcement = 后端 strength（none/partial/full 都能表达）
+#   - 没传（纯函数穷举 / 离线单测）⇒ 回落 none（与旧表同值 ⇒ **既有诚实性单测不破**）
 _DEPRECATED_KEYS = ("default", "allow", "deny", "risk")
 
 
-def describe(policy: dict, target: str = "") -> dict:
+def describe(policy: dict, target: str = "", backend_info: dict | None = None) -> dict:
     """该工具本次调用的**隔离自述**（纯函数，便于穷举单测）。
 
-    返回 ``{mode, enforcement, ceiling, gap, reason, deprecated_used}``：
+    返回 ``{mode, enforcement, ceiling, backend, enforced_by, gap, reason,
+    deprecated_used, backend_error}``：
 
-    - ``mode``        配置声明的档位
-    - ``enforcement`` **实际**能达到的强度（当前恒 ``none`` —— 无进程级隔离）
-    - ``ceiling``     该 mode 在当前平台的能力上限
-    - ``gap``         ``mode`` 与 ``enforcement`` 的落差（配置了但兑现不了 ⇒ 必须可见）
+    - ``mode``          配置声明的档位
+    - ``enforcement``   **实际**能达到的强度（由后端自报；无后端信息 ⇒ none）
+    - ``ceiling``       同上（保留键名以兼容审计与前端）
+    - ``backend``       实际生效的后端名
+    - ``enforced_by``   谁在强制（``none`` / 具体后端 / ``backend-error``）
+    - ``gap``           ``mode`` 与 ``enforcement`` 的落差（配置了但兑现不了 ⇒ 必须可见）
+    - ``backend_error`` 显式要求的后端不可得（**可见**，不静默）
     - ``deprecated_used`` 仍在用已废弃的旧裁决键（迁移期提示，不静默）
 
     ★ 宁可 ``enforcement="none"`` 也不谎报 —— 插件页显示"看起来健康"比显示"无隔离"危险。
@@ -238,16 +250,30 @@ def describe(policy: dict, target: str = "") -> dict:
     mode = str(policy.get("mode") or "none").strip()
     if mode not in MODES:
         mode = "none"
-    ceiling = _ENFORCEMENT_CEILING.get(mode, "none")
     used = [k for k in _DEPRECATED_KEYS if policy.get(k) not in (None, [], {}, "allow", "open")]
+    info = backend_info or {}
+    strength = str(info.get("strength") or "none")
+    if strength not in ENFORCEMENTS:
+        strength = "none"
+    enforced_by = str(info.get("enforced_by") or "none")
     if mode == "none":
         reason = "未配置隔离档位"
-    elif ceiling == "none":
-        reason = f"档位 {mode!r} 已声明，但本插件**未实现任何进程级隔离** ⇒ 实际无隔离"
+    elif strength == "none":
+        # 有后端理由就用后端的（能说清"要了 wsl2 但没有"）；没有则给通用说明。
+        # ★ 注意 ``or`` 的短路：``info.get("reason")`` 为 None/空串时**必须**回落模板，
+        #   否则 ``str(None)`` 会变成字面量 "None" 混进审计理由里（已被单测抓到）。
+        # ★ 措辞沿用旧实现的三条关键信息（声明了什么 / 未实现 / 实际无隔离），
+        #   既有诚实性单测据此断言"理由能解释为什么没隔离"，改措辞会破契约。
+        reason = (str(info.get("reason")) if info.get("reason") else
+                  f"档位 {mode!r} 已声明，但本插件**未实现任何进程级隔离**"
+                  f"（无可用后端兑现）⇒ 实际无隔离")
     else:
-        reason = f"档位 {mode!r} 生效（强度 {ceiling}）"
-    return {"mode": mode, "enforcement": ceiling, "ceiling": ceiling,
-            "gap": mode != "none" and ceiling == "none",
+        reason = f"档位 {mode!r} 生效（强度 {strength}，后端 {enforced_by}）"
+    return {"mode": mode, "enforcement": strength, "ceiling": strength,
+            "backend": str(info.get("backend") or "null"),
+            "enforced_by": enforced_by,
+            "gap": mode != "none" and strength == "none",
+            "backend_error": bool(info.get("error")),
             "reason": reason, "deprecated_used": used}
 
 
@@ -317,7 +343,23 @@ class Sandbox:
                 inc_counter("agent_sandbox_workspace_failed_total")
                 logger.warning("沙箱落点目录创建失败 %s ⇒ 子进程沿用宿主 cwd", ws["cwd"])
                 return None
-            return ws
+            # ★ P0：在落点之上叠加**后端**的隔离信息。
+            # 契约纪律（代码复核所得，勿改）：接缝形状必须是 ``{"cwd","env",...}`` 字典，
+            # 且既有桥**只消费 cwd/env 两个键** ⇒ ``SpawnOptions`` 是内核内部类型，
+            # 在此 ``to_dict()`` 后返回，向后兼容；新增键今天无人读，P1/P4/P7 才用。
+            try:
+                backend, _binfo = select_backend(str(policy.get("backend") or "auto"),
+                                                 strict=bool(policy.get("strict")))
+            except BackendUnavailable as exc:
+                # strict=true 且显式后端不可得 ⇒ **可见**（计数+告警）+ 回落无隔离。
+                # ★ 诚实边界：这**不等于拒绝 spawn**——接缝没有"拒绝"通道，
+                #   桥拿到 None 仍会起进程；真正的 spawn 级拒绝需桥配合（P1+ 待办）。
+                inc_counter("agent_sandbox_backend_error_total")
+                logger.warning("沙箱后端不可得（strict=true）：%s ⇒ 回落无隔离", exc)
+                backend = NullBackend()
+            opts = SpawnOptions(cwd=ws.get("cwd"), env=dict(ws.get("env") or {}),
+                                mode=str(ws.get("mode") or "none"))
+            return backend.spawn_options(opts, policy, session_key).to_dict()
 
         ctx.provide(Services.CHILD_SPAWN_OPTIONS, _workspace)
 
@@ -326,7 +368,14 @@ class Sandbox:
             policy = _config(ctx)
             if not in_scope(policy, target):
                 return await next()          # 不在作用域：完全不过问
-            info = describe(policy, target)
+            # P0：先问后端"实际能给什么"，再让 describe 据**真实强度**自述
+            # （不再由插件内硬编码的天花板反推 ⇒ 后端落地后这里自动变 partial/full）。
+            binfo = describe_backend(str(policy.get("backend") or "auto"),
+                                     strict=bool(policy.get("strict")))
+            info = describe(policy, target, binfo)
+            if binfo.get("error"):
+                # 显式要求了后端却不可得 ⇒ **不静默**（可见计数，运维能查到）
+                inc_counter("agent_sandbox_backend_error_total")
             if info["deprecated_used"]:
                 # 迁移期提示：**不静默**（旧键仍在生效会让用户以为改了新键就生效了）
                 inc_counter("agent_sandbox_deprecated_keys_total")
@@ -338,6 +387,9 @@ class Sandbox:
                 "bridge": _bridge_of(target),
                 "mode": info["mode"], "enforcement": info["enforcement"],
                 "ceiling": info["ceiling"], "gap": info["gap"],
+                # ★ P0：后端与"谁在强制" —— 旧实现恒填 "none"，无法区分
+                #   "沙箱正常评估为无隔离" 与 "沙箱自身故障/后端不可得"。
+                "backend": info["backend"], "backend_error": info["backend_error"],
                 # ★ 落点（2026-10-04）：声明了档位 ⇒ 子进程被挪到会话私有目录。
                 # 与桥侧**共用同一个纯函数** ⇒ 审计里的 cwd 就是实际生效的那个，不会漂移。
                 # 注意：这只说明"东西落在哪"，**不代表强制**（见 workspace_for 的说明）。
@@ -346,7 +398,7 @@ class Sandbox:
                 # ★ enforced_by 区分"沙箱正常评估"与"沙箱自身故障"（DSH 的
                 # denialSignatures vs runnerFailureRules）。当前后端恒 "none"；
                 # 未来落地后填真实后端名，失败时填 "backend-error"。
-                "enforced_by": "none",
+                "enforced_by": info["enforced_by"],
                 # 迁移期可见性：仍在用已废弃的裁决键 ⇒ 审计里能查到（不静默）
                 "deprecated_used": list(info["deprecated_used"]),
                 "by": "sandbox", "session": sk,
@@ -370,13 +422,19 @@ class Sandbox:
         ★ 策略（谁能调什么）由 guard 的 ``status()`` 报；本条**只报隔离**，两者不互相代答。
         """
         policy = _config(ctx)
-        info = describe(policy)
+        binfo = describe_backend(str(policy.get("backend") or "auto"),
+                                 strict=bool(policy.get("strict")))
+        info = describe(policy, "", binfo)
         ws = workspace_for(policy, current_session_key(ctx))
         return {
             "mode": info["mode"],
             "enforcement": info["enforcement"],
             "ceiling": info["ceiling"],
             "gap": info["gap"],
+            # P0：后端自述（backend / 谁在强制 / 后端是否出错）
+            "backend": info["backend"],
+            "enforced_by": info["enforced_by"],
+            "backend_error": info["backend_error"],
             "reason": info["reason"],
             # 落点（当前是否把子进程挪出项目根）——与审计同源，前端可直接展示
             "workspace": (ws or {}).get("cwd", ""),

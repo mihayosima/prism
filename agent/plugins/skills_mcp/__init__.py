@@ -24,11 +24,18 @@ import sys
 from pathlib import Path
 
 from agent.api import (DEFAULT_DB_PATH, McpStdioClient, Services, StateKeys,
-                       build_task_schema, plugin)
+                       build_task_schema, current_session_key, plugin)
 
 logger = logging.getLogger("agent.plugins.skills_mcp")
 
 _BRIDGE = "skills_mcp"
+
+#: ★ P3（2026-10-13）：本适配器里**确属只读**的工具名。
+#: 依据：``run/skills_mcp_adapter.py`` 的两个工具只读 ``data/skills`` 后返回文本
+#（``skill_list`` 列卡片、``skill_view`` 读正文），**无任何写/执行副作用**。
+#: 未列入本集合的工具一律沿用 ``risk="write"``（保守：不因猜错而放行危险工具）。
+#: ⚠️ 后续 Follow 三件套（skill_bash/file_create/str_replace）**绝不可**加进这里。
+_READ_ONLY_TOOLS = frozenset({"skill_list", "skill_view"})
 
 #: 适配器模块（以 ``python -m`` 方式拉起，无需额外安装任何依赖）。
 _ADAPTER_MODULE = "agent.run.skills_mcp_adapter"
@@ -96,13 +103,44 @@ class SkillsMcp:
         db_path = cfg.get("db_path") or DEFAULT_DB_PATH
         return str(Path(db_path).parent)
 
+    def _workspace(self) -> dict | None:
+        """取沙箱落点（``{"cwd","env"}``）；沙箱未装配 ⇒ ``None``（沿用宿主 cwd，不劣化）。
+
+        ★ P2（2026-10-13）：此前本桥**没有接** ``CHILD_SPAWN_OPTIONS``，而另两个 MCP 桥
+        （playwright / windows）早已接了 ⇒ 不一致：本桥子进程的 cwd 仍是**项目根**
+        （那里有 ``local_secrets.json`` 明文 key 与 ``data/*.db`` 全量数据）。
+        此处按另两桥**同款接法**补齐；取不到就退回无落点，**绝不把桥启动搞崩**。
+        """
+        if self._ctx is None:
+            return None
+        # ★ 用 getattr 取而不是直接 ``self._ctx.get(...)``：部分装配/测试桩的 ctx 未必
+        # 实现 ``get``。沙箱是**增强维度**，缺了就退回无落点。
+        getter = getattr(self._ctx, "get", None)
+        if not callable(getter):
+            return None
+        try:
+            fn = getter(Services.CHILD_SPAWN_OPTIONS)
+        except Exception:                       # noqa: BLE001
+            return None
+        if not callable(fn):
+            return None
+        try:
+            return fn(current_session_key(self._ctx))
+        except Exception:                       # noqa: BLE001 —— 沙箱故障 ⇒ 退回无落点
+            logger.warning("skills_mcp 取沙箱落点失败 ⇒ 沿用宿主 cwd")
+            return None
+
     def _spawn(self, cfg: dict) -> McpStdioClient:
-        """按配置造一个客户端（子进程环境注入 ``SKILLS_DATA_DIR``）。"""
+        """按配置造一个客户端（注入 ``SKILLS_DATA_DIR``；装上沙箱时再叠落点）。"""
         command, args, timeout = resolve(cfg, {})
         env = {"SKILLS_DATA_DIR": self._data_dir()}
         env.update({str(k): str(v) for k, v in (cfg.get("env") or {}).items()})
+        ws = self._workspace()
+        if ws:
+            env.update(ws.get("env") or {})
+            logger.info("skills_mcp 落点收拢：cwd=%s", ws.get("cwd"))
         return McpStdioClient(command, args, env, timeout_s=timeout,
-                              on_stderr=_on_stderr)
+                              on_stderr=_on_stderr, cwd=(ws or {}).get("cwd"))
 
     async def apply(self, ctx) -> None:
         cfg = _section(ctx)
@@ -130,11 +168,16 @@ class SkillsMcp:
         ctx.state[StateKeys.MCP_TOOLS.format(bridge=_BRIDGE)] = self._tools
         ctx.state[StateKeys.MCP_ERROR.format(bridge=_BRIDGE)] = None
         for t in tools:
+            name = str(t.get("name") or "")
             task_schema = build_task_schema(t.get("inputSchema"))
-            ctx.tasks.register(ctx, f"mcp.skills.{t.get('name')}", schema=task_schema,
-                               handler=self._make_handler(t.get("name")),
+            # ★ P3：risk **不再吃 ``register`` 的默认值 "write"**。此前三个 MCP 桥注册时
+            # 都没传 risk ⇒ 连 ``skill_list`` 这种纯读工具也是 write 级 ⇒ guard 在
+            # risk.ask 下"读个技能也要问人"、plan 模式被裁 —— 只读适配器名不副实的漏洞。
+            ctx.tasks.register(ctx, f"mcp.skills.{name}", schema=task_schema,
+                               handler=self._make_handler(name),
                                owner=self.name,
-                               description=f"skills-mcp: {t.get('description') or t.get('name')}")
+                               risk="read" if name in _READ_ONLY_TOOLS else "write",
+                               description=f"skills-mcp: {t.get('description') or name}")
         ctx.provide(Services.SKILLS_MCP, self)
         ctx.effect(self._close)
 

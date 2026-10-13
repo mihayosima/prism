@@ -100,8 +100,14 @@ _SCHEMA: dict[str, Any] = {
         # ``default``/``allow``/``deny``/``risk`` 四键**已废弃**（准入判定归 guard，
         # 问人归 approval）⇒ 保留仅为兼容既有配置，**不再有裁决效果**。
         # ⚠️ 删键会让写了这些键的用户配置在装配期抛 ``ConfigError`` ⇒ 服务起不来，故不删。
+        # ★ P0（2026-10-13，分级沙箱骨架）新增三键——**必须登记**：
+        #   ``backend`` = state 轴（auto/off/win-token/wsl2/container/cloud）
+        #   ``network`` = 网络策略（dict，内含 ``allow_domains`` 等；登记成 dict 而非点号键，
+        #                 因为严格节的键是扁平的）
+        #   ``strict``  = 显式要求后端不可得时是否硬失败（默认 false = 告警+回落）
         "sandbox": {"mode": str, "targets": list, "default": str, "allow": list,
-                    "deny": list, "risk": dict},
+                    "deny": list, "risk": dict, "backend": str, "network": dict,
+                    "strict": bool},
     },
     # 插件自管顶层节
     "windows_mcp": "_any",

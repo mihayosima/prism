@@ -38,6 +38,12 @@ from agent.core.skill import Skill, skill
 from agent.core.skills_catalog import SkillsCatalog
 from agent.core.skills_loader import (delete_skill_file, discover_skills, load_state,
                                       parse_skill_file, save_state, write_skill_file)
+# 沙箱 confinement 后端（P0 骨架）：与 SkillsCatalog 同一纪律——插件/传输层只被允许
+# import agent.api，而 api 不得 import agent.sys ⇒ 需被插件构造的对象必须落 core。
+# NullBackend/select_backend 供 plugins.sandbox 驱动 enforcement（不再硬编码天花板）。
+from agent.core.sandbox_backend import (BACKENDS, STRENGTHS, BackendUnavailable,
+                                        ConfinementBackend, NullBackend, SpawnOptions,
+                                        describe_backend, select_backend)
 from agent.core.scope_config import (DEFAULT_SESSION_LIMIT, evict_lru,
                                      merge_overrides, section_of, touch)
 from agent.core.services_catalog import ALL as SERVICE_KEYS, Services
@@ -130,6 +136,15 @@ __all__ = [
     "delete_skill_file",
     "load_state",
     "save_state",
+    # 沙箱 confinement 后端（core/sandbox_backend；plugins.sandbox 经本出口取用）
+    "SpawnOptions",
+    "ConfinementBackend",
+    "NullBackend",
+    "BackendUnavailable",
+    "select_backend",
+    "describe_backend",
+    "BACKENDS",
+    "STRENGTHS",
     # ctx.state 共享键（跨插件契约）
     "StateKeys",
     # 会话/租户身份原语（阶段 2.2；实现位于 core/session，纯值对象 + 纯函数）
