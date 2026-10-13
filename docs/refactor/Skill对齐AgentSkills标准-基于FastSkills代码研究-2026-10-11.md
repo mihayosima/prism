@@ -7,6 +7,7 @@
 | --- | --- | --- |
 | 2026-10-11 23:12 | v1 | 基于 matthewlee0102/FastSkills 源码逐段研究，给出"如何让本仓 skill 插件成为 Claude Code 同款（Agent Skills 开放标准兼容）"的对齐方案，含差距对照与代码级实施步骤 |
 | 2026-10-12 00:26 | v1.1 | **阶段 0/1/2 已实施并真机验证**：目录式布局 `skills/<name>/SKILL.md`（扁平兼容）、`_parse_meta` 支持 YAML 块标量（多行 `description`）、**去掉强制 `skill.` 前缀**、`{baseDir}` 替换、目录式写回不分裂、`skills_routes` 放开前缀校验。注：实施时 loader 已随分层修复迁至 `agent/core/skills_loader.py`。阶段 3/4/5 未做 |
+| 2026-10-14 01:45 | v1.2（勘误） | **路径归位记录（正文保留历史原貌，未回改）**：v1.1 所述「loader 在 `agent/core/skills_loader.py`」已再次归位——技能三模块（`Skill`/`SkillsCatalog`/loader）现位于 `agent/plugins/skills/{model,catalog,loader}.py`，只读 MCP 适配器现位于 `agent/plugins/skills/adapter.py`。依据：架构文档 §三层容器语义（`core/` 零业务词；`plugins.memory` 即 system 层住插件层的先例），`agent.api` 不再导出任何技能符号。详见 `agent内部架构-开发文档.md` 2026-10-14 更新记录 |
 
 ---
 

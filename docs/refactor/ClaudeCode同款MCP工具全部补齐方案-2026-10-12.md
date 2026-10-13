@@ -7,6 +7,7 @@
 | --- | --- | --- |
 | 2026-10-12 00:43 | v1 | 结合实际代码复核现状（含纠正一处此前的误判），给出 Follow 三件套 + 阶段 3/4/5 的分批实施方案、护栏设计与验收清单 |
 | 2026-10-14 01:50 | v1.1 | **路径勘误（实施前必读）**：本文所引 `agent/run/skills_mcp_adapter.py` 已归位 `agent/plugins/skills/adapter.py`；`agent/core/skill.py` / `skills_catalog.py` / `skills_loader.py` 已归位 `agent/plugins/skills/` 下 `model.py` / `catalog.py` / `loader.py`（详见 `agent内部架构-开发文档.md` 2026-10-14 更新记录）。后续按本文施工时，所有旧路径一律按新路径执行；方案的技术判断（工具面、护栏、验收）不受影响 |
+| 2026-10-14 01:45 | v1.2 | **① P0 已实施**（提交 `fed1dcf`，2026-10-13）：skills 桥注册改传 risk，`skill_list`/`skill_view` 按 `_READ_ONLY_TOOLS` 白名单标 `read`、其余沿用 `write`（§1.3/§2.3/P0 节已同步标注）。**② 正文路径与行号按归位后代码全面校正**（适配器/目录/loader 新路径 + 真实行号）。**③ §2.4/§5 沙箱状态勘误**：`enforcement` 不再恒 `none`——分级沙箱 P4/P5 已落地（wsl2 进程级 / container 容器级后端），强度由真实后端驱动、off 档才是 `none`（详见 `分级沙箱对齐ClaudeCode方案-2026-10-13.md` v1.6）；本方案"路径不逃逸 + 默认关闭 + risk 审批"的宿主侧护栏设计不受影响，但**不得**再宣称"无任何隔离实现"。**④ §4 契约断言行改写**：适配器已与技能目录同包（包内相对导入合法），禁限是跨子系统直连（`sys.tasks`/`plugins.react`），不再是"只走 agent.api" |
 
 > 前情：已提交 `2bcd35f`（Skill 插件 + 只读 MCP 适配器 + 格式对齐阶段 0/1/2）。
 > 本方案在此基础上补 **FastSkills MCP server 的完整工具面** 与 **对齐阶段 3/4/5**。
@@ -36,7 +37,7 @@
 ## 1. 现状与缺口（全部经代码核实）
 
 ### 1.1 适配器现状
-`agent/run/skills_mcp_adapter.py`：`_HANDLERS`(:97) 仅 `skill_list` / `skill_view`；`_tools()`(:100) 只声明这两个。
+`agent/plugins/skills/adapter.py`：`_HANDLERS`(:103) 仅 `skill_list` / `skill_view`；`_tools()`(:106) 只声明这两个。
 
 ### 1.2 缺口清单
 
@@ -46,7 +47,7 @@
 | B | `bash_tool`（cwd=`{baseDir}`，超时 120s） | ❌ | **执行能力**（社区技能跑 scripts/ 全靠它） |
 | C | `file_create` | ❌ | 写能力 |
 | D | `str_replace` | ❌ | 写能力 |
-| E | 阶段 3：索引块格式对齐 | ⏳ | `skills_catalog.py:182 index_block` |
+| E | 阶段 3：索引块格式对齐 | ⏳ | `plugins/skills/catalog.py:187 index_block` |
 | F | 阶段 4：管理面展示捆绑资源 | ⏳ | `Skill` 无 `resources` 字段 |
 | G | 阶段 5：社区技能直装 | ⏳ | 无 `/api/skills/install` |
 | — | `search_cloud_skills` / `install_cloud_skill`（云注册表） | ❌ | **本方案不做**（外部依赖、运维增强，与"同款工具"正交） |
@@ -54,9 +55,11 @@
 ### 1.3 顺带发现的真实缺陷：MCP 工具风险级全被标成 `write`
 
 - `sys/tasks.py:186` `register(..., risk: str = "write")` 默认写级；
-- 三个 MCP 桥注册时**都没传 `risk`**（`plugins/skills_mcp/__init__.py:134`、`playwright:157`、`windows:144`）。
+- 三个 MCP 桥注册时**都没传 `risk`**（`plugins/skills_mcp/__init__.py:190`、`playwright:159`、`windows:146`）。
 
 后果：`mcp.skills.skill_list` 这种纯读工具风险级也是 `write` ⇒ 在 guard 的 `risk.ask` 策略下**读技能也要问人**，plan 模式下会被裁掉。这是"只读适配器"名不副实的漏洞，**必须在补执行能力前先修**（否则新增的 `skill_bash` 与 `skill_list` 风险级相同，护栏形同虚设）。
+
+> ✅ **已修（P0，提交 `fed1dcf`，2026-10-13）**：skills 桥注册处改传 risk——`_READ_ONLY_TOOLS` 白名单内的工具标 `read`、其余沿用 `write`（保守：不因猜错而放行）。playwright / windows 两桥**仍未修**（各自 25/20 个工具，逐一判定读写语义前不敢批量标 read，列为待办）。
 
 `RISKS = ("read", "write", "danger")`（`sys/tasks.py:97`）。
 
@@ -95,13 +98,14 @@
   - `skill_list` / `skill_view` → `"read"`
   - `skill_bash` → `"danger"`
   - `skill_file_create` / `skill_str_replace` → `"write"`
-- 桥插件 `plugins/skills_mcp/__init__.py:134` 注册处改为 `risk=t.get("risk") or "write"`，并把 `t["risk"]` 一并写进 `description` 前缀便于排查。
+- 桥插件 `plugins/skills_mcp/__init__.py:190` 注册处取 risk 注册（✅ 已实施：现为 `risk="read" if name in _READ_ONLY_TOOLS else "write"`；后续 Follow 三件套落地时，白名单机制要升级为"按适配器声明的 risk 透传"，见 P2）。
 - **本轮只改 skills 桥**；playwright / windows 桥的同款问题另开议题（属既有行为变更，需单独回归）。
 
 ### 2.4 沙箱的诚实说明
 
-`plugins/sandbox/__init__.py` 已明示：**无任何进程级隔离实现，所有档位 `enforcement` 恒 `none`**。
-故本方案**不宣称**"沙箱化执行"——隔离强度仍为 `none`，安全边界是「路径不逃逸 + 默认关闭 + risk=danger 走审批」，不是进程隔离。文档与前端文案都不得写成"沙箱执行"。
+`plugins/sandbox/__init__.py` 的隔离强度由**真实后端**驱动（分级沙箱 P4/P5 后）：`backend=off`（当前默认）⇒ `enforcement=none`；`wsl2`（bwrap+netns，partial）/ `container`（Docker，full）⇒ 按后端真实能力兑现，`status()`/审计如实报 `backend`/`enforced_by`/`portable`（详见 `分级沙箱对齐ClaudeCode方案-2026-10-13.md` v1.6）。
+
+故本方案的安全边界表述分两层：**宿主侧**「路径不逃逸 + 默认关闭 + risk=danger 走审批」始终成立；**进程隔离**则取决于沙箱配置——默认 off 下不得宣称"沙箱化执行"，配了 wsl2/container 才可宣称对应强度。文档与前端文案都不得越过配置的诚实边界。
 
 ---
 
@@ -109,31 +113,31 @@
 
 每批独立可验收、可回滚；前一批绿了再开下一批。
 
-### P0 —— 风险级标注（先修，约 0.5 批）
+### P0 —— 风险级标注（✅ 已实施，提交 `fed1dcf`，2026-10-13）
 | 落点 | 改动 |
 | --- | --- |
-| `run/skills_mcp_adapter.py:_tools()`(:100) | 两个工具加 `"risk": "read"` |
-| `plugins/skills_mcp/__init__.py:134` | `register(..., risk=t.get("risk") or "write")` |
+| `plugins/skills_mcp/__init__.py:190`（注册处） | 注册时传 risk：`risk="read" if name in _READ_ONLY_TOOLS else "write"`（白名单 `skill_list`/`skill_view`） |
+| `plugins/skills_mcp/__init__.py`（`_READ_ONLY_TOOLS`） | 新增只读工具白名单常量（附判定依据注释） |
 | `agent/tests/test_skills_mcp_adapter.py` | 断言 `_tools()` 含 risk；断言桥注册时传了 risk（monkeypatch `ctx.tasks.register`） |
 
-验收：`/api/tools` 里 `mcp.skills.skill_list` 风险级 = read；plan 模式下仍可调。
+验收（已过）：`/api/tools` 里 `mcp.skills.skill_list` 风险级 = read；plan 模式下仍可调。
 
 ### P1 —— 只读增强 + 阶段 3（索引块格式）
 | 落点 | 改动 |
 | --- | --- |
 | `_tools()` / `_HANDLERS` | `skill_view` 增 `view_range: [start, end]`（1-based，含端点；`-1` 表示到末尾，对齐 FastSkills `view` 语义） |
-| `core/skills_catalog.py:182 index_block` | 输出改为 Claude Code 风 `- name — <description 多行折叠为单行，_slim 截断>`；保留「读/写」标记与预算截断（不改 `max_chars` 语义） |
-| `core/skills_catalog.py:42 _slim` | 复用，但索引里 **description 允许更长**（触发说明是命中依据）⇒ 新增参数 `limit`，索引用 200、列表用 120 |
+| `plugins/skills/catalog.py:187 index_block` | 输出改为 Claude Code 风 `- name — <description 多行折叠为单行，_slim 截断>`；保留「读/写」标记与预算截断（不改 `max_chars` 语义） |
+| `plugins/skills/catalog.py:47 _slim` | 复用，但索引里 **description 允许更长**（触发说明是命中依据）⇒ 新增参数 `limit`，索引用 200、列表用 120 |
 
 验收：`code-review` 技能索引行显示为 `code-review — 对改动做评审…（含 Use when 触发语）`；`skill_view` 传 `view_range=[1,3]` 只回前三行。
 
 ### P2 —— Follow 三件套（核心批次）
 | 落点 | 改动 |
 | --- | --- |
-| `run/skills_mcp_adapter.py` | 新增 `_tool_bash` / `_tool_file_create` / `_tool_str_replace`，注册进 `_HANDLERS`；`_tools()` 按 `SKILLS_ALLOW_EXEC` 决定是否返回这三个 |
+| `plugins/skills/adapter.py` | 新增 `_tool_bash` / `_tool_file_create` / `_tool_str_replace`，注册进 `_HANDLERS`；`_tools()` 按 `SKILLS_ALLOW_EXEC` 决定是否返回这三个 |
 | 同上 | 新增 `_resolve_in(base: Path, candidate: str) -> Path`：resolve + `is_relative_to` 校验，逃逸抛 `ValueError` |
 | 同上 | 新增 `_run_cmd(cmd, cwd, timeout_s)`：`asyncio.create_subprocess_shell`；超时按 FastSkills 语义**返回部分输出 + isError**（不静默成功）；输出解码 utf-8 失败回落 `mbcs`（本机 Windows 控制台 GBK 的既有坑） |
-| `plugins/skills_mcp/__init__.py:_spawn`(:99) | 注入 `SKILLS_ALLOW_EXEC` / `SKILLS_WORKDIR` / `SKILLS_EXEC_TIMEOUT_S` |
+| `plugins/skills_mcp/__init__.py:_spawn`(:140) | 注入 `SKILLS_ALLOW_EXEC` / `SKILLS_WORKDIR` / `SKILLS_EXEC_TIMEOUT_S` |
 | `core/config_schema.py` | 无需改键（`skills_mcp` 节登记为 `_any`），只需在实现里给默认值 |
 
 工具签名（草稿）：
@@ -147,10 +151,10 @@ skill_str_replace(path: str, old: str, new: str, count?: int)    # old 必须唯
 ### P3 —— 阶段 4：管理面展示捆绑资源
 | 落点 | 改动 |
 | --- | --- |
-| `core/skill.py` | `Skill` 增 `resources: list[str] = field(default_factory=list)`（相对 basedir 的相对路径） |
-| `core/skills_loader.py:135 discover_skills` | 目录式技能扫 `scripts/ reference/ templates/ examples/ assets/` 一级文件（限深度 2、限条数 50，防大目录拖慢启动） |
-| `core/skills_catalog.py:84 _card` | 增 `basedir` / `resources` |
-| `run/skills_routes.py:40 _list_skills` | 透传（无需改签名）；`_get_skill`(:48) 已返回整卡 |
+| `plugins/skills/model.py` | `Skill` 增 `resources: list[str] = field(default_factory=list)`（相对 basedir 的相对路径） |
+| `plugins/skills/loader.py:138 discover_skills` | 目录式技能扫 `scripts/ reference/ templates/ examples/ assets/` 一级文件（限深度 2、限条数 50，防大目录拖慢启动） |
+| `plugins/skills/catalog.py:89 _card` | 增 `basedir` / `resources` |
+| `run/skills_routes.py:42 _list_skills` | 透传（无需改签名）；`_get_skill`(:50) 已返回整卡 |
 | `web/src/views/SkillsView.vue` + `skills.logic.ts` | 详情区展示「捆绑资源」列表；**改完必须 `npm run build` 重建 `web/dist` 并查页面**（既有教训：不重建则页面看不到新产物） |
 
 ### P4 —— 阶段 5：社区技能直装
@@ -173,7 +177,7 @@ skill_str_replace(path: str, old: str, new: str, count?: int)    # old 必须唯
 | --- | --- |
 | `test_skills_mcp_adapter.py`（现 18 项） | risk 字段；`view_range` 切片；路径穿越 3 例（`../`、绝对路径、workdir 外）；命令超时；输出截断；`allow_exec=false` 时 `tools/list` 不含三件套；真子进程 E2E（临时 `data_dir`） |
 | `test_skill_plugin.py`（现 20 项） | `resources` 发现；`index_block` 新格式；`_slim(limit)` 参数 |
-| `test_services_contract.py` | AST 守卫不变：适配器不得 import `sys.tasks` / `plugins.react`；新增断言 `agent/run/skills_mcp_adapter.py` 只走 `agent.api` |
+| `test_services_contract.py` | AST 守卫不变：适配器（`plugins/skills/adapter.py`）不得 import `sys.tasks` / `plugins.react`（跨子系统直连）；包内相对导入（`skills.catalog` 等）合法——技能系统内部相依是设计意图，不在禁限 |
 | 新增 `test_skills_install.py`（P4） | Zip-Slip 拒绝；非白名单 host 拒绝；缺 `SKILL.md` 拒绝；正常解包落盘 |
 
 回归纪律（沿用既有约定）：
@@ -181,13 +185,13 @@ skill_str_replace(path: str, old: str, new: str, count?: int)    # old 必须唯
 - 分批跑（每批 4 文件左右），避免 MemoryError；
 - 每批结束真机：`uvicorn` 起服务 + `/api/tools` 确认 `mcp.skills.*` 工具数与风险级；改过前端则重建 `dist` 并查页面。
 
-已知基线失败（与本次无关，勿重复排查）：`test_react_user_reject_not_counted`、`test_state_key_literals_only_in_state_keys`。
+已知基线失败（与本次无关，勿重复排查）：`test_react_user_reject_not_counted`、`test_state_key_literals_only_in_state_keys`、`test_budget_*`×2、`test_work_memory`×1（均为 HEAD 基线既有，2026-10-14 全量回归复核确认）。
 
 ---
 
 ## 5. 风险与边界
 
-- **不宣称沙箱**：`enforcement` 恒 `none`；安全靠路径约束 + 默认关 + `risk=danger` 审批。
+- **不宣称沙箱**：隔离强度由 `backend` 配置驱动（off ⇒ `none`；wsl2 ⇒ partial；container ⇒ full，详见分级沙箱方案 v1.6）；宿主侧安全靠路径约束 + 默认关 + `risk=danger` 审批，两层边界都不得越过配置的诚实边界对外表述。
 - **Windows 编码**：子进程输出解码 utf-8 → 失败回落 `mbcs`，禁止 `UnicodeDecodeError` 冒泡把子进程打死（适配器 `main()` 是逐行循环，异常要就地兜住）。
 - **不放宽既有两个桥**：playwright / windows 桥的 `risk` 缺失问题本轮不动。
 - **`data/` 与 `web/dist` 不入版本库**：`data/agent_plugin_state.json`（enabled 列表）、示例技能、`web/dist` 都是每机独立的；新机需自行补，方案文档与提交信息已注明。
