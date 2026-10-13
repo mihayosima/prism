@@ -139,8 +139,15 @@ class SkillsMcp:
         if ws:
             env.update(ws.get("env") or {})
             logger.info("skills_mcp 落点收拢：cwd=%s", ws.get("cwd"))
+        # ★ P4：跨边界隔离（wsl2/容器）需要改写 argv 本身，光 cwd/env 挡不住命令。
+        # ``wrap`` 是接缝新增键（既有桥不读 ⇒ 向后兼容）；本桥显式支持。
+        wrap = (ws or {}).get("wrap")
+        if wrap:
+            logger.info("skills_mcp 命令包装：backend=%s mode=%s",
+                        (ws or {}).get("backend"), wrap.get("mode"))
         return McpStdioClient(command, args, env, timeout_s=timeout,
-                              on_stderr=_on_stderr, cwd=(ws or {}).get("cwd"))
+                              on_stderr=_on_stderr, cwd=(ws or {}).get("cwd"),
+                              wrap=wrap)
 
     async def apply(self, ctx) -> None:
         cfg = _section(ctx)

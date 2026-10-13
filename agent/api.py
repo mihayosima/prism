@@ -43,7 +43,8 @@ from agent.core.skills_loader import (delete_skill_file, discover_skills, load_s
 # NullBackend/select_backend 供 plugins.sandbox 驱动 enforcement（不再硬编码天花板）。
 from agent.core.sandbox_backend import (BACKENDS, STRENGTHS, BackendUnavailable,
                                         ConfinementBackend, NullBackend, SpawnOptions,
-                                        describe_backend, select_backend)
+                                        Wsl2Backend, apply_wrap, describe_backend,
+                                        select_backend, to_wsl_path)
 from agent.core.scope_config import (DEFAULT_SESSION_LIMIT, evict_lru,
                                      merge_overrides, section_of, touch)
 from agent.core.services_catalog import ALL as SERVICE_KEYS, Services
@@ -140,9 +141,12 @@ __all__ = [
     "SpawnOptions",
     "ConfinementBackend",
     "NullBackend",
+    "Wsl2Backend",
     "BackendUnavailable",
     "select_backend",
     "describe_backend",
+    "apply_wrap",
+    "to_wsl_path",
     "BACKENDS",
     "STRENGTHS",
     # ctx.state 共享键（跨插件契约）

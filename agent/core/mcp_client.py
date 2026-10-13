@@ -51,6 +51,8 @@ import signal
 import subprocess
 from typing import Any
 
+from agent.core.sandbox_backend import apply_wrap
+
 _MCP_VERSION = "2024-11-05"
 
 #: 宿主（WorkBuddy CLI）注入的「安全删除」防护变量。MCP 子进程是独立第三方程序，
@@ -148,7 +150,7 @@ class McpStdioClient:
 
     def __init__(self, command: str, args: list[str] | None = None,
                  env: dict[str, str] | None = None, timeout_s: float = 120.0,
-                 on_stderr=None, cwd: str | None = None):
+                 on_stderr=None, cwd: str | None = None, wrap: dict | None = None):
         self._cmd = command
         self._args = list(args or [])
         self._env = env or {}
@@ -157,6 +159,11 @@ class McpStdioClient:
         #: 子进程工作目录（**纯机制**：本模块不决定它是什么，由调用方/沙箱接缝给）。
         #: ``None`` = 继承宿主 cwd（历史行为，不劣化）。
         self._cwd = cwd
+        #: ★ 命令包装（P4 WSL2 / P5 容器）：隔离作用在命令本身（如套 ``wsl.exe -e bash -lc
+        #: "bwrap …"``）。``None`` = 不包装（历史行为）。由沙箱接缝经桥传入。
+        self._wrap = wrap
+        #: 包装是否真正生效（翻译表命中与否）——未命中则退化为无隔离，须可观测。
+        self._wrap_applied = False
         self._proc: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
@@ -180,7 +187,17 @@ class McpStdioClient:
         return self._dead
 
     async def start(self) -> None:
-        full_env = child_env(self._env)
+        # ★ 命令包装（P4）：隔离若只给 cwd/env 就只能"落点收拢"，挡不住命令本身；
+        # 跨边界（WSL2/容器）必须改写 argv。applied=False ⇒ 原样启动（无隔离，可观测）。
+        cmd, argv, env_over, cwd = self._cmd, self._args, self._env, self._cwd
+        if self._wrap:
+            cmd, argv, env_over, cwd, self._wrap_applied = apply_wrap(
+                self._cmd, self._args, self._env, self._cwd, self._wrap)
+            if not self._wrap_applied:
+                logger.warning("沙箱包装未命中翻译规则 ⇒ 子进程 %s 退化为无隔离运行"
+                               "（translations=%s）", self._cmd,
+                               self._wrap.get("translations"))
+        full_env = child_env(env_over)
         self._dead = None
         self._closing = False
         # 独立进程组（Windows: CREATE_NEW_PROCESS_GROUP / POSIX: start_new_session）
@@ -194,7 +211,7 @@ class McpStdioClient:
         if self._cwd:
             extra["cwd"] = self._cwd
         self._proc = await asyncio.create_subprocess_exec(
-            self._cmd, *self._args,
+            cmd, *argv,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, env=full_env, **extra)
         self._reader = asyncio.create_task(self._read_loop())

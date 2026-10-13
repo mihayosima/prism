@@ -1,4 +1,4 @@
-# 分级沙箱对齐 Claude Code 方案（设计稿 v1.4 · P1 spike 已实测，win-token 出局）
+# 分级沙箱对齐 Claude Code 方案（设计稿 v1.5 · P4 wsl2 已实施并端到端验证）
 
 编制时间：2026-10-13 21:58（GMT+8）
 适用范围：Agent Harness /  Prism 沙箱组件重构
@@ -11,6 +11,7 @@
 | v1.2 | 2026-10-13 22:47 | 用户确认 WSL2 已修复（runtime 可用；开发侧 Bash 工具仍黑名单 wsl.exe）；进程级在 Windows 显式拆为 win-token 与 wsl2 两个 backend，`auto` 优先级 wsl2→win-token→off；5 档部署模型落地 |
 | v1.3 | 2026-10-13 23:20 | **代码复核 + 首批实施**：修正 §4 接缝契约冲突（真实形状 `(session_key)->dict`、桥只读 cwd/env）；P0/P2/P3 完成并回归绿（118 项）；裁定 strict=false、P1 spike 允许；新增 §11.7「strict ≠ 拒绝 spawn」诚实边界 |
 | **v1.4** | **2026-10-13 23:50** | **★ P1 spike 实测，推翻两个核心假设**：① **win-token 出局**——非管理员下 `CreateRestrictedToken` 能成功，但**任何 restricting SID 都会让子进程 `0xC0000142` 起不来**（矩阵诊断 6 配置），绕过需放宽系统目录 ACE=安全倒退 ⇒ 标记不可用；② **Docker 已在本机可用**（Desktop 29.4.0，容器运行）+ **WSL2 进程级全套可用**（bwrap/Landlock/netns 实测，`--unshare-net` 真断网）⇒ container/wsl2 从"仅代码预留"升为"本机可部署"。新增 §6.8「目标可移植性约束」（windows_mcp 进不了 WSL/容器）；auto 优先级改 **wsl2→container→off** |
+| **v1.5** | **2026-10-14 00:10** | **P4 wsl2 后端实施完成 + 端到端验证**：新增「命令包装（wrap）」通道（§4.1，补上"隔离必须作用在命令本身"这一接缝盲区）；`Wsl2Backend` + `apply_wrap` + mcp_client 消费 + skills_mcp 桥接入；修复 `mode=none` 谎报后端强度的缺陷；实测隔离有效性（写项目根 DENIED / 工作目录 OK / 网络 BLOCKED）。回归 131 项绿 |
 
 ---
 
@@ -130,9 +131,36 @@ class SpawnOptions:
     creationflags: int | None       # Windows 进程标志（含/不含令牌，P1）
     preexec: Callable | None        # Linux: unshare/prctl/landlock 闭包（P4）
     seccomp_fd: int | None          # Linux seccomp filter fd（P4）
+    wrap: dict | None               # ★ P4：命令包装（见 §4.1）—— 隔离作用在**命令本身**
 
     def to_dict(self) -> dict: ...  # ★ 转接缝字典（见下方契约纪律）
 ```
+
+### 4.1 ★ 命令包装（wrap）通道 —— P4 新增，补上接缝盲区
+
+v1.3 的接缝只有 `cwd`/`env`，但**跨边界隔离（wsl2 / 容器）必须作用在命令本身**：
+光改 cwd 与环境变量，进程仍在宿主侧以全权限跑，等于没隔离。故新增 `wrap` 通道。
+
+```
+wrap = {
+  "mode": "shell",                    # 目前只此一种：把原命令包进一层外壳
+  "argv": ["wsl.exe", "-e", "bash", "-lc"],   # 外壳前缀（最后一项由调用方追加 inner）
+  "inner": "bwrap --ro-bind ... --bind ... --unshare-net ...",  # 外壳内实际执行的隔离命令
+  "kind": "wsl2-bwrap",
+}
+```
+
+消费点：`core/mcp_client.py` 的 `apply_wrap(command, argv, env, cwd, wrap) -> (cmd, argv, env, cwd, applied)`。
+
+| 情形 | 行为 |
+| --- | --- |
+| `wrap=None` | 原样启动（历史行为，不劣化） |
+| 命中翻译（Windows exe + `-m` 包模块 ⇒ WSL 内 `python3`） | 套上外壳，env 提到 `bwrap` **之前**（否则被当成命令参数） |
+| **未命中**翻译（例：Windows 原生 exe，如 UI 自动化） | **原样启动，不硬套** —— 硬套必崩。这正是 §6.8 目标可移植性的落地点 |
+
+★ 两条实测踩坑（已修，勿回退）：
+1. `bwrap` 的 `--chdir` 会切走 cwd，但 `python3 -m agent....` 需要**项目根**可导入 ⇒ 用 `PYTHONPATH=<repo>` 显式给，不依赖调用方合并 env。
+2. env 赋值必须排在 `bwrap` **之前**（`A=1 bwrap ... cmd`），否则 env 被当作 bwrap 的子命令参数。
 
 ★ **契约纪律（2026-10-13 代码复核得出，勿改）**——这一条比上面所有字段都重要：
 
@@ -237,6 +265,31 @@ class ConfinementBackend(Protocol):
 - ⚠ **开发侧验证限制**：本 agent 的 Bash 工具仍把 `wsl.exe` 列入 Program Blacklist，故 WSL2 backend 的 spike/单测须以 **Python 脚本经 subprocess 调 `wsl`**（runtime 路径，本轮已验证可行）或由用户在沙箱外执行，不能从我的 Bash 工具直接跑。
 - 内核不足（Landlock ABI 过低）⇒ `capability_probe()` 返回不可用 ⇒ `auto` 不选它，配置显式要求则 fail-closed。
 
+#### 6.3.1 ★ P4 实施状态（2026-10-14 00:10，已完成并端到端验证）
+
+**落地内容**：
+
+| 落点 | 变更 |
+| --- | --- |
+| `core/sandbox_backend.py` | 新增 `Wsl2Backend`（`capability_probe` 探测 wsl/bwrap/Landlock、`can_enforce`、`describe` 带 gaps）、`to_wsl_path()` 路径映射、`_bwrap_inner()` 命令生成、`apply_wrap()` 包装应用；`SpawnOptions` 增 `wrap` 字段；`_BACKEND_CLASSES` 登记 `wsl2`；`win-token` 登记为"实测不可用"（reason 含 `0xC0000142`） |
+| `core/mcp_client.py` | `McpStdioClient.__init__` 增 `wrap` 形参；`start()` 先 `apply_wrap` 再启动 |
+| `plugins/skills_mcp/__init__.py` | `_spawn` 把后端产出的 `wrap` 一并传给客户端（cwd/env 之外的新通道） |
+| `plugins/sandbox/__init__.py` | **修复缺陷**：`mode=none`（未声明隔离）时原本仍把后端强度 `partial` 报出去 ⇒ 谎报。现改为 `mode=none` 时强制 `none/none backend` |
+| `api.py` | 导出 `Wsl2Backend`/`apply_wrap`/`to_wsl_path`/`NET_POLICIES` |
+
+**三层验证（全部实测，非推断）**：
+
+| 层 | 脚本 | 结果 |
+| --- | --- | --- |
+| 跨边界 stdio 桥 | `_spike/wsl_stdio_spike.py` | A 裸 WSL2 内 MCP 适配器完整往返（initialize→tools/list→tools/call）✅；B bwrap 包裹后仍正常且 `--unshare-net` 内 `NET_BLOCKED` ✅；C 杀宿主 `wsl.exe` 后 WSL 内**无残留进程** ✅ |
+| 端到端真机 | `_spike/wsl_e2e.py` | 经 `Wsl2Backend` 产出 wrap → `McpStdioClient` 真起 WSL2 内桥 → `tools/list` 返回 `skill_list`/`skill_view`、技能可见 ✅ |
+| **隔离有效性** | `_spike/wsl_isolation_check.py` | **决定性证据**：bwrap 内写项目根 ⇒ **`DENIED`**；写工作目录 ⇒ OK；网络 ⇒ **`BLOCKED`**。对照组（无 bwrap）全部放行 ⇒ 差异确实来自隔离，不是权限巧合 |
+
+**诚实边界（勿夸大）**：
+- 当前 `strength="partial"` —— 只用了 bwrap 的 bind/netns，**尚未**接 seccomp/Landlock ABI 调用（gaps 里如实列出）。
+- `--ro-bind /mnt` 在 WSL2 的 drvfs（9P）挂载上生效，实测已证；但**跨发行版/内核升级需重测**。
+- 只有"命令可翻译到 Linux"的目标才可被隔离（§6.8）；未命中翻译时**原样启动、无隔离**（不硬套，避免必崩）。
+
 ### 6.4 macOS Seatbelt（同理，代码写、本机不跑）
 - 生成 SBPL 规则（`(deny default)` + 项目根/临时目录 allow + `network*` deny），`sandbox-exec -p` 包裹。
 
@@ -335,20 +388,22 @@ agent:
 
 **修订后的实施顺序（v1.4）**：~~P1（win-token，已出局）~~ → **P4（wsl2 进程级，本机实测可跑，与 CC 同构）** → **P5（container 容器级，本机实测可跑，强度最高）** → P8（目标可移植性）→ P7（网络：先 netns/`--network none` 断网，再应用层白名单代理）→ P6（前端）。
 
-**实施状态（2026-10-13 23:20 更新）**：
+**实施状态（2026-10-14 00:10 更新）**：
 
 | 批次 | 状态 | 落地摘要 |
 | --- | --- | --- |
 | **P0** | ✅ 已完成 | 新建 `core/sandbox_backend.py`（`SpawnOptions` + `ConfinementBackend` + `NullBackend` + `select_backend`/`describe_backend`）；`api.py` re-export；sandbox 插件删除 `_ENFORCEMENT_CEILING` 硬编码、改由后端驱动 `enforcement`；`config_schema` 登记 `backend`/`network`/`strict`；审计与 `status()` 增 `backend`/`enforced_by`/`backend_error`。新增 `test_sandbox_backend.py`（18 项）。 |
 | **P2** | ✅ 已完成 | `skills_mcp` 接 `CHILD_SPAWN_OPTIONS`（新增 `_workspace()`，与另两桥同款），`_spawn` 传 `cwd` + 合并重定向 env。 |
 | **P3** | ✅ 已完成（部分） | `skills_mcp` 的 `skill_list`/`skill_view` 注册传 `risk="read"`（`_READ_ONLY_TOOLS` 白名单）；测试桩补 `risk` 形参 + 新增 P3 回归用例。⚠️ **playwright/windows 两桥未动**——它们各有 25/20 个工具，逐一判定读写语义前不敢批量标 `read`（误标=放行危险工具），列为待办需逐工具审计。 |
+| **P4** | ✅ **已完成 + 端到端验证** | `Wsl2Backend`（bwrap+netns）+ `apply_wrap` 命令包装通道（§4.1）+ `mcp_client` 消费 + `skills_mcp` 接入；修 `mode=none` 谎报后端强度的缺陷。三层实测全绿（跨边界 stdio / 端到端起桥 / **隔离有效性对照实验**）。详见 §6.3.1。 |
 
 ---
 
 ## 10. 测试与回归
 
-- `test_sandbox_backend.py`：每个 backend 的 `capability_probe`/`can_enforce`/`spawn_options` 纯函数断言；Windows 令牌 backend 在非管理员/不可用时 fail-closed 断言。
-- `test_sandbox_plugin.py`：更新为断言 backend 驱动 enforcement、gap 可见、显式要求不可用 backend 时 spawn 被拒（或落 backend-error）。
+- `test_sandbox_backend.py`：**51 项**（P4 后）。含 backend 的 `capability_probe`/`can_enforce`/`spawn_options` 纯函数断言；★ 两条**契约守卫**（`to_dict()` 必含 `cwd`/`env`；套了 wrap 后仍必含）；`apply_wrap` 命中/未命中/无 wrap 三态；`win-token` 恒不可用的可追溯 reason（含 `0xC0000142`）。
+  - ⚠️ P4 后本机 wsl2 **真的可用** ⇒ 原"auto 恒回落 null"的 6 条假设失效，已改为**按真实能力断言**（有 wsl2 则 `wsl2|null`，无则 `null`），避免换机/CI 红。
+- `test_sandbox_plugin.py`：断言 backend 驱动 enforcement、gap 可见、`mode=none` 时**不得**报出后端强度（谎报守卫）。
 - `test_services_contract.py`：确保 backend 在 core、`api` 不 import `sys`（既有守卫）。
 - 全量 pytest 纪律照旧（`CODEBUDDY_SAFE_DELETE_SANDBOX=0`、basetemp 独立）。
 
@@ -380,12 +435,16 @@ agent:
 
 ---
 
-## 13. v1.4 新增待拍板事项（编码前）
+## 13. 待拍板事项（v1.5 更新）
 
-1. **下一个动手批次**：P4（wsl2 进程级，与 CC 同构、轻量）还是 P5（container 容器级，强度最高、本机已验证）？我的建议是 **P4 先**（进程级是 CC 日常默认档，且无需镜像准备），P5 紧随。
-2. **stdio MCP 桥跨边界怎么跑**（wsl2/container 的技术关键）：
-   - wsl2：`wsl.exe -e python3 -m agent.run.skills_mcp_adapter`，工作目录用 `/mnt/c/...` 映射（`data/skills` 需从 WSL 可达）；stderr/进程树终止需验证。
-   - container：`docker run -i --rm -v <workspace>:/workspace <image> python -m …`（`-i` 保 stdio）。需选定/构建镜像（alpine+python 即可，或复用 `node:22-alpine` 不合适）。
-   - 二者都需原型验证 **stdin/stdout 不粘包、长连接稳定、子进程能整棵杀**。
-3. **`windows_mcp` 的处置**：确认接受「在 status/describe 里诚实标注为不可沙箱化（off）」，还是需要额外投入（我看不到可行路径，除非接受无隔离）。
-4. **是否保留 `win-token` 枚举值**：建议保留但 `capability_probe()` 恒不可用，并在文档中留实验记录（避免他人/日后重复踩坑）。
+**✅ 已裁定（2026-10-13 23:55，用户选择）**：
+1. **下一个动手批次 = P4（wsl2 进程级）** —— ✅ **已完成并端到端验证**（§6.3.1）。P5（container）紧随。
+2. **`windows_mcp` 处置 = 直接 off 并诚实暴露** —— 用户判断：这是 **MCP 自身设计问题**（Windows 原生 UI 自动化无法跨到 WSL/容器），不由沙箱承担 ⇒ 接受无隔离，标注 `unportable_targets`。
+3. **保留 `win-token` 枚举值** —— `capability_probe()` 恒不可用 + reason 指向 §6.2 实验记录（避免重复踩坑）。已落地。
+
+**仍待拍板（P4 完成后浮现）**：
+
+1. **P5（container 容器级）是否接着做**：本机 Docker 实测可用、强度最高（文件+网络+进程）。代价是需选/建运行 MCP 桥的镜像，且启动比 wsl2 重。
+2. **默认档位要不要从 `off` 改成 `auto`**：P4 后 `auto` 在本机**真能选中 wsl2 并兑现隔离**。当前配置默认仍是 `mode=none`（off）。是否默认开启？——开启意味着**所有 MCP 桥子进程默认进 WSL2**，需评估兼容风险（playwright 桥在 WSL 内能否跑、性能损耗）。建议先在 `skills_mcp` 单桥试点。
+3. **`windows_mcp` 的 off 标注何时落地**（P8）：需要给桥加 `runnable_in` 声明 + `status()`/`describe()` 暴露 `unportable_targets`。用户已接受方向，实施时机待定。
+4. **P7 网络代理是否仍必要**：wsl2 已有**内核级 netns 断网**（`network=deny` 实测可兑现）⇒ 代理式域名白名单的边际价值下降（仅在"需要部分放行特定域名"时才必要）。可考虑降级为可选子项目。

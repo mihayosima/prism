@@ -46,6 +46,16 @@ PLUGIN_DIR = AGENT_DIR / "plugins"
 MCP_TOOLS = ("mcp.windows.open", "mcp.playwright.nav")
 
 
+def _expected_enforcement() -> str:
+    """**真实后端**驱动下的强度（本机有 WSL2+bwrap ⇒ partial；否则 none）。
+
+    P4 落地 wsl2 后，声明了隔离档位就**真的**可能兑现 ⇒ 断言不能再写死 "none"，
+    否则等于把"有隔离"谎报成"没隔离"。两种环境都靠这个函数保持诚实。
+    """
+    from agent.core.sandbox_backend import Wsl2Backend
+    return "partial" if Wsl2Backend().capability_probe().get("available") else "none"
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -398,9 +408,17 @@ def test_plugin_is_off_by_default(tmp_path):
 
 
 def test_untouched_surfaces_stay_untouched():
-    """守卫：本批**不改** MCP 桥与两个 MCP 插件（注册处一行不动）。"""
+    """守卫：桥**不参与准入裁决**（裁决权在 guard/approval），两个 MCP 插件一行不动。
+
+    ★ P4 修订：跨边界隔离（WSL2/容器）必须作用在**命令本身**，光给 cwd/env 挡不住
+    ⇒ ``core/mcp_client.py`` 现在会引用 ``apply_wrap``（**只应用包装、不做判断**）。
+    这是机制层面的必要耦合；被守住的边界是"**裁决**不进桥"——桥不为允许/拒绝负责。
+    """
     bridge = (AGENT_DIR / "core" / "mcp_client.py").read_text(encoding="utf-8")
-    assert "sandbox" not in bridge.lower(), "MCP 桥不应知道沙箱（准入在 waterfall 层）"
+    assert "apply_wrap" in bridge, "跨边界隔离必须作用在命令上（P4：光 cwd/env 挡不住）"
+    # 守住的边界是"**裁决**不进桥"：选择哪个后端、是否允许调用，都是插件/guard 的活。
+    for banned in ("select_backend", "describe_backend", "decision", "risk"):
+        assert banned not in bridge, f"MCP 桥不得做后端选择/准入裁决：{banned}"
     for rel in ("plugins/playwright_mcp/__init__.py", "plugins/windows_mcp/__init__.py"):
         assert "sandbox" not in (AGENT_DIR / rel).read_text(encoding="utf-8").lower(), \
             f"{rel} 不应改动（沙箱在准入层，不进桥）"
@@ -478,8 +496,9 @@ def test_confinement_audit_carries_workspace(tmp_path):
     assert payload["cwd"].startswith("data/sandbox/u_A-")
     assert payload["env_redirected"] is True
     # ★ 关键：落点收拢**不是**强制 —— enforcement 不得因此抬升（抬了就是谎报）
-    assert payload["enforcement"] == "none"
-    assert payload["gap"] is True
+    expected = _expected_enforcement()
+    assert payload["enforcement"] == expected, "强度必须由后端真实能力驱动"
+    assert payload["gap"] is (expected == "none")
 
 
 def test_audit_workspace_empty_when_mode_none(tmp_path):
@@ -515,7 +534,11 @@ def test_status_reports_workspace(tmp_path):
     sb = st.get("plugins.sandbox") or {}
     assert (sb.get("workspace") or "").startswith("data/sandbox/u_B-")
     assert sb.get("env_redirected") is True
-    assert sb.get("enforcement") == "none"       # 仍不谎报
+    # ★ P4 后：声明了档位且本机 wsl2 可用 ⇒ 真的兑现了 partial；不可得才回落 none。
+    # 两种都属"不谎报"，关键是**由真实后端能力驱动**，不是硬编码。
+    expected = _expected_enforcement()
+    assert sb.get("enforcement") == expected, "强度必须由后端真实能力驱动"
+    assert bool(sb.get("gap")) is (expected == "none")
 
 
 # ---------------------------------------------------------------------------

@@ -255,7 +255,11 @@ def describe(policy: dict, target: str = "", backend_info: dict | None = None) -
     strength = str(info.get("strength") or "none")
     if strength not in ENFORCEMENTS:
         strength = "none"
-    enforced_by = str(info.get("enforced_by") or "none")
+    # ★ ``mode="none"`` 表示**没声明**隔离档位 —— 此时后端根本不会被消费
+    # （``workspace_for`` 返回 None ⇒ 落点/包装都不生效）⇒ 报出 ``partial`` 就是**谎报**。
+    # P4 落地 wsl2 后这条才暴露出来：后端"可用"≠"这次调用被隔离了"。
+    effective = strength if mode != "none" else "none"
+    enforced_by = str(info.get("enforced_by") or "none") if mode != "none" else "none"
     if mode == "none":
         reason = "未配置隔离档位"
     elif strength == "none":
@@ -269,10 +273,10 @@ def describe(policy: dict, target: str = "", backend_info: dict | None = None) -
                   f"（无可用后端兑现）⇒ 实际无隔离")
     else:
         reason = f"档位 {mode!r} 生效（强度 {strength}，后端 {enforced_by}）"
-    return {"mode": mode, "enforcement": strength, "ceiling": strength,
-            "backend": str(info.get("backend") or "null"),
+    return {"mode": mode, "enforcement": effective, "ceiling": effective,
+            "backend": str(info.get("backend") or "null") if mode != "none" else "null",
             "enforced_by": enforced_by,
-            "gap": mode != "none" and strength == "none",
+            "gap": mode != "none" and effective == "none",
             "backend_error": bool(info.get("error")),
             "reason": reason, "deprecated_used": used}
 
