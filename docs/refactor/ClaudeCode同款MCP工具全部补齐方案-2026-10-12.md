@@ -6,6 +6,7 @@
 | 时间 | 版本 | 变更摘要 |
 | --- | --- | --- |
 | 2026-10-12 00:43 | v1 | 结合实际代码复核现状（含纠正一处此前的误判），给出 Follow 三件套 + 阶段 3/4/5 的分批实施方案、护栏设计与验收清单 |
+| 2026-10-14 01:50 | v1.1 | **路径勘误（实施前必读）**：本文所引 `agent/run/skills_mcp_adapter.py` 已归位 `agent/plugins/skills/adapter.py`；`agent/core/skill.py` / `skills_catalog.py` / `skills_loader.py` 已归位 `agent/plugins/skills/` 下 `model.py` / `catalog.py` / `loader.py`（详见 `agent内部架构-开发文档.md` 2026-10-14 更新记录）。后续按本文施工时，所有旧路径一律按新路径执行；方案的技术判断（工具面、护栏、验收）不受影响 |
 
 > 前情：已提交 `2bcd35f`（Skill 插件 + 只读 MCP 适配器 + 格式对齐阶段 0/1/2）。
 > 本方案在此基础上补 **FastSkills MCP server 的完整工具面** 与 **对齐阶段 3/4/5**。

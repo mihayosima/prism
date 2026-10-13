@@ -1,12 +1,16 @@
-"""agent.core.skills_catalog —— 技能目录（SkillsCatalog）。
+"""agent.plugins.skills.catalog —— 技能目录（SkillsCatalog）。
 
 react 经 ``ctx.get(Services.SKILLS)`` **反向读取**本目录，二者单向解耦：本模块
 **不 import react / plugins.react**。
 
-为什么在 **core** 而不是 sys：分层规则要求「插件 / 传输层只经 ``agent.api`` 取用，而 api
-不得反向依赖 sys」⇒ 任何要被插件（``plugins/skills``）或传输层（``run/skills_routes``、
-``run/skills_mcp_adapter``）构造的对象，都必须能被 api 导出，即只能落在 core。
-本目录经 ``agent.api`` 再导出后，各层即可合规取用。
+★ 2026-10-14 归位：本模块从 ``agent/core`` 移入 ``plugins/skills``。设计文档三层语义
+（``agent内部架构-开发文档.md``）：``core/`` 零业务词，业务词只允许出现在 ``plugins/``
+业务插件、``fixtures/`` 与领域文档；``plugins.memory``（layer=system）住插件层即先例。
+此前沉入 core 的理由（"适配器子进程要构造 ⇒ 只能落 core"）是把插件层问题推给内核：
+适配器已随桥搬进 ``plugins/skills_mcp/adapter.py``（包内相对导入本目录），run/ 传输层
+改经目录自身的管理面 API（``add_fields`` / ``persist`` / ``reload_from_disk``）操作，
+两端都不再需要 ``agent.api`` 导出技能类。内核机制（errors / permissions / tokens）
+仍经 ``agent.api`` facade 取用，不碰 ``agent.core.*`` 私有路径。
 
 暴露给 react 的契约面（react 只依赖这些签名）：
 - ``meta_tools() -> list[dict]``        单 ``skill`` 工具定义（常驻，独立于 lazy_tools）
@@ -16,7 +20,10 @@ react 经 ``ctx.get(Services.SKILLS)`` **反向读取**本目录，二者单向�
 - ``index_block(max_chars) -> str``      紧凑索引（注入系统提示免费常驻）
 - ``render_content(s) -> str``           正文（``{baseDir}`` 已替换为技能文件所在目录）
 
-管理面（决策：增/删/查/改/启停）：
+管理面（决策：增/删/查/改/启停；run/skills_routes 只经这些方法，不碰 Skill 类）：
+- ``add_fields(...) -> dict``            字段式新增（内部构造 Skill，返回卡片）
+- ``persist(s)``                         把内存中的技能写回磁盘
+- ``reload_from_disk(name) -> Skill``    从磁盘重载（目录式/扁平式均可）
 - ``add / remove / set_enabled`` 支持 ``persist`` 写盘（``data/skills/*.md`` + ``skills_state.json``）
 - 同名冲突抛 ``ServiceConflictError``（不静默覆盖）
 - 插件来源技能不可经管理面移除（只可停用插件）
@@ -29,12 +36,10 @@ import logging
 from pathlib import Path
 from typing import Any, Callable
 
-from agent.core.errors import AgentError, ServiceConflictError
-from agent.core.permissions import current_permission_mode
-from agent.core.skill import Skill
-from agent.core.skills_loader import (delete_skill_file, discover_skills, load_state,
-                                      save_state, write_skill_file)
-from agent.core.tokens import clip_text
+from agent.api import AgentError, ServiceConflictError, clip_text, current_permission_mode
+from .loader import (delete_skill_file, discover_skills, load_state,
+                     parse_skill_file, save_state, write_skill_file)
+from .model import Skill
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +200,45 @@ class SkillsCatalog:
         return ("## 可用技能（按需调用 skill 工具加载说明，勿当普通函数直接调用）\n" + body)
 
     # ---- 管理面（持久化） ----
+    def add_fields(self, *, name: str, description: str = "", content: str = "",
+                   risk: str = "read", tags: list[str] | None = None,
+                   owner: str = "admin", source: str = "file",
+                   persist: bool = False) -> dict:
+        """字段式新增（传输层管理面用）：内部构造 Skill、注册、按需写盘，返回卡片。
+
+        ★ 归位（2026-10-14）后 ``run/skills_routes`` 不再 import Skill 类——run/ 层
+        只准 import ``agent.api``，而 api 不再导出技能类 ⇒ 新增改经本方法落库。
+        """
+        s = Skill(name=name, description=description, content=content, risk=risk,
+                  tags=list(tags or []), owner=owner, source=source)
+        self.add(s, persist=persist)
+        return self._card(s)
+
+    def persist(self, s: Skill) -> Path:
+        """把内存中的技能写回磁盘（管理面编辑后调用；目录式优先写回原 ``SKILL.md``）。"""
+        return write_skill_file(self._data_dir, s)
+
+    def reload_from_disk(self, name: str) -> Skill:
+        """从磁盘重载指定技能（扁平式/目录式均可），返回重载后的 Skill。
+
+        ★ 归位（2026-10-14）后解析/重注册逻辑内聚到目录自身，传输层不再碰
+        ``parse_skill_file``。布局兼容：``<name>.md`` 与 ``<name>/SKILL.md`` 都认
+        （旧传输层实现只查扁平路径，目录式技能实为 404——本次顺带修正）。
+        找不到入口文件抛 ``FileNotFoundError``、解析失败抛 ``ValueError``，
+        由传输层映射为 4xx：重载是显式管理动作，失败必须可见，不吞。
+        """
+        d = Path(self._data_dir) / "skills"
+        safe = str(name).replace("/", "_").replace("\\", "_")
+        for p, default in ((d / f"{safe}.md", None), (d / safe / "SKILL.md", name)):
+            if p.exists():
+                ns = parse_skill_file(p, default_name=default)
+                ns.enabled = name not in self._disabled
+                self.unregister(name)
+                self.register(ns)
+                return ns
+        raise FileNotFoundError(
+            f"技能文件不存在：{d / f'{safe}.md'} 或 {d / safe / 'SKILL.md'}")
+
     def add(self, skill: Skill, *, persist: bool = False) -> None:
         if skill.name in self._skills:
             raise ServiceConflictError(skill.name, "skills.catalog")

@@ -32,15 +32,11 @@ from agent.core.obs import (bind_request_id, configure_logging, counters_snapsho
                             new_request_id, trace_fields)
 from agent.core.request_cost import (estimate_request_cost, wire_messages,
                                      wire_tools)
-from agent.core.skill import Skill, skill
-# 技能目录与文件发现/持久化：随 ``Skill`` 一并落在 core 并经本出口导出，使插件与传输层
-# 合规取用（它们只被允许 import agent.api）。
-from agent.core.skills_catalog import SkillsCatalog
-from agent.core.skills_loader import (delete_skill_file, discover_skills, load_state,
-                                      parse_skill_file, save_state, write_skill_file)
-# 沙箱 confinement 后端（P0 骨架）：与 SkillsCatalog 同一纪律——插件/传输层只被允许
-# import agent.api，而 api 不得 import agent.sys ⇒ 需被插件构造的对象必须落 core。
+# 沙箱 confinement 后端（P0 骨架）：插件/传输层只被允许 import agent.api，而 api 不得
+# import agent.sys ⇒ 需被插件构造的**机制**必须落 core（机制 = 零业务词，如本模块）。
 # NullBackend/select_backend 供 plugins.sandbox 驱动 enforcement（不再硬编码天花板）。
+# ★ 2026-10-14 辨界：此纪律只对**机制**成立——业务特性代码（如 Skill 插件系统）不得
+# 据此沉入 core，已归位 plugins/skills（设计文档三层语义）；api 不再导出任何技能类。
 from agent.core.sandbox_backend import (BACKENDS, BRIDGE_PORTABILITY, STRENGTHS,
                                         BackendUnavailable, ConfinementBackend,
                                         ContainerBackend, NullBackend, SpawnOptions,
@@ -110,8 +106,9 @@ def cost_factor(ctx, default: float = 1.0) -> float:
 
 #: 权限档位助手已下沉到 ``agent.core.permissions``（内核层），此处**原样再导出**：
 #: 一是保持既有调用点（approval / react / guard）零改动；二是让 ``core`` 侧的公共组件
-#: （如技能目录 ``core/skills_catalog``）也能取用——api 不得反向依赖 sys，而插件与传输层
-#: 又只能经 api 消费，故这类共用原语必须落在 core。
+#: 也能取用——api 不得反向依赖 sys，而插件与传输层又只能经 api 消费，故这类共用原语
+#: 必须落在 core。（★ 2026-10-14：权限档位本身即内核机制——与技能特性无关；技能目录
+#: 已归位 ``plugins/skills``，不再作为本处留核的理由。）
 from agent.core.permissions import current_permission_mode, set_permission_mode
 
 __all__ = [
@@ -129,16 +126,6 @@ __all__ = [
     # services
     "Services",
     "SERVICE_KEYS",
-    # 技能数据模型（实现位于 core/skill；插件/系统层经本出口取用）
-    "Skill",
-    "skill",
-    "SkillsCatalog",
-    "discover_skills",
-    "parse_skill_file",
-    "write_skill_file",
-    "delete_skill_file",
-    "load_state",
-    "save_state",
     # 沙箱 confinement 后端（core/sandbox_backend；plugins.sandbox 经本出口取用）
     "SpawnOptions",
     "ConfinementBackend",

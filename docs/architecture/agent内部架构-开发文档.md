@@ -7,6 +7,7 @@
 | 哲学来源 | DeepSeek-Harness 的「everything-is-a-plugin ⇒ Cordis」——**slim 重实现**，只借骨架不搬产品（§1） |
 | 关联文档 | 《agent记忆架构-方案.md》（记忆子系统设计与落点）·《记忆插件-能力缺口分析.md》（记忆现状待办）·《agent通用能力-完善路线.md》（通用能力待办与优先级）·《ReAct插件-设计方案.md》（多步循环设计，§2 A1 的落地）· `README.md`（运行入口与现状摘要）· `doc/`（历史归档：领域与接口设计，**不作工作参考**） |
 | 编制日期 | 2026-09-22（v1.0）／**2026-09-24（v2.0：由领域施工文档改写为通用型 agent 开发文档）** |
+| 更新记录 | 2026-10-14 01:50（GMT+8）：登记 Skill 插件系统归位——技能模块（`Skill`/`SkillsCatalog`/loader）与只读 MCP 适配器从 `agent/core`、`agent/run` 迁入 `plugins/skills`（`model`/`catalog`/`loader`/`adapter` 四子模块，适配器与目录同包以包内相对导入；桥 `plugins/skills_mcp` 只经 spawn 路径字符串引用）；`agent.api` 不再导出任何技能符号。依据：本文档 §三层容器语义（`core/` 零业务词，业务词只允许出现在 `plugins/` 业务插件、`fixtures/` 与领域文档；`plugins.memory` 即 system 层住插件层的先例）。同期 `test_agent_purity` 业务词表按同形异义先例（`order`）将 `skill` 登记出表（词表里的 skill 指选品域策略技能，与 Skill 插件系统非同一概念；电商域词「技能库」保留）。 |
 
 > **v2.0 变更说明**：v1.0 是面向特定领域的施工文档（含技能库 / 评分管线 / 领域数据表 / 引擎桥）。v2.0 移除全部领域与引擎专用内容，改为**如实描述当前通用 agent 实现**：内核 + 系统插件 + 两个 driver（loop / chat）+ 可管理的目录插件 + MCP 工具桥 + 记忆子系统。领域内容（如选品策略）落在各自的领域文档中，不进入本卷。
 
@@ -71,6 +72,8 @@ agent/                            ← agent 运行时（slim Cordis 重实现，
 ├─ plugins/              目录插件（来源 = 目录 ⇒ 可启停卸；layer 只是语义标签）
 │  ├─ memory/       plugins.memory       记忆子系统（layer=system，默认启用）
 │  ├─ react/        plugins.react        ReAct 多步工具循环（layer=system，默认启用；prompt/components/loop 三子模块）
+│  ├─ skills/       plugins.skills       技能目录（layer=system；model/catalog/loader/adapter 四子模块）
+│  ├─ skills_mcp/   plugins.skills_mcp   只读技能 MCP 桥（layer=business，默认未启用）
 │  └─ windows_mcp/  plugins.windows_mcp  windows-mcp 工具桥（layer=business，默认启用）
 ├─ fixtures/llm.py       离线确定性 LLM 夹具（零触网；chat/memory/react 五标记路由）
 ├─ run/chat.py           入口：网页 harness / 无头 `--once`（§9.2）
@@ -162,6 +165,8 @@ class XxxSubsystem:
 | **guard** | `guard` | system | 内置系统 | 权限网关：capability 裁决 + 矩阵 + durable 审计（§4.4） |
 | **plugins.memory** | `memory` | system | 目录插件 | 记忆子系统（LLM 提取 + 打分衰减 + recall/context 注入） |
 | **plugins.react** | `react` | system | 目录插件 | ReAct 多步工具循环（Think→Act+Observe→收敛 + 三把闸 + 四组件接缝）（§5.3） |
+| **plugins.skills** | `skills` | system | 目录插件 | 技能目录（`model`/`catalog`/`loader`/`adapter` 四子模块；react 经 `ctx.get(Services.SKILLS)` 反向读取） |
+| **plugins.skills_mcp** | `skills_mcp` | business | 目录插件 | 只读技能 MCP 桥（spawn `plugins/skills/adapter.py` 子进程 ⇒ `mcp.skills.*` 工具） |
 | **plugins.windows_mcp** | `windows_mcp` | business | 目录插件 | windows-mcp-server 工具桥（MCP stdio → agent 工具目录） |
 
 > **装配分组 ≠ layer**：`loop` 的 layer 是 `system` 却在「内置业务」分组；`chat` 是 `business` 也在该分组。分组只表达「随 `build_agent` 恒定装配」，与语义层无关（§0.3）。
@@ -325,8 +330,8 @@ ctx.react.run(ctx, prompt, *, session_id="default", prior=None) -> ReactResult
   `delta = "system/builtin"` ⇒ 内置插件，不给操作；目录插件（discovered）的 delta 是
   `enabled · assembled / enabled · 待重启装配 / disabled · 未装配 / 待停用` ⇒ **一律给「启用 / 停用 / 移除」按钮**。
 - 因此 **`layer` 不参与可管理性判定**：目录插件无论 `layer=system` 还是 `business`，都可启停卸。这正是 §0.3「两个正交的轴」的落地方式。
-- 现状：`plugins.memory`（记忆）、`plugins.react`（ReAct 多步循环）与 `plugins.windows_mcp`（工具桥）均为目录插件，默认启用（见 `data/agent_plugin_state.json`）。
-- **插件包**：以 `__init__.py` 为入口的插件是**包**，可含子模块并用包内相对导入（`from .loop import …`）——加载器按包加载（`submodule_search_locations` + 命名空间父包 `agent_plugins`）。`plugins.react` 即四文件形态（`prompt/components/loop/__init__`）。
+- 现状：`plugins.memory`（记忆）、`plugins.react`（ReAct 多步循环）、`plugins.skills`（技能目录）与 `plugins.windows_mcp`（工具桥）均为目录插件，默认启用（见 `data/agent_plugin_state.json`）；`plugins.skills_mcp`（只读技能 MCP 桥）默认未启用。
+- **插件包**：以 `__init__.py` 为入口的插件是**包**，可含子模块并用包内相对导入（`from .loop import …`）——加载器按包加载（`submodule_search_locations` + 命名空间父包 `agent_plugins`）。`plugins.react` 即四文件形态（`prompt/components/loop/__init__`）；`plugins.skills` 同理为 `model/catalog/loader/adapter` 四子模块（技能 MCP 适配器与目录同包 ⇒ 包内相对导入；桥只经 spawn 路径字符串引用它——**插件间禁止横向 import**，见 `test_plugin_decoupling`）。
 
 ---
 

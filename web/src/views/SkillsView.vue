@@ -34,11 +34,11 @@
     <div ref="host" v-html="html" @click="onClick"></div>
 
     <!-- 查看弹窗 -->
-    <div v-if="viewing" class="modal-mask" @click.self="viewing = false">
+    <div v-if="viewing" class="modal-mask" @click.self="viewing = null">
       <div class="modal">
         <div class="modal-head">
           <b>{{ viewing.name }}</b>
-          <button class="chip" @click="viewing = false">关闭</button>
+          <button class="chip" @click="viewing = null">关闭</button>
         </div>
         <div class="modal-body">
           <div class="muted" style="margin-bottom:6px">{{ viewing.description }}</div>

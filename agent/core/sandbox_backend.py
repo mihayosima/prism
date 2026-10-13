@@ -176,7 +176,7 @@ class SpawnOptions:
     #: inner 命令前缀（如 bwrap 一整串），与原命令拼接后作为外层最后一个参数。
     wrap_inner: str = ""
     #: 命令翻译表（**可序列化的数据**，交给 ``apply_wrap`` 执行）：
-    #: ``[{"match_args": ["-m", "agent.run.skills_mcp_adapter"], "exe": "python3"}]``
+    #: ``[{"match_args": ["-m", "agent.plugins.skills.adapter"], "exe": "python3"}]``
     #: —— Windows 侧的可执行文件在 WSL/容器内不存在，必须换成目标环境里的命令。
     translations: tuple[dict, ...] = ()
     #: ★ P5：容器内**路径映射** ``[[宿主要替换前缀, 容器内前缀], ...]``。
@@ -304,8 +304,10 @@ WIN_TOKEN_VERDICT = (
 
 #: Windows 侧可执行文件在 WSL 内不存在 ⇒ 必须翻译成目标环境里的命令。
 #: 这是**数据**（可随 ``SpawnOptions`` 过接缝），翻译动作由 ``apply_wrap`` 执行。
+#: ★ 2026-10-14：技能 MCP 适配器已归位 ``plugins/skills_mcp/adapter.py``（此前在
+#: ``agent.run``）——翻译表跟着模块路径走，桥的 spawn 命令（``-m`` 模块名）不变。
 _WSL2_TRANSLATIONS: tuple[dict, ...] = (
-    {"match_args": ["-m", "agent.run.skills_mcp_adapter"], "exe": "python3"},
+    {"match_args": ["-m", "agent.plugins.skills.adapter"], "exe": "python3"},
 )
 
 #: 探测结果缓存（``wsl -l -v`` 有秒级开销，不每次 spawn 都跑）。

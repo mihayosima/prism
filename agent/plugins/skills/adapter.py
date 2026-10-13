@@ -1,23 +1,29 @@
-"""agent.run.skills_mcp_adapter —— 只读技能 MCP 服务器（stdlib stdio JSON-RPC）。
+"""agent.plugins.skills.adapter —— 只读技能 MCP 服务器（stdlib stdio JSON-RPC）。
 
 把本仓 ``Services.SKILLS`` 的技能目录以 MCP 工具形式对外暴露，供子 agent / 外部 MCP
 客户端消费。设计要点（均经真实代码核实）：
 
 - **只读**：仅暴露 ``skill_list`` / ``skill_view`` 两个读工具，不提供任何写/执行动作。
-  执行能力由内核的 ``Skill.run`` 承担，**不经**本适配器。
+  执行能力由技能自带的 ``Skill.run`` 承担，**不经**本适配器。
 - **零第三方依赖**：``core/mcp_client.py`` 是 stdlib 的 JSON-RPC stdio 客户端，本模块是
   它的**对端**——同样用 stdlib 手写服务端。实测本机 ``fastmcp`` / ``mcp`` 均未安装且无 uv，
   故不走框架路线（方案 §7-5 的「手写 stdio 桥」选项）。
-- **子进程无 ctx**：以 ``python -m agent.run.skills_mcp_adapter`` 独立进程运行，拿不到
-  ``ctx``；改为从环境变量 ``SKILLS_DATA_DIR`` 取数据目录，用 ``load_from_disk()`` 从磁盘
-  **重建**目录——与内核读同一份 ``<data_dir>/skills/*.md``，口径一致（参照
-  ``plugins/skills/_resolve_data_dir``：数据目录 = ``db_path`` 的父目录）。
-- **零耦合**：经 ``agent.api`` 取 ``SkillsCatalog``（api 不得反向依赖 sys，故技能目录落在
-  core 并由 api 导出）；不 import ``sys.tasks`` / ``plugins.react``
-  （由 ``test_services_contract`` 的 AST 守卫）。
+- **子进程无 ctx**：以 ``python -m agent.plugins.skills.adapter`` 独立进程运行，
+  拿不到 ``ctx``；改为从环境变量 ``SKILLS_DATA_DIR`` 取数据目录，用 ``load_from_disk()``
+  从磁盘**重建**目录——与内核读同一份 ``<data_dir>/skills/*.md``，口径一致（参照
+  ``plugins/skills._resolve_data_dir``：数据目录 = ``db_path`` 的父目录）。
+- **零耦合**：经**包内相对导入**取 ``SkillsCatalog``；不 import ``sys.tasks`` /
+  ``plugins.react``（由 ``test_services_contract`` 的 AST 守卫）。
 
-线协议（与 ``core/mcp_client.py`` 严格对齐）：换行分隔的 JSON-RPC 2.0，
-``initialize`` → ``notifications/initialized`` → ``tools/list`` → ``tools/call``。
+★ 2026-10-14 两连迁，终局落在本包：
+  ① 从 ``agent/run`` 先迁 ``plugins/skills_mcp``——随即被 ``test_plugin_decoupling``
+     的**插件横向耦合**守卫拦下（``plugins.skills_mcp.adapter → plugins.skills.catalog``
+     是跨包 import，插件间禁止横向依赖）；
+  ② 改迁本包（``plugins/skills/adapter.py``）——适配器消费技能目录，与目录同包 ⇒
+     intra-package 相对导入合法；``plugins/skills_mcp`` 桥只经 **spawn 路径字符串**
+     （``-m agent.plugins.skills.adapter``）引用它，字符串不是 import，不构成耦合。
+  根因回顾：适配器栖身 run/ 本是为了 import ``agent.api`` 导出的 SkillsCatalog
+  （该类当年被误沉 core）——放置错误引发迁移，归位后 api 不再导出任何技能符号。
 """
 
 from __future__ import annotations
@@ -29,9 +35,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from agent.api import SkillsCatalog
+from .catalog import SkillsCatalog
 
-logger = logging.getLogger("agent.run.skills_mcp_adapter")
+logger = logging.getLogger("agent.plugins.skills.adapter")
 
 #: 与 ``core/mcp_client.py`` 的 ``_MCP_VERSION`` 一致。
 _PROTOCOL = "2024-11-05"
@@ -59,8 +65,8 @@ def _build_catalog() -> SkillsCatalog:
 def _slim_card(row: dict) -> dict:
     """把 ``catalog()`` 的卡片压成索引条目：**剔除 content**（正文由 skill_view 给）。
 
-    ``SkillsCatalog._card`` 实际含 ``content``（见 ``sys/skills.py``），若直接透传，
-    一次 ``skill_list`` 就把全部技能正文灌进上下文——正是要避免的 token 膨胀。
+    ``SkillsCatalog._card`` 实际含 ``content``，若直接透传，一次 ``skill_list``
+    就把全部技能正文灌进上下文——正是要避免的 token 膨胀。
     """
     return {"name": row.get("name"), "description": row.get("description"),
             "risk": row.get("risk"), "source": row.get("source"),

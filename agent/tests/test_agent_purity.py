@@ -11,12 +11,23 @@ AGENT_PKG = Path(__file__).resolve().parent.parent          # agent/
 CORE = AGENT_PKG / "core"
 
 # 业务词清单（来自业务文档词表）：出现在内核树即判污染
+# ★ 2026-10-14：「skill」已移出本表——**同形异义**（先例见下 ``test_core_business_terms_are_domain_neutral``
+#   对 ``order`` 的处理：`_Listener.order` 是"执行序"不是"订单"，加入前必须确认内核用法无歧义）。
+#   词表里的 skill 指**选品域的策略技能**（`docs/archive/选品策略技能库-设计.md`：
+#   ``skills/`` = 20 条选品策略 YAML、``agent/skills`` = 策略注册表、``run_skill`` →
+#   评分/排榜），与 Skill 插件系统**不是同一概念**——后者是 harness 自身的扩展机制
+#   （skill.md 指令包 + 元工具/lazy 注入），按设计文档三层语义属插件层设施
+#   （`plugins/skills`；`plugins.memory` 即 system 层住插件层的先例）。
+#   2026-10-14 已把误沉 core 的技能模块归位 plugins/skills；内核残留的 ``skill``
+#   字样仅剩 DI 注册键（``Services.SKILLS="skills.catalog"``）、config 节名、沙箱
+#   桥 id 等**接线名**——拦这些等于拦服务注册表，违背本表「防选品域倒灌」的本意。
+#   电商域业务词「技能库」**保留**（选品域概念，archive 文档在案）。
 BUSINESS_TERMS = [
     "选品", "策略", "候选", "评分", "排榜", "短名单", "技能库", "爆款",
     "互补", "替代", "升级", "消耗", "季节", "场景", "潮流", "科技", "健康",
     "美学", "社交", "情绪", "痛点", "家居", "儿童", "效率", "户外",
     "substitution", "complementary", "upgrade", "consumable",
-    "bestseller", "sku", "tiktok", "product_id", "picks", "skill",
+    "bestseller", "sku", "tiktok", "product_id", "picks",
 ]
 
 
@@ -50,14 +61,35 @@ def test_core_never_imports_sys_or_plugins():
     """K0 分层守卫：内核（core + 唯一出口 api）不得反向依赖 sys / plugins。
 
     解耦的硬约束——内核是纯机制，不得获知业务/系统插件的具体实现位置。
+
+    ★ 2026-10-14：改用 **AST 只匹配真实 import 语句**（原为裸子串匹配）。
+    api.py 的 docstring 里有「api 不得 import agent.sys」这句**规则自述**，
+    子串匹配把说明文误判为违规（假阳性，本守卫曾因此红）——文档里写规则
+    ≠ 违反规则，本 guard 要拦的是真 import。顺带补强：``from agent import sys``
+    这种旧写法漏拦的真违规，AST 版能拦到。
     """
-    bad: list[tuple[str, str]] = []
+    import ast
+
+    banned = ("agent.sys", "agent.plugins")
+    bad: list[tuple[str, int]] = []
     for fp in _core_py_files():
-        text = fp.read_text(encoding="utf-8")
-        for pat in ("from agent.sys", "from agent.plugins",
-                    "import agent.sys", "import agent.plugins"):
-            if pat in text:
-                bad.append((fp.name, pat))
+        src = fp.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:                        # pragma: no cover
+            continue
+        for node in ast.walk(tree):
+            targets: list[str] = []
+            if isinstance(node, ast.Import):
+                targets = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                targets = [node.module]
+                if node.module == "agent":
+                    # from agent import sys / plugins —— 旧子串写法漏拦的真违规形态
+                    targets += [f"agent.{a.name}" for a in node.names]
+            for mod in targets:
+                if any(mod == b or mod.startswith(b + ".") for b in banned):
+                    bad.append((fp.name, getattr(node, "lineno", 0)))
     assert not bad, f"内核反向依赖 sys/plugins: {bad}"
 
 

@@ -1,7 +1,12 @@
-"""agent.api.skills —— 技能管理面 HTTP 路由（增 / 删 / 查 / 改 / 启停）。
+"""agent.run.skills_routes —— 技能管理面 HTTP 路由（增 / 删 / 查 / 改 / 启停）。
 
 与运行时加载路径同一套解耦范式：路由经 ``c.root.get(Services.SKILLS)`` **反向读取**
 ``SkillsCatalog``，**不 import skills 插件**；未装配 ⇒ 返回 enabled=False。
+
+★ 2026-10-14 归位后本模块**不再 import 任何技能类/loader 函数**：Skill 插件系统已从
+core 迁入 ``plugins/skills``，api 不再导出技能符号，而 run/ 层只准 import ``agent.api``
+⇒ 写操作全部改经目录自身的管理面 API（``add_fields`` / ``persist`` / ``reload_from_disk``），
+HTTP 行为与错误码保持不变。
 
 写入操作（POST/PUT/DELETE）受权限档软约束（deny 模式拒写）；后期可升级为硬闸门。
 持久化：add/remove 写 ``data/skills/<name>.md``（reload 从盘重读），启停改
@@ -10,10 +15,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from agent.api import (AgentError, ServiceConflictError, Services, Skill,
-                       parse_skill_file, write_skill_file)
+from agent.api import AgentError, ServiceConflictError, Services
 
 
 def _valid_name(name: str) -> bool:
@@ -74,16 +76,16 @@ def register_skills_routes(app, deps) -> None:
         if isinstance(tags, str):
             tags = [t.strip() for t in tags.split(",") if t.strip()]
         persist = bool(body.get("persist", True))
-        s = Skill(name=name, description=description, content=content, risk=risk,
-                  tags=list(tags), owner="admin", source="file")
         try:
-            cat.add(s, persist=persist)
+            card = cat.add_fields(name=name, description=description,
+                                  content=content, risk=risk, tags=list(tags),
+                                  owner="admin", source="file", persist=persist)
         except ServiceConflictError:
             return JSONResponse({"error": f"技能 {name!r} 已存在（同名冲突）"},
                                 status_code=409)
         except AgentError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        return JSONResponse({"ok": True, "skill": cat._card(s)}, status_code=201)
+        return JSONResponse({"ok": True, "skill": card}, status_code=201)
 
     @app.put("/api/skills/{name}")
     async def _update_skill(name: str, body: dict):
@@ -109,7 +111,7 @@ def register_skills_routes(app, deps) -> None:
         persist = bool(body.get("persist", True))
         if persist and s.source == "file" and any(
                 k in body for k in ("description", "content", "risk", "tags")):
-            write_skill_file(cat._data_dir, s)
+            cat.persist(s)
         if "enabled" in body:
             try:
                 cat.set_enabled(name, bool(body["enabled"]), persist=persist)
@@ -143,15 +145,10 @@ def register_skills_routes(app, deps) -> None:
             return JSONResponse({"error": f"未找到技能 {name!r}"}, status_code=404)
         if s.source != "file":
             return JSONResponse({"error": "仅文件型技能支持 reload"}, status_code=400)
-        safe = name.replace("/", "_").replace("\\", "_")
-        p = Path(cat._data_dir) / "skills" / f"{safe}.md"
-        if not p.exists():
-            return JSONResponse({"error": f"文件不存在：{p}"}, status_code=404)
         try:
-            ns = parse_skill_file(p)
-            ns.enabled = name not in cat._disabled
-            cat.unregister(name)
-            cat.register(ns)
+            ns = cat.reload_from_disk(name)
+        except FileNotFoundError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
         except Exception as exc:                     # noqa: BLE001
             return JSONResponse({"error": f"重载失败：{exc}"}, status_code=400)
         return JSONResponse({"ok": True, "skill": cat._card(ns)})

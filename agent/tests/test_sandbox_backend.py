@@ -199,7 +199,7 @@ def test_seam_contract_single_arg_callable():
 # --------------------------------------------------------------------------- #
 
 _WSL_OK = {"available": True, "reason": "注入：wsl2 可用", "distro": "Ubuntu"}
-_SKILLS_ARGS = ["-m", "agent.run.skills_mcp_adapter"]
+_SKILLS_ARGS = ["-m", "agent.plugins.skills.adapter"]
 
 
 def _wsl_opts(mode: str = "workspace-write", network: str = "deny",
@@ -270,7 +270,7 @@ def test_apply_wrap_hits_translation():
     assert applied is True
     assert cmd == "wsl.exe"
     inner = args[-1]
-    assert "python3 -m agent.run.skills_mcp_adapter" in inner    # 已翻译成 WSL 内命令
+    assert "python3 -m agent.plugins.skills.adapter" in inner    # 已翻译成 WSL 内命令
     assert "SKILLS_DATA_DIR=/mnt/c/repo/data/skills" in inner    # env 进 inner
     assert "bwrap --ro-bind" in inner                            # 隔离器在前（env 赋值在其**之前**）
 
@@ -441,12 +441,12 @@ def test_apply_wrap_argv_mode_order():
     """
     d = _docker_opts()
     cmd, args, _env, _cwd, applied = apply_wrap(
-        "python.exe", ["-m", "agent.run.skills_mcp_adapter"],
+        "python.exe", ["-m", "agent.plugins.skills.adapter"],
         {"SKILLS_DATA_DIR": os.path.join(os.getcwd(), "data")},
         os.path.join(os.getcwd(), "data", "sandbox", "s1"), d["wrap"])
     assert applied is True and cmd == "docker"
     seq = args
-    assert "python3" in seq and seq[-2:] == ["-m", "agent.run.skills_mcp_adapter"]
+    assert "python3" in seq and seq[-2:] == ["-m", "agent.plugins.skills.adapter"]
     img = seq.index("python:3.12-alpine")
     assert seq.index("-e") < img < seq.index("python3"), \
         f"顺序错误（-e 应在 image 前、命令应在 image 后）: {seq}"

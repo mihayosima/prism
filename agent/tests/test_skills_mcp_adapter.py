@@ -12,11 +12,13 @@ import json
 
 import pytest
 
-from agent.api import Services, SkillsCatalog, parse_skill_file
+from agent.api import Services
 from agent.core.config_schema import _SCHEMA
-from agent.core.skill import Skill, skill
+from agent.plugins.skills.catalog import SkillsCatalog
+from agent.plugins.skills.loader import parse_skill_file
+from agent.plugins.skills.model import Skill, skill
 from agent.plugins.skills_mcp import SkillsMcp
-from agent.run.skills_mcp_adapter import _dispatch, _tools
+from agent.plugins.skills.adapter import _dispatch, _tools
 
 
 def _write_skill(tmp_path, stem: str, description: str, body: str) -> str:

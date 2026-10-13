@@ -38,6 +38,8 @@ import type {
   SettingsPatchRequest,
   SettingsResponse,
   SettingsScope,
+  SkillRow,
+  SkillsResponse,
 } from './types'
 
 // ---------- 状态 / 会话 ----------

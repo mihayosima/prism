@@ -1,7 +1,10 @@
-"""agent.core.skills_loader —— 文件型技能发现与持久化（data/skills/*.md）。
+"""agent.plugins.skills.loader —— 文件型技能发现与持久化（data/skills/*.md）。
 
 frontmatter 为极简 YAML（``key: value`` + ``tags: [a, b]``），避免引入 PyYAML 依赖。
 仅扫描 ``data/skills/``（用户决策：不过度扫各插件子目录，省启动耗时）。
+
+★ 2026-10-14 归位：随 Skill 插件系统从 ``agent/core`` 移入 ``plugins/skills``
+（设计文档三层语义：业务词只允许出现在插件层；归位论证见 ``model.py`` docstring）。
 """
 
 from __future__ import annotations
@@ -10,7 +13,7 @@ import json
 import logging
 from pathlib import Path
 
-from agent.core.skill import Skill
+from .model import Skill
 
 logger = logging.getLogger(__name__)
 

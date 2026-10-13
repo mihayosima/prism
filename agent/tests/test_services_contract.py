@@ -164,7 +164,7 @@ def test_every_service_constant_has_provider():
 
 # ---- 技能 MCP 适配器（只读对外暴露）零耦合守卫 ----
 
-_ADAPTER = AGENT / "run" / "skills_mcp_adapter.py"
+_ADAPTER = AGENT / "plugins" / "skills" / "adapter.py"
 _SKILLS_MCP_BRIDGE = AGENT / "plugins" / "skills_mcp" / "__init__.py"
 
 
@@ -174,6 +174,11 @@ def test_skills_mcp_adapter_import_purity():
     适配器是**独立子进程**，只应从磁盘重建技能目录；一旦 import ``sys.tasks`` 或
     ``plugins.react``，就会把技能与工具两个子系统焊死——正是当初绕开
     ``register_meta_tool``、改走 ``Services.SKILLS`` 反向读取要杜绝的事。
+
+    ★ 2026-10-14 归位：适配器从 ``agent/run`` 迁入 ``plugins/skills`` 包内
+    （与技能目录同包 ⇒ 包内相对导入 ``.catalog``，不构成插件横向耦合；
+    桥 ``plugins/skills_mcp`` 只经 spawn 路径字符串引用它）。技能系统内部
+    相依是设计意图，不在禁限；禁的始终是**跨子系统**（工具表 / 反应器）直连。
     """
     if not _ADAPTER.exists():
         return
@@ -188,12 +193,16 @@ def test_skills_mcp_bridge_import_purity():
 
     桥的职责是「起子进程 + 注册工具」，与 ``playwright_mcp`` / ``windows_mcp`` 同形态；
     它不该知道技能目录怎么建、工具表怎么管。
+
+    ★ 2026-10-14 归位：技能目录已从 core 迁回 ``plugins/skills``（api 不再导出技能类）。
+    桥与技能子系统只经 **spawn 路径**（``-m agent.plugins.skills.adapter``）相遇，
+    import 侧依旧零直连——禁限随归位更新：``agent.core.skills`` 已不存在，
+    ``agent.plugins.skills`` 仍在禁限（桥不该 import 目录实现）。
     """
     if not _SKILLS_MCP_BRIDGE.exists():
         return
-    # 技能目录已下沉到 core，故禁的是「绕过 api 直连 core」：桥应只 import agent.api。
-    banned_prefixes = ("agent.sys.tasks", "agent.core.skills",
-                       "agent.plugins.react", "agent.plugins.skills")
+    banned_prefixes = ("agent.sys.tasks", "agent.plugins.react",
+                       "agent.plugins.skills")
     mods = _module_imports(_SKILLS_MCP_BRIDGE)
     # 排除自身包路径（agent.plugins.skills_mcp 不是 agent.plugins.skills）
     bad = sorted(m for m in mods

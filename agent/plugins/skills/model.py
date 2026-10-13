@@ -1,10 +1,14 @@
-"""agent.core.skill —— Skill 数据模型（内核层，零业务词、不 import agent.api）。
+"""agent.plugins.skills.model —— Skill 数据模型（技能插件层）。
 
 Skill = 一份「遇到 X 类任务时按 Y 步骤做」的说明（``content``，给模型看）+ 可选代码
-入口（``run``，给编排器调）。与 tool/MCP 正交互补：skill 描述「怎么做」，tool 提供
+入口（``run``，给编排器调）。与 tool/MCP 正交分工：skill 描述「怎么做」，tool 提供
 「能做的具体动作」。
 
-零业务词（test_agent_purity 守卫）。
+★ 2026-10-14 归位：本模块随 Skill 插件系统从 ``agent/core`` 移入 ``plugins/skills``。
+设计文档三层语义——``core/`` 零业务词，业务词只允许出现在 ``plugins/`` 业务插件、
+``fixtures/`` 与领域文档（``plugins.memory`` 即 system 层组件住插件层的先例）。
+此前的反向推理（"适配器子进程要构造 ⇒ 只能落 core"）让内核迁就了特性，已纠正：
+适配器随桥驻插件层（``plugins/skills_mcp/adapter.py``），不再需要 api 导出本类。
 """
 
 from __future__ import annotations

@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import pytest
 
-from agent.api import (ServiceConflictError, Services, SkillsCatalog, StateKeys,
-                       delete_skill_file, discover_skills, load_state,
-                       parse_skill_file, save_state, write_skill_file)
-from agent.core.skill import Skill, skill
-from agent.core.skills_loader import _state_path
+from agent.api import ServiceConflictError, Services, StateKeys
 from agent.plugins.react.loop import ReactLoop, TaskContext
+from agent.plugins.skills.catalog import SkillsCatalog
+from agent.plugins.skills.loader import (_state_path, delete_skill_file,
+                                         discover_skills, load_state,
+                                         parse_skill_file, save_state,
+                                         write_skill_file)
+from agent.plugins.skills.model import Skill, skill
 
 
 # ---- 最小假 ctx（仅用于 _tools_for_step 的 get(Services.SKILLS) 探测） ----

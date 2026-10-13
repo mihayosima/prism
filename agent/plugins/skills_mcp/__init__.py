@@ -1,7 +1,7 @@
 """插件包：skills_mcp —— 只读技能 MCP 桥（把本仓技能目录以 MCP 工具对外暴露）。
 
-与 ``playwright_mcp`` / ``windows_mcp`` **同形态**：起一个 stdio 子进程（本仓自家的
-``agent.run.skills_mcp_adapter``），把它的工具注册进 agent 工具目录，供 chat tool_call 调用。
+与 ``playwright_mcp`` / ``windows_mcp`` **同形态**：起一个 stdio 子进程（技能目录自带的
+``agent.plugins.skills.adapter``），把它的工具注册进 agent 工具目录，供 chat tool_call 调用。
 
 - **只读**：对端只暴露 ``skill_list`` / ``skill_view``，无任何写/执行动作（执行仍由内核
   ``Skill.run`` 承担）。
@@ -32,14 +32,18 @@ logger = logging.getLogger("agent.plugins.skills_mcp")
 _BRIDGE = "skills_mcp"
 
 #: ★ P3（2026-10-13）：本适配器里**确属只读**的工具名。
-#: 依据：``run/skills_mcp_adapter.py`` 的两个工具只读 ``data/skills`` 后返回文本
+#: 依据：``plugins/skills/adapter.py`` 的两个工具只读 ``data/skills`` 后返回文本
 #（``skill_list`` 列卡片、``skill_view`` 读正文），**无任何写/执行副作用**。
 #: 未列入本集合的工具一律沿用 ``risk="write"``（保守：不因猜错而放行危险工具）。
 #: ⚠️ 后续 Follow 三件套（skill_bash/file_create/str_replace）**绝不可**加进这里。
 _READ_ONLY_TOOLS = frozenset({"skill_list", "skill_view"})
 
 #: 适配器模块（以 ``python -m`` 方式拉起，无需额外安装任何依赖）。
-_ADAPTER_MODULE = "agent.run.skills_mcp_adapter"
+#: ★ 2026-10-14 归位：适配器从 ``agent.run`` 迁入 **``plugins/skills`` 包内**
+#: （``plugins/skills/adapter.py``）——它消费技能目录，与目录同包才能用包内相对导入；
+#: 插件间禁止横向 import（test_plugin_decoupling 守卫），故不能放本包再 import
+#: skills 包。本桥只经这行 **spawn 路径字符串**引用它：字符串不是 import，不构成耦合。
+_ADAPTER_MODULE = "agent.plugins.skills.adapter"
 
 
 def _on_stderr(text: str) -> None:

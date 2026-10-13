@@ -4,6 +4,8 @@
 - 文件型技能从 ``<data_dir>/skills/*.md`` 发现（仅此一处，不过度扫描）。
 - 本插件**不 import react**，react 也**不 import 本插件**——纯经 Service 契约相遇。
 - 停用后 ``ctx.has(Services.SKILLS)`` 为 False，react 回落「无技能」分支，零劣化。
+- ★ 2026-10-14 归位：``SkillsCatalog`` 实现随本包驻留插件层（``.catalog`` 子模块），
+  不再经 ``agent.api`` 导出——api 是内核出口，导出技能类等于让内核知道业务特性。
 """
 
 from __future__ import annotations
@@ -11,7 +13,9 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from agent.api import DEFAULT_DB_PATH, Services, SkillsCatalog, plugin
+from agent.api import DEFAULT_DB_PATH, Services, plugin
+
+from .catalog import SkillsCatalog
 
 logger = logging.getLogger(__name__)
 
