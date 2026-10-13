@@ -40,6 +40,9 @@ _diag_mcp/*.json
 _diag_mcp/*.log
 _diag_mcp/*.txt
 
+# 可行性原型（spike）：验证完即弃，不并入主码
+_spike/
+
 # temp patch scripts
 patch_remove_windowing.py
 patch_remove_windowing2.py

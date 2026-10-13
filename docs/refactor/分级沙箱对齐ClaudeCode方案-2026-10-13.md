@@ -1,7 +1,7 @@
-# 分级沙箱对齐 Claude Code 方案（设计稿 v1.3 · P0/P2/P3 已实施）
+# 分级沙箱对齐 Claude Code 方案（设计稿 v1.4 · P1 spike 已实测，win-token 出局）
 
 编制时间：2026-10-13 21:58（GMT+8）
-适用范围：Agent Harness / Prism 沙箱组件重构
+适用范围：Agent Harness /  Prism 沙箱组件重构
 更新记录：
 
 | 版本 | 时间 | 变更摘要 |
@@ -10,6 +10,7 @@
 | v1.1 | 2026-10-13 22:40 | 用户裁定：① 新增「非沙箱 off」为一等档位，进程级运行时不满足时 Sandbox Runtime 默认 off（优雅降级不报错）；② 网络隔离（代理式域名白名单）纳入本轮，补 `network` 策略轴与每 backend 诚实能力/gap |
 | v1.2 | 2026-10-13 22:47 | 用户确认 WSL2 已修复（runtime 可用；开发侧 Bash 工具仍黑名单 wsl.exe）；进程级在 Windows 显式拆为 win-token 与 wsl2 两个 backend，`auto` 优先级 wsl2→win-token→off；5 档部署模型落地 |
 | v1.3 | 2026-10-13 23:20 | **代码复核 + 首批实施**：修正 §4 接缝契约冲突（真实形状 `(session_key)->dict`、桥只读 cwd/env）；P0/P2/P3 完成并回归绿（118 项）；裁定 strict=false、P1 spike 允许；新增 §11.7「strict ≠ 拒绝 spawn」诚实边界 |
+| **v1.4** | **2026-10-13 23:50** | **★ P1 spike 实测，推翻两个核心假设**：① **win-token 出局**——非管理员下 `CreateRestrictedToken` 能成功，但**任何 restricting SID 都会让子进程 `0xC0000142` 起不来**（矩阵诊断 6 配置），绕过需放宽系统目录 ACE=安全倒退 ⇒ 标记不可用；② **Docker 已在本机可用**（Desktop 29.4.0，容器运行）+ **WSL2 进程级全套可用**（bwrap/Landlock/netns 实测，`--unshare-net` 真断网）⇒ container/wsl2 从"仅代码预留"升为"本机可部署"。新增 §6.8「目标可移植性约束」（windows_mcp 进不了 WSL/容器）；auto 优先级改 **wsl2→container→off** |
 
 ---
 
@@ -19,17 +20,19 @@
 
 Claude Code（以下简称 CC）把隔离分成三档（已联网核实官方文档 `code.claude.com/docs/en/sandbox-environments`），外加一个**非沙箱（off）** 基准态：
 
-| 部署 backend（用户视角的"档"） | CC 概念档 | 机制 | 本机可部署？ |
+| 部署 backend（用户视角的"档"） | CC 概念档 | 机制 | **本机实测状态（2026-10-13 23:50）** |
 | --- | --- | --- | --- |
 | **off（非沙箱，基准态）** | off | 无隔离，等同直接跑（CC `dangerously-disable` 日常态） | ✅ 现状，一等档位 |
-| **win-token（Windows 受限令牌）** | 进程级 | 受限令牌 + DACL 限写，仅文件/进程维度，`partial` | ✅ 待 P1 spike 验证非管理员可用性 |
-| **wsl2（WSL2 内 Linux 进程级）** | 进程级 | WSL2 内 `bwrap`+`seccomp`+Landlock + 网络代理（最接近 CC Sandbox Runtime） | ✅ **2026-10-13 用户确认 WSL2 已修复**，runtime 可用；开发侧 Bash 工具仍黑名单 wsl.exe，WSL2 backend 须 Python 级（runtime/subprocess）验证 |
-| **container（Docker 容器级）** | 容器级 | Docker 加固（`--network none`+seccomp+只读+非 root）+ 代理 socket | ❌ 本机 Docker 仍起不来，仅代码+配置预留 |
+| ~~**win-token**（Windows 受限令牌）~~ | 进程级 | 受限令牌 + DACL 限写，仅文件/进程维度 | ❌ **实测不可用（出局）**：令牌能建，但加 restricting SID 后子进程必崩 `0xC0000142`；不加则毫无隔离。详见 §6.2 |
+| **wsl2（WSL2 内 Linux 进程级）** | 进程级 | WSL2 内 `bwrap`+`seccomp`+Landlock+netns（最接近 CC Sandbox Runtime） | ✅ **实测可跑**：内核 6.18、`CONFIG_SECURITY_LANDLOCK=y`、`bwrap`/`unshare`/`python3` 齐备；`--unshare-net` 实跑 **NET_BLOCKED** |
+| **container（Docker 容器级）** | 容器级 | Docker 加固（`--network none`+seccomp+只读+非 root） | ✅ **实测可跑**（推翻原判断）：Docker Desktop **29.4.0**，`docker run --rm --network none --read-only --cap-drop ALL alpine echo` ⇒ **CONTAINER_OK** |
 | **cloud（VM/云会话级）** | 云/VM 级 | `claude --cloud`/Firecracker 外部编排 | ❌ 本地无编排，仅 stub |
 
-★ **概念分组**：用户视角的 5 档里，**win-token 与 wsl2 同属 CC 的"进程级"档**——只是 Windows 上两套机制（原生令牌 vs 借 WSL2 的 Linux 原语）。`backend=auto` 在 Windows 上的探测优先级：**wsl2 → win-token → off**（wsl2 最接近 CC 完整隔离；令牌是原生轻量兜底；都不可得则 off）。二者均可被用户显式点名（`backend=wsl2` / `backend=win-token`）。
+★ **概念分组（更新）**：用户视角的档里，**win-token 与 wsl2 同属 CC 的"进程级"档**（Windows 上两套机制）。但经本轮实测，**win-token 这条路在本机走不通** ⇒ 本机进程级**只有 wsl2 一条可行路径**。
 
-本仓目标：**把 off + 这（至多）三概念档（进程/容器/云）抽象成一套统一、可扩展、解耦、诚实降级 的沙箱后端框架**，并按本机实际能力分阶段落地——**进程级在本机有两个可运行 backend：wsl2（优先，最接近 CC）与 Windows 受限令牌（原生兜底）**；容器/云档做成代码+配置+接口预留。
+★ **`auto` 探测优先级（v1.4 修订）**：**wsl2 → container → off**（进程级轻量优先，符合 CC 日常默认；容器更重但更强，供显式点名或 wsl2 不可得时承接）。原 v1.2 的 `win-token` 从链路中移除。
+
+本仓目标：**把 off + 三概念档（进程/容器/云）抽象成一套统一、可扩展、解耦、诚实降级 的沙箱后端框架**，并按本机实际能力分阶段落地——**本机真正可部署的是 wsl2（进程级）与 container（容器级）**，cloud 做成代码+配置+接口预留。
 
 ★ **用户裁定（2026-10-13）**：off 是一等档位（不是失败态）；当进程级运行时不满足（如原生 Windows 无 WSL2、或非管理员下令牌不可用）时，`Sandbox Runtime` **默认 off**（优雅降级为 none，不报错）。这对应 `backend=auto` 回落 `NullBackend` 的语义，但须把"off"与"请求了隔离却得不到"明确区分展示。
 
@@ -44,7 +47,8 @@ Claude Code（以下简称 CC）把隔离分成三档（已联网核实官方文
   - **Linux**：`bwrap`（mount/pid/network 命名空间，只读根 + 可写 bind-mount）+ `seccomp` BPF（只拦 `openat`/`openat2` 等热点 syscalls，read/write 放行，开销 3–10µs/次）；较新内核用 Landlock 做文件系统白名单。**内核不够新时 fail-closed（拒绝启动，不静默降级）**。
   - **网络**：用户态代理做域名白名单（不终止 TLS，故宽域名=潜在外泄路径，属已知限制）。
 - **模式（policy）**：`read-only` / `workspace-write` / `dangerously-disable`。
-- **★ 关键真相**：CC 的"沙箱化 Bash 工具"**不支持原生 Windows**，原生 Windows 上只用容器/VM 档。⇒ 本仓若要在 Windows 上做"进程级"，CC 在 Windows 也是借 WSL2 的 Linux 原语做进程级；据此本仓进程级在 Windows 走两条路：优先 **WSL2 内 Linux 原语**（与 CC 同构，最接近完整隔离，且能借 WSL2 netns + 代理做到接近 CC 的网络隔离），兜底 **Windows 受限令牌（partial，仅文件/进程、不含网络）**。
+- **★ 关键真相**：CC 的"沙箱化 Bash 工具"**不支持原生 Windows**，原生 Windows 上只用容器/VM 档；CC 在 Windows 上做进程级同样是**借 WSL2 的 Linux 原语**。⇒ 本仓进程级在 Windows 的正路就是 **WSL2 内 Linux 原语**（与 CC 同构）。
+  - ~~Windows 受限令牌（原生兜底，partial）~~ — **v1.4 实测出局，见 §6.2**。结论：Windows 原生进程级隔离在本机**不可兑现**，与 CC 结论一致（CC 也不支持原生 Windows 进程级）。
 
 ### 1.2 容器级
 - `docker run --cap-drop ALL --security-opt no-new-privileges --security-opt seccomp=… --read-only --tmpfs /tmp --network none --memory 2g --pids-limit 100 --user 1000:1000 -v /code:/workspace:ro -v proxy.sock:/var/run/proxy.sock`。
@@ -77,7 +81,7 @@ Claude Code（以下简称 CC）把隔离分成三档（已联网核实官方文
 ## 3. 设计原则
 
 1. **四轴正交，不压成一维阶梯**（沿用现有 `mode`/`enforcement` 思路并升级）：
-   - **state 轴 `backend`**：隔离档位/机制（`off` / `win-token` / `wsl2` / `container` / `cloud`），`auto` 默认按平台能力探测（Windows：wsl2→win-token→off）。其中 **`off` 是一等档位**（= CC 的非沙箱基准态），不是失败态。
+   - **state 轴 `backend`**：隔离档位/机制（`off` / `wsl2` / `container` / `cloud`；~~`win-token`~~ 实测出局，保留枚举值但不实现），`auto` 默认按平台能力探测（Windows：**wsl2→container→off**）。其中 **`off` 是一等档位**（= CC 的非沙箱基准态），不是失败态。
    - **file-policy 轴 `mode`**：文件系统限制到什么（`none` / `read-only` / `workspace-write`）。
    - **network-policy 轴 `network`**：网络限制（`allow` / `deny` / `proxy` 域名白名单）。**本轮纳入**。
    - **scope 轴 `targets`**：对哪些工具生效（默认 `["mcp.*"]`）。
@@ -184,26 +188,72 @@ class ConfinementBackend(Protocol):
 ### 6.1 NullBackend（现状，诚实 none）
 - `strength="none"`，`can_enforce` 恒 False。仅产出落点收拢。配置 `backend=null` 或 `auto` 探测不到可用后端时回落。
 
-### 6.2 Windows 受限令牌（**partial**，Windows 原生兜底 backend）★ 推荐首做
-- 机制：ctypes 调 `advapi32.CreateRestrictedToken`（去掉特权、加 restricting SID）⇒ `CreateProcessAsUserW` 拉起 MCP 子进程。对 `data/sandbox/<session>` 施加 DACL（`(WD)+(RC)` 成对，配方 MEMORY 已记"实测成立"）让受限令牌可写、其余受限。作为 **Windows 原生兜底**：当 wsl2 不可用时它是唯一可落地的进程级真隔离；wsl2 可用时它是轻量降级路径。
-- **强度定位 `partial`**：仅限**文件写 + 进程令牌**，**不含网络隔离**（令牌不控网络）。故 `workspace-write` + Windows 令牌仍报 `partial` + 网络 gap 可见。
-- **fail-closed**：令牌创建失败 ⇒ 拒绝该子进程 spawn，`enforced_by="backend-error"`，桥照常走"启动失败"路径报错，不静默以全特权起进程。
-- **实现难点（须 spike）**：`asyncio.create_subprocess_exec` 不支持令牌；需 ctypes 拿可继承管道句柄 + `CreateProcessAsUserW`，再把句柄接回 asyncio 读写。建议先做最小原型验证读取 stdout/stderr 不丢、子进程树能整棵杀（复用现有 `_kill_tree` 思路，令牌子进程仍可用 taskkill /T）。
-- **前置**：本机非管理员——受限令牌通常需要一定权限；需实测非管理员下 `CreateRestrictedToken` 是否可用（MEMORY 记"实测成立"但未注明是否管理员）。若非管理员不可用 ⇒ 该 backend 在本机也 fail-closed，只能等提权或走容器档。
+### 6.2 ~~Windows 受限令牌~~ —— **实测出局（P1 spike 结论，2026-10-13 23:50）**
 
-### 6.3 WSL2/Linux Landlock + seccomp + 命名空间（partial/full，**本机可运行**）★ 进程级首选
+原型：`_spike/token_spike.py` + `_spike/token_matrix.py`（**不并入主码**）。
+
+**实测结果（本机非管理员：`IsUserAnAdmin=False`、不在 Administrators 组）**：
+
+| 步骤 | 结果 |
+| --- | --- |
+| `CreateRestrictedToken`（`DISABLE_MAX_PRIVILEGE` + 2 个 restricting SID） | ✅ **成功** —— 非管理员下令牌建得出来 |
+| 构造环境块（`userenv.CreateEnvironmentBlock`）+ `CREATE_UNICODE_ENVIRONMENT` | ✅ 解决 `ERROR_INVALID_PARAMETER(87)` |
+| 给 `WinSta0`/`Desktop` 追加 Everyone+RC 的 ACE | ✅ `SetSecurityInfo` rc=0 |
+| `CreateProcessAsUserW` 拉起 `cmd.exe` / `python.exe` | ❌ 一律 **`0xC0000142` STATUS_DLL_INIT_FAILED** |
+
+**配置矩阵二分诊断（`token_matrix.py`，决定性）**：
+
+| 配置 | flags | restricting SIDs | 子进程 | 隔离是否生效 |
+| --- | --- | --- | --- | --- |
+| 1 基线 | 0 | — | rc=0 ✅ | ❌ **毫无隔离**（denied 目录照写） |
+| 2 只去特权 | `DISABLE_MAX_PRIVILEGE` | — | rc=0 ✅ | ❌ **毫无隔离** |
+| 3 | 0 | `[Everyone]` | `0xC0000142` ❌ | — |
+| 4 | 0 | `[RC]` | `0xC0000142` ❌ | — |
+| 5 | 0 | `[Everyone, RC]` | `0xC0000142` ❌ | — |
+| 6 原方案 | `DISABLE_MAX_PRIVILEGE` | `[Everyone, RC]` | `0xC0000142` ❌ | — |
+
+⇒ **根因与特权无关，是 restricting SID 机制本身**：一旦施加 restricting SID，访问检查的第二遍会要求系统 DLL / 命名对象（`\KnownDlls`、`\BaseNamedObjects` 等）的 DACL 显式允许该 SID，否则进程初始化即失败——且**换系统目录的 `cmd.exe` 也一样崩**，排除"程序本体读不到"这一解释。
+
+**为何不继续**：唯一绕过路径是给 `C:\Windows\System32` 等系统路径放宽 Everyone/RC ACE，这属于**放宽系统目录权限的安全倒退**，与沙箱目标背道而驰。不做。
+
+**处置**：`win-token` 保留为配置枚举值，`capability_probe()` 恒返回 `available=False, reason="restricted-token: 施加 restricting SID 后子进程无法初始化（0xC0000142），本机不可兑现"`（可附带指向 §6.2 的说明），显式点名时按 §3.3 fail-closed 处理。这与 CC 结论一致——**CC 也不支持原生 Windows 进程级沙箱**。
+
+**附带纠正**：此前 MEMORY 记"Windows 受限令牌配方实测成立、⚠ 未实施"是**过期/不完整**的（成立的是"令牌创建"这一步，不是"可用隔离"），已在本轮修正。
+
+### 6.3 WSL2/Linux Landlock + seccomp + 命名空间（**本机实测可跑**，进程级唯一可行路径）★ v1.4 首选
 - `unshare(CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWNET)` + Landlock ABI v4+ 文件系统白名单 + seccomp BPF（仅拦 `openat`/`openat2`）。
-- **2026-10-13 用户确认 WSL2 已修复**：runtime（Python subprocess/ctypes 拉起子进程）可经 WSL2 执行，**本 backend 从"仅代码"升级为"本机可运行"**；网络维度可借 WSL2 netns + 代理做到接近 CC 的 `network=deny`/`proxy`（比 win-token 更完整）。
-- ⚠ **开发侧验证限制**：本 agent 的 Bash 工具仍把 `wsl.exe` 列入 Program Blacklist，故 WSL2 backend 的 spike/单测须以 **Python 脚本经 subprocess 调 `wsl`**（runtime 路径）或由用户在沙箱外执行，不能从我的 Bash 工具直接跑。
+- **★ 实测证据（2026-10-13 23:50，经 Python subprocess 调 `wsl.exe`）**：
+
+  | 探测项 | 结果 |
+  | --- | --- |
+  | 内核 | `6.18.40.1-microsoft-standard-WSL2` |
+  | Landlock | `CONFIG_SECURITY_LANDLOCK=y`，`CONFIG_LSM` 含 `landlock` ✅ |
+  | 用户命名空间 | `CONFIG_USER_NS=y`；`unshare --user --map-root-user --net` ⇒ **成功** |
+  | 工具 | `/usr/bin/bwrap`、`/usr/bin/unshare`、`/usr/bin/python3` 齐备 |
+  | **bwrap 实跑** | `bwrap --ro-bind /usr … --unshare-net --die-with-parent /bin/echo` ⇒ **`BWRAP_OK`** |
+  | **断网实跑** | 同一 bwrap 内 `curl https://example.com` ⇒ **`NET_BLOCKED`** ✅ |
+
+  ⇒ 本 backend 从"仅代码"升级为**本机可运行、可验证**；网络维度**内核级可兑现**（`network=deny` 不再是 gap）。
+- ⚠ **开发侧验证限制**：本 agent 的 Bash 工具仍把 `wsl.exe` 列入 Program Blacklist，故 WSL2 backend 的 spike/单测须以 **Python 脚本经 subprocess 调 `wsl`**（runtime 路径，本轮已验证可行）或由用户在沙箱外执行，不能从我的 Bash 工具直接跑。
 - 内核不足（Landlock ABI 过低）⇒ `capability_probe()` 返回不可用 ⇒ `auto` 不选它，配置显式要求则 fail-closed。
 
 ### 6.4 macOS Seatbelt（同理，代码写、本机不跑）
 - 生成 SBPL 规则（`(deny default)` + 项目根/临时目录 allow + `network*` deny），`sandbox-exec -p` 包裹。
 
-### 6.5 Container（Docker 模板，本机不可部署）
+### 6.5 Container（Docker 模板，**本机实测可跑**）★ v1.4 升级
 - 产出一份 `docker run` 模板（§1.2 加固参数）+ 把 `SpawnOptions` 映射成挂载/网络/seccomp 配置。
-- 本机 Docker WSL2 起不来 ⇒ 该 backend `capability_probe()` 返回不可用，`auto` 不选；配置显式要求 ⇒ fail-closed 并给出"请先修复 Docker"的明确指引。
-- **仍要写出来**：一是接口齐备、二是将来换机/CI 可直接用、三是符合"对齐 CC 三档"的架构完整性。
+- **★ 实测证据（2026-10-13 23:50，推翻原"Docker 起不来"判断）**：
+
+  | 探测项 | 结果 |
+  | --- | --- |
+  | 引擎 | Docker Desktop **29.4.0**（`OperatingSystem: Docker Desktop (containerized)`） |
+  | 运行中容器 | `blog-web-1 / blog-caddy-1 / blog-api-1 / blog-postgres-1 / blog-redis-1 / neo4j` |
+  | 本地镜像 | `alpine:latest`、`node:22-alpine`、`postgres:16-alpine`、`hello-world` 等 20 个 |
+  | **加固实跑** | `docker run --rm --network none --read-only --cap-drop ALL alpine:latest echo` ⇒ **`CONTAINER_OK`** |
+
+  ⇒ 容器档从"不可部署"升级为**本机可落地、可验证**，且 `--network none` 可真正断网（配合代理 socket 可做白名单出网）。这是本仓目前**强度最高**的一档（文件+网络+进程）。
+- 映射要点：`cwd` → `-v <workspace>:/workspace`（`read-only` 档加 `:ro`）；`network=deny` → `--network none`；`network=proxy` → `--network none` + 挂载代理 socket；`mode=read-only` → `--read-only --tmpfs /tmp`。
+- ⚠ **成本提示**：每次 spawn 一个容器比 WSL2 进程级重（镜像已有则百 ms 级），且 MCP stdio 桥本身要能在容器/WSL 里跑（见 §6.8）。
 
 ### 6.6 Cloud / VM（stub）
 - 仅定义 `name="cloud"` + `capability_probe()` 恒不可用 + 抛出"需外部编排器"的明确错误；config 预留 `backend=cloud` 开关，真集成（远程执行 glue）留作扩展点，不在此轮实现。
@@ -212,11 +262,10 @@ class ConfinementBackend(Protocol):
 参考 CC：网络隔离靠**用户态代理**做域名白名单（不终止 TLS，故宽域名=潜在外泄路径，属已知限制），而非内核级封堵。分两层能力：
 
 1. **容器级（`backend=container`）**：`--network none` + 挂载代理 unix socket，子进程**只能**经代理出网 ⇒ 网络隔离最完整（内核级无网 + 应用层白名单）。这是 CC 推荐做法，也是本仓网络隔离的"完整形态"。
-2. **进程级（分两个 backend，网络能力不同）**：
-   - **win-token（原生 Windows）**：仅**应用层（env 代理）**——注入 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 指向本仓自研 asyncio 域名白名单代理；受限令牌**不控任意端口的原始 socket** ⇒ 不走 env 代理的裸 socket 仍可能出网。故 win-token 下 `network=deny` **不可兑现**（无内核 netns），只能 `proxy` 应用层，`net_gap` 对 `deny` 恒为 true。
-   - **wsl2（WSL2 内 Linux）**：兼具应用层代理 **+ 内核层 `CLONE_NEWNET` netns** ⇒ `network=deny` 可在内核级真正断网（子进程进独立网络命名空间无路由），`network=proxy` 叠应用层白名单。故 wsl2 进程级可做到**接近 CC 的完整网络隔离**，`net_gap` 在 deny/proxy 下均可为 false（除非 WSL2 内核不支持 netns，探测时如实报 gap）。
+2. **进程级（`backend=wsl2`，v1.4 实测）**：兼具应用层代理 **+ 内核层 `CLONE_NEWNET` netns** ⇒ `network=deny` 可在内核级真正断网。**实测 `bwrap --unshare-net` 内 `curl` ⇒ `NET_BLOCKED`** ✅。故 wsl2 进程级可做到**接近 CC 的完整网络隔离**，`net_gap` 在 deny/proxy 下均可为 false。
    - 应用层代理：backend 给子进程注入代理 env，凡**遵守代理环境变量的工具**（curl/git/npm/python requests 等）出网都过白名单 ⇒ 覆盖绝大多数数据外泄路径。
-   - 诚实边界：`SpawnOptions.net_policy="proxy"` 在 win-token = 仅应用层；在 wsl2 = 应用层 + 内核 netns；完整无例外断网（`deny` 对所有裸 socket）仅在**容器档**（`--network none`）可得。
+   - ~~**win-token（原生 Windows）**：仅应用层 env 代理、`deny` 不可兑现~~ —— **该 backend 已出局（§6.2）**，不再计入网络能力矩阵。
+   - 诚实边界：`net_policy="proxy"` 在 wsl2 = 应用层 + 内核 netns；完整无例外断网（`deny` 对裸 socket 亦生效）在**容器档**（`--network none`）与 wsl2 netns 均可得。
 3. **off / null 档**：`net_policy` 默认 `allow`（与现状一致，不劣化）。
 
 **新增组件 `agent/core/net_proxy.py`（或 `run/net_proxy.py`，落点同 core 解耦纪律）**：
@@ -228,12 +277,29 @@ class ConfinementBackend(Protocol):
 
 ---
 
+### 6.8 ★ 目标可移植性约束（v1.4 新增，架构级必读）
+
+wsl2 / container 两个 backend 都意味着**子进程不在原生 Windows 上跑**。这带来一条此前没显式建模的约束：
+
+| MCP 桥（targets） | 能否在 WSL2 内跑 | 能否在容器内跑 | 结论 |
+| --- | --- | --- | --- |
+| `skills_mcp`（纯 Python stdio，只读技能目录） | ✅ | ✅（挂载 skills 目录） | 可被 wsl2/container 隔离 |
+| `playwright_mcp`（浏览器自动化，有 Linux 版/官方镜像） | ✅（需 WSL 内装浏览器） | ✅（`mcr.microsoft.com/playwright`） | 可被隔离，但需镜像/依赖准备 |
+| `windows_mcp`（**Windows 原生 UI / Win32 自动化**） | ❌ | ❌ | **本仓无法沙箱化** —— 只能 `off`，须在 status/gap 里诚实暴露 |
+
+⇒ 设计后果：
+1. **每个 target 需声明可移植性**（新增字段，如桥配置里 `runnable_in: ["win","wsl2","container"]`），backend 选择时与目标集合求交；不可移植的目标**降级为 off**，并让 `describe()` 输出 `unportable_targets: ["mcp.windows.*"]` 之类可见信息。
+2. 这不是缺陷而是**本机约束的诚实表达**：Windows 原生自动化工具无法放进 Linux/容器边界，与 CC 不支持原生 Windows 进程级同源。
+3. 若将来要求 `windows_mcp` 也必须受限，唯一现实路径是「Windows 原生 Job Object + 文件系统 ACL 限制（无 restricting SID）」——但 §6.2 的矩阵已证明**不加 restricting SID 就毫无隔离**，故**不可宣称其具备隔离能力**。
+
+---
+
 ## 7. 配置与降级语义
 
 ```yaml
 agent:
   sandbox:
-    backend: auto                # state：auto|off|win-token|wsl2|container|cloud（默认 auto；Windows 探测优先级 wsl2→win-token→off）
+    backend: auto                # state：auto|off|wsl2|container|cloud（win-token 保留枚举但恒不可用；默认 auto，Windows 探测优先级 wsl2→container→off）
     mode: workspace-write        # file-policy：none|read-only|workspace-write
     network: allow               # network-policy：allow|deny|proxy（proxy=域名白名单）
     network.allow_domains: []    # proxy 档的域名白名单（空=全拒，需显式开）
@@ -241,7 +307,7 @@ agent:
     targets: ["mcp.*"]           # scope
 ```
 - **off 一等档位**：`backend=off` 或 `auto` 探测不到可用后端 ⇒ `enforcement=none, sandbox_runtime=off`，**不报错**（对齐用户裁定：进程级运行时不满足时默认 off）。
-- `describe()` 输出示例（Windows + 令牌可用 + 代理开）：`{backend:"process", mode:"workspace-write", network:"proxy", strength:"partial", file_gap:false, net_gap:true(进程级仅应用层代理), enforced_by:"windows-restricted-token"}`。
+- `describe()` 输出示例（wsl2 可用 + deny）：`{backend:"wsl2", mode:"workspace-write", network:"deny", strength:"partial~full", file_gap:false, net_gap:false, enforced_by:"wsl2-bwrap-landlock"}`；容器档：`{backend:"container", …, strength:"full", net_gap:false, enforced_by:"docker"}`。
 - `gap` 分两个维度分别计：`file_gap`（文件限制未兑现）与 `net_gap`（网络限制未兑现，如进程级 `network=deny` 不可兑现、或 `proxy` 仅应用层）。两维任一为 true ⇒ 整体 `gap=true`。
 - **显式要求但不可得**（如 `backend=process` 强制、令牌不可用）：默认**可见告警 + 回落 off + 审计 `backend-error` 计数**（不静默、默认不硬拒绝）；`strict=true` 时改为**硬拒绝该子进程 spawn**（对齐 DSH `denialSignatures` vs `runnerFailureRules`，不把基础设施故障误报成策略结果）。
 
@@ -258,15 +324,16 @@ agent:
 | 批次 | 内容 | 本机可跑？ | 风险 |
 | --- | --- | --- | --- |
 | **P0** | 骨架：`core/sandbox_backend.py`（协议+NullBackend+select_backend，含 off 一等档位）+ `SpawnOptions`（含 `net_policy`/`proxy_addr`）；`api.py` re-export；`sandbox` 插件接 backend 驱动 enforcement；config_schema 增 `backend`/`network`/`strict`；删硬编码天花板；审计/状态改读 backend。 | ✅ | 低（核心重构，须全量回归） |
-| **P1** | Windows 受限令牌 backend + `mcp_client.py` 令牌 spawn 路径（先做 spike 验证 asyncio+令牌管道）。 | ⚠ 取决于非管理员是否可用 `CreateRestrictedToken` | 中（ctypes 复杂，须原型） |
 | **P2** | `skills_mcp` 桥接 `CHILD_SPAWN_OPTIONS`（小修，一致性）。 | ✅ | 低 |
 | **P3** | 顺带修 MCP 工具 risk 缺陷（P0 前置已记）：三桥纯读工具注册传 `risk="read"`。 | ✅ | 低 |
-| **P4** | **wsl2 backend**（代码+单测+本机 runtime 验证；Linux Landlock+seccomp+ns，最接近 CC）；macOS Seatbelt backend（代码写、本机不跑）。 | ⚠ wsl2 本机可跑（runtime）；macOS 仅代码 | 中（wsl2 须 Python 级验证，不能走 Bash 工具） |
-| **P5** | Container backend（Docker 模板+映射，含 `--network none`+代理 socket）；Cloud stub。 | ❌ 本机 Docker 坏 | 低（不本地跑） |
+| **~~P1~~** | ~~Windows 受限令牌 backend~~ —— **spike 已完成，结论：出局**（§6.2）。原型留在 `_spike/`（不并入主码）。 | — | — |
+| **P4** | **wsl2 backend**（bwrap+Landlock+netns，进程级）代码 + 单测 + **本机 runtime 验证**（Python subprocess 调 `wsl`，已证可行）；macOS Seatbelt backend（代码写、本机不跑）。 | ✅ 实测可跑 | 中（须 Python 级验证，不能走 Bash 工具） |
+| **P5** | **Container backend**（Docker 模板+映射，含 `--network none`+代理 socket）；Cloud stub。 | ✅ **实测可跑**（v1.4 推翻原判断） | 中（本机可验证，需选/建镜像） |
+| **P8** | **目标可移植性**（§6.8）：桥声明 `runnable_in`，不可移植目标（如 `mcp.windows.*`）降级 off 并在 `describe()`/`status()` 暴露 `unportable_targets`。 | ✅ | 低 |
+| **P7** | **网络隔离（本轮纳入）**：`net_proxy.py` 域名白名单代理 + `SpawnOptions` 注入代理 env（应用层）+ wsl2 netns / 容器档 `--network none`；审计 `agent/sandbox/net_denied`。 | ✅ 代理本机可跑；断网已实测 | 中（代理需稳，防误拦合法出网） |
 | **P6** | 前端沙箱状态页增强：展示 backend/strength/file_gap/net_gap/enforced_by（复用现有 status 字段）。 | ✅ | 低 |
-| **P7** | **网络隔离（本轮纳入）**：`net_proxy.py` 域名白名单代理 + `SpawnOptions` 注入代理 env（进程级应用层）+ 容器档 `--network none`+代理 socket；审计 `agent/sandbox/net_denied`。 | ⚠ 代理本机可跑；容器档网络 none 依赖 Docker | 中（代理需稳，防误拦合法出网） |
 
-**建议实施顺序**：P0 → P2 → P3（低风险骨架+一致性+risk 修复，立即可见）→ P1（win-token spike，原生兜底）→ P4（wsl2 runtime 验证，进程级首选）→ P7（网络代理：先 wsl2/netns 断网 + 应用层白名单，再 win-token 应用层）→ P5/P6。
+**修订后的实施顺序（v1.4）**：~~P1（win-token，已出局）~~ → **P4（wsl2 进程级，本机实测可跑，与 CC 同构）** → **P5（container 容器级，本机实测可跑，强度最高）** → P8（目标可移植性）→ P7（网络：先 netns/`--network none` 断网，再应用层白名单代理）→ P6（前端）。
 
 **实施状态（2026-10-13 23:20 更新）**：
 
@@ -289,12 +356,12 @@ agent:
 
 ## 11. 诚实风险与未决项（必读）
 
-1. **网络隔离是 partial（进程级）**：本轮已纳入代理式域名白名单（P7），但**进程级 backend（Windows 令牌/Linux Landlock）只做应用层代理**（env 注入），**不控裸 socket** ⇒ `net_gap=true` 须如实暴露，不能宣称"网络已封死"。完整网络隔离只在**容器档**（`--network none`+代理 socket，内核级无网）可得。代理不 inspect TLS，宽域名=潜在外泄路径（对齐 CC 已知限制）。
-2. **本机 Docker 起不来** ⇒ 容器/VM 档在本机**不可部署**，仅代码+配置+stub，换机/CI 方可用。
-3. **管理员权限**：Windows 受限令牌可能需管理员；本机非管理员，P1 前须先 spike 验证 `CreateRestrictedToken` 可用性，否则该档也 fail-closed。
-4. **对齐 CC 的口径**：CC 在 Windows 也是借 WSL2 的 Linux 原语做进程级 ⇒ 本仓 **wsl2 backend 与 CC 同构**，可宣称"对齐 CC 进程级沙箱"；**Windows 令牌是 native 兜底（partial，仅文件/进程、不含网络）**，不能宣称等同 CC。文案上**严禁**宣称"沙箱执行/进程级隔离"除非对应 backend 真兑现。
-5. **asyncio + Windows 令牌 spawn** 是技术难点，须先做最小原型，不能直接合进主链路。
-6. **WSL2 开发侧验证限制**：本 agent Bash 工具仍黑名单 `wsl.exe`，WSL2 backend 的 spike 与回归须以 Python subprocess 调 `wsl`（runtime 路径）或在沙箱外执行；不能依赖我的 Bash 工具直接验证。
+1. **网络隔离（v1.4 修订，好于预期）**：wsl2 进程级**有内核 netns**，实测 `bwrap --unshare-net` 内 `curl` ⇒ `NET_BLOCKED`；容器档 `--network none` 亦可 ⇒ **`network=deny` 在这两个 backend 下可真正兑现，`net_gap=false`**。仍存的限制是应用层代理（`proxy` 档）：按域名粒度、不 inspect TLS，宽域名=潜在外泄路径（对齐 CC 已知限制），且**不改** env 代理的裸 socket 仍可能绕（除非叠加 netns/`--network none`）。
+2. ~~**本机 Docker 起不来**~~ —— **已推翻（2026-10-13 实测）**：Docker Desktop 29.4.0 正常、容器在跑、`docker run --network none --read-only --cap-drop ALL` 成功 ⇒ 容器档**本机可部署可验证**。剩余不可部署的只有 cloud 档（无编排器，纯 stub）。
+3. ~~**管理员权限/Windows 令牌**~~ —— **spike 结论：出局**。非管理员下 `CreateRestrictedToken` 能成功，但施加 restricting SID 后子进程必崩 `0xC0000142`；不施加则毫无隔离（§6.2 矩阵）。⇒ 本机**不存在**可用的 Windows 原生进程级隔离。
+4. **对齐 CC 的口径（v1.4）**：本仓 **wsl2 backend 与 CC 同构**（bwrap+Landlock+netns，CC 在 Windows 也借 WSL2）⇒ 可宣称"对齐 CC 进程级沙箱"；**container backend 对齐 CC 容器档**（加固参数一致）。文案上**严禁**宣称"沙箱执行/进程级隔离"除非对应 backend 真兑现；`windows_mcp` 一类不可移植目标须显式标注为无隔离（§6.8）。
+5. ~~**asyncio + Windows 令牌 spawn 技术难点**~~ —— 随 P1 出局而不再适用。新的技术难点是：**stdio MCP 桥如何跨边界运行**（wsl2 内/容器内跑 Python stdio 桥，路径映射、stderr 回传、进程树终止），须原型验证。
+6. **WSL2 开发侧验证限制**：本 agent Bash 工具仍黑名单 `wsl.exe`；但**已验证 Python subprocess（runtime 路径）可正常调 `wsl.exe`**（`wsl -l -v` 返回 Ubuntu/docker-desktop Running）⇒ spike 与回归走 Python 脚本即可，不阻塞。
 7. **`strict=true` 不等于"拒绝 spawn"（代码复核所得）**：`CHILD_SPAWN_OPTIONS` 接缝的返回值只有"给不给落点"两态（dict / None），**没有"拒绝"通道**；桥拿到 `None` 仍会照常起进程。故本轮 `strict=true` 的实际效果是**抛 `BackendUnavailable` + 计数 `agent_sandbox_backend_error_total` + 告警 + 回落无隔离**，**不是**硬阻断子进程。真正的 spawn 级拒绝需桥配合改造（P1+ 待办），文档与文案**不得**宣称"strict 会阻止执行"。
 
 ---
@@ -304,13 +371,21 @@ agent:
 **已裁定（2026-10-13）**：
 - ✅ **off 是一等档位**：进程级运行时不满足时 `Sandbox Runtime` 默认 off（优雅降级不报错）。已写入 §0/§3/§7。
 - ✅ **网络隔离纳入本轮**：代理式域名白名单（P7）已写入 §6.7/§7/§9/§11。
-
-**已裁定（2026-10-13）**：
-- ✅ **off 是一等档位**：进程级运行时不满足时 `Sandbox Runtime` 默认 off（优雅降级不报错）。已写入 §0/§3/§7。
-- ✅ **网络隔离纳入本轮**：代理式域名白名单（P7）已写入 §6.7/§7/§9/§11。
-- ✅ **WSL2 已修复 + 5 档模型**：进程级拆为 `wsl2`（首选）/ `win-token`（兜底），`auto` 优先级 wsl2→win-token→off。已写入 §0/§1.1/§3/§6.3/§6.7/§7。
+- ✅ **WSL2 已修复 + 5 档模型**：进程级拆为 `wsl2`（首选）/ `win-token`（兜底），`auto` 优先级 wsl2→win-token→off。已写入 §0/§1.1/§3/§6.3/§6.7/§7。（⚠ v1.4 修订：`win-token` 出局，优先级改 **wsl2→container→off**）
 
 **✅ 已按推荐裁定（2026-10-13 23:20，用户授权"待定事项按推荐进行"）**：
 1. **首做批次 = P0+P2+P3** —— 低风险骨架 + 一致性小修 + risk 缺陷修复。已完成（见 §9 实施状态）。
-2. **P1 前置 spike = 允许** —— 令牌最小原型**不并入主代码**，仅验证本机非管理员下 `CreateRestrictedToken` 可用性；结论决定 P1 是否落地。待做（排在 P0/P2/P3 之后）。
+2. **P1 前置 spike = 允许** —— 令牌最小原型**不并入主代码**。✅ **已完成并出结论：win-token 出局**（§6.2）。
 3. **`strict` 默认 = `false`** —— 显式要求后端不可得时：可见告警 + 回落 off + 审计 `backend-error`，不硬拒绝（避免打断正常操作）。已落地；⚠️ 其"不等于拒绝 spawn"的边界已写入 §11.7。
+
+---
+
+## 13. v1.4 新增待拍板事项（编码前）
+
+1. **下一个动手批次**：P4（wsl2 进程级，与 CC 同构、轻量）还是 P5（container 容器级，强度最高、本机已验证）？我的建议是 **P4 先**（进程级是 CC 日常默认档，且无需镜像准备），P5 紧随。
+2. **stdio MCP 桥跨边界怎么跑**（wsl2/container 的技术关键）：
+   - wsl2：`wsl.exe -e python3 -m agent.run.skills_mcp_adapter`，工作目录用 `/mnt/c/...` 映射（`data/skills` 需从 WSL 可达）；stderr/进程树终止需验证。
+   - container：`docker run -i --rm -v <workspace>:/workspace <image> python -m …`（`-i` 保 stdio）。需选定/构建镜像（alpine+python 即可，或复用 `node:22-alpine` 不合适）。
+   - 二者都需原型验证 **stdin/stdout 不粘包、长连接稳定、子进程能整棵杀**。
+3. **`windows_mcp` 的处置**：确认接受「在 status/describe 里诚实标注为不可沙箱化（off）」，还是需要额外投入（我看不到可行路径，除非接受无隔离）。
+4. **是否保留 `win-token` 枚举值**：建议保留但 `capability_probe()` 恒不可用，并在文档中留实验记录（避免他人/日后重复踩坑）。
