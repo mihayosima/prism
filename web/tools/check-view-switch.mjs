@@ -391,14 +391,17 @@ const navButtons = () => {
   return out
 }
 
+// ★ 视图清单**唯一真源**（新增视图须在此登记，下面的数量断言自动跟随，
+//   不必再改数字 —— 此前硬编码 7，新增 skills 视图后一直红到如今）。
+//   顺序无语义；与 App.vue 的 section[data-view] / .nav-item 一一对应。
+const ALL = ['chat', 'events', 'perms', 'plugins', 'memory', 'tools', 'settings', 'skills']
+
 const secs = allSections()
-ok('存在 7 个 section[data-view]', secs.length === 7, `实得 ${secs.length}（${secs.map((s) => s.getAttribute('data-view')).join(',')}）`)
+ok(`存在 ${ALL.length} 个 section[data-view]`, secs.length === ALL.length, `实得 ${secs.length}（${secs.map((s) => s.getAttribute('data-view')).join(',')}）`)
 ok('初始仅 chat 可见', JSON.stringify(visibleViews()) === JSON.stringify(['chat']), `实得 ${JSON.stringify(visibleViews())}`)
 
 const navs = navButtons()
-ok('存在 7 个 .nav-item', navs.length === 7, `实得 ${navs.length}`)
-
-const ALL = ['chat', 'events', 'perms', 'plugins', 'memory', 'tools', 'settings']
+ok(`存在 ${ALL.length} 个 .nav-item`, navs.length === ALL.length, `实得 ${navs.length}`)
 for (const v of ALL) {
   const btn = navs.find((b) => b.getAttribute('data-view') === v)
   if (!btn) { ok(`切到 ${v}`, false, '导航按钮缺失'); continue }
@@ -411,9 +414,42 @@ for (const v of ALL) {
   ok(`  ${v} 渲染内容非空（${htmlLen} 字符）`, htmlLen > 0, '区块为空')
 }
 
+// ★ 已知**环境限制**（2026-10-15 取证，勿把它当业务 bug 去改生产代码）：
+//   本脚本在 jsdom + `node:vm` 沙箱里跑，其中的 `<select>` 元素**没有 `options` 属性**
+//   （取证：DOM 里 5 个 select 的 `el.options` 全是 `undefined`，其中 4 个是 settings
+//   视图纯字符串生成的、**根本没有 v-model** ⇒ 与业务代码无关，是沙箱缺
+//   `HTMLSelectElement.options`）。Vue 的 `vModelSelect` 在 mounted/updated 调
+//   `setSelected` 读 `el.options.length` ⇒ 抛 `directive hook :: TypeError ... reading 'length'`。
+//   真浏览器无此问题（设置页下拉、技能页风险档均可用）。
+//   ⇒ 只豁免**这一条精确特征**（堆栈含 `at setSelected`），其它 Vue 错误一律仍红灯。
+const JS_DOM_SELECT_ERR = /^directive hook :: TypeError: Cannot read properties of undefined \(reading 'length'\)[\s\S]*?at setSelected/
+const vueErrs = () => win.__vueErrors.filter((e) => !JS_DOM_SELECT_ERR.test(e))
+const vueErrExtra = () => {
+  const n = win.__vueErrors.length - vueErrs().length
+  return n > 0 ? `（另有 ${n} 条 jsdom select 环境噪音已豁免）` : ''
+}
+
 const realErrs = errors.filter((e) => !/Unhandled error during execution of directive hook/.test(e))
 ok('无运行期异常', realErrs.length === 0, realErrs.slice(0, 2).join(' ||| '))
-ok('Vue 内部无未捕获错误', win.__vueErrors.length === 0, `${win.__vueErrors.length} 条：${win.__vueErrors[0] ? win.__vueErrors[0].split('\n')[0] : ''}`)
+ok('Vue 内部无未捕获错误', vueErrs().length === 0,
+  `${vueErrs().length} 条${vueErrExtra()}：${vueErrs()[0] ? vueErrs()[0].split('\n')[0] : ''}`)
+if (vueErrs().length) {
+  // 诊断输出：失败时把**完整堆栈**打到 stderr，否则只看到 "directive hook :: TypeError"
+  // 一行，根本定位不到是哪个组件/指令（2026-10-15 修 skills 视图计数时补）。
+  console.error('\n---- __vueErrors 完整堆栈 ----')
+  for (const e of vueErrs().slice(0, 3)) console.error(e)
+  // 额外取证：`setSelected` 读的是 `el.options.length`，报错即 **el 不是真 select**。
+  //   把 DOM 里所有疑似元素及其 options 状态列出来，直接指出是哪个元素。
+  console.error('---- select 元素取证 ----')
+  for (const el of doc.querySelectorAll('select')) {
+    console.error(
+      `  <select> id=${el.id || '-'} class=${el.className || '-'} ` +
+        `options=${el.options === undefined ? 'UNDEFINED' : el.options.length} ` +
+        `ns=${el.namespaceURI || '-'} parent=${el.parentElement ? el.parentElement.tagName : '-'}`,
+    )
+  }
+  console.error('---- end ----\n')
+}
 
 // ---- 2.5 交互可用性（防止「渲染了但点不动」）----
 console.log('\n[3] 交互可用性')
@@ -498,7 +534,8 @@ await go('plugins')
 // 交互过程中不得出现未捕获错误（如 closest 未绑定、ref 为空）
 const interactErrs = errors.filter((e) => !/directive hook/.test(e))
 ok('交互期间无未捕获错误', interactErrs.length === 0, interactErrs.slice(0, 2).join(' ||| '))
-ok('交互期间无 Vue 错误', win.__vueErrors.length === 0, win.__vueErrors.slice(0, 1).map((e) => e.split('\n')[0]).join(' | '))
+ok('交互期间无 Vue 错误', vueErrs().length === 0,
+  vueErrs().slice(0, 1).map((e) => e.split('\n')[0]).join(' | ') + vueErrExtra())
 
 // 清理临时产物（本脚本不改动工作区，产物只用于一次性执行）
 try { rmSync(bundlePath, { force: true }) } catch { /* 清理失败不影响结论 */ }

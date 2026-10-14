@@ -603,7 +603,14 @@ ok('澄清卡选项行存在（.hitopt 或 .apopt）', !!document.body.querySele
 
 const cardErrs = errors.filter((e) => !/directive hook/.test(e))
 ok('驱动期间无未捕获错误', cardErrs.length === 0, cardErrs.slice(0, 1).join(' ||| '))
-ok('驱动期间无 Vue 错误', ctx.__vueErrors.length === 0, ctx.__vueErrors.slice(0, 1).map((e) => e.split('\n')[0]).join(' | '))
+// ★ 与 `check-view-switch.mjs` 同源的**jsdom 沙箱限制**（2026-10-15 取证）：
+//   沙箱里的 `<select>` 没有 `options` 属性（连无 v-model 的 select 也是 undefined）
+//   ⇒ Vue 的 `vModelSelect.setSelected` 读 `el.options.length` 抛
+//   `directive hook :: TypeError ... reading 'length'`。真浏览器无此问题。
+//   故只豁免**这一条精确特征**（堆栈含 `at setSelected`），其它 Vue 错误仍红灯。
+const JS_DOM_SELECT_ERR = /^directive hook :: TypeError: Cannot read properties of undefined \(reading 'length'\)[\s\S]*?at setSelected/
+const cardVueErrs = ctx.__vueErrors.filter((e) => !JS_DOM_SELECT_ERR.test(e))
+ok('驱动期间无 Vue 错误', cardVueErrs.length === 0, cardVueErrs.slice(0, 1).map((e) => e.split('\n')[0]).join(' | '))
 
 // 清理临时产物
 try { rmSync(bundlePath, { force: true }) } catch { /* 不影响结论 */ }

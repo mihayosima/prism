@@ -418,7 +418,9 @@ const go = async (v) => {
   await settle(400); flushRaf(); await settle(80)
 }
 
-ok('App 已挂载（存在 7 个 section[data-view]）', allSections().length === 7, `实得 ${allSections().length}`)
+// ★ 8 = chat + NAV_MACHINE 7 项（2026-10-15：新增 skills「技能」视图后由 7 改 8，
+//   此前硬编码 7 让本脚本一直红）
+ok('App 已挂载（存在 8 个 section[data-view]）', allSections().length === 8, `实得 ${allSections().length}`)
 
 // ============================================================
 // 3. 逐视图功能对拍
@@ -433,7 +435,14 @@ await go('events')
   const d = BACKEND_DATA.events
   const backendRows = (d.rows || d.events || d.items || []).length
   const ths = findAll(s, (e) => e.tagName === 'TH').map((e) => e.textContent.trim())
-  ok('events 表头含 seq/event/at/payload', ['seq', 'event', 'at', 'payload'].every((c) => ths.includes(c)), ths.join(','))
+  // ★ 空态是**设计如此**：`renderEventsHtml` 在无匹配事件时返回"无匹配事件"而不是表格，
+  //   此时本就没有表头 —— 原断言隐含"一定有数据"，后端空库时误红。这里按数据分情况断言，
+  //   两种情形都必须被覆盖（不是放宽，是补齐空态这一支）。
+  if (backendRows > 0) {
+    ok('events 表头含 seq/event/at/payload', ['seq', 'event', 'at', 'payload'].every((c) => ths.includes(c)), ths.join(','))
+  } else {
+    ok('events 无数据时显示空态（不渲染表头为设计如此）', /无匹配事件/.test(s.textContent || ''), (s.textContent || '').slice(0, 40))
+  }
 
   const trs = findAll(s, (e) => e.tagName === 'TR')
   const renderedRows = Math.max(0, trs.length - 1)
@@ -644,9 +653,9 @@ await go('settings')
 // ---------- nav ----------
 console.log('\n  ── nav（导航与页脚）──')
 {
-  ok('nav 有 7 个导航项', navs.length === 7, `实得 ${navs.length}`)
+  ok('nav 有 8 个导航项', navs.length === 8, `实得 ${navs.length}`)
   const labels = navs.map((n) => n.textContent.trim())
-  ok('nav 含全部 7 个视图标签', ['会话', '事件', '权限', '插件', '记忆', '工具', '设置'].every((l) => labels.some((x) => x.includes(l))), labels.join('|'))
+  ok('nav 含全部 8 个视图标签', ['会话', '事件', '权限', '插件', '技能', '记忆', '工具', '设置'].every((l) => labels.some((x) => x.includes(l))), labels.join('|'))
   // 当前激活项唯一
   const actives = navs.filter((n) => n.classList.contains('active'))
   ok('nav 激活项唯一', actives.length === 1, `实得 ${actives.length}`)
@@ -658,7 +667,13 @@ console.log('\n  ── nav（导航与页脚）──')
 // ---------- 收尾 ----------
 const realErrs = errors.filter((e) => !/directive hook/.test(e))
 ok('全程无未捕获错误', realErrs.length === 0, realErrs.slice(0, 1).join(' ||| '))
-ok('全程无 Vue 错误', win.__vueErrors.length === 0, win.__vueErrors.slice(0, 1).map((e) => e.split('\n')[0]).join(' | '))
+// ★ 与 `check-view-switch.mjs` 同源的**jsdom 沙箱限制**（2026-10-15 取证）：沙箱里的
+//   `<select>` 没有 `options` 属性 ⇒ Vue 的 `vModelSelect.setSelected` 读
+//   `el.options.length` 抛 `directive hook :: TypeError ... reading 'length'`，真浏览器无此问题。
+//   只豁免这一条精确特征（堆栈含 `at setSelected`），其它 Vue 错误仍红灯。
+const JS_DOM_SELECT_ERR = /^directive hook :: TypeError: Cannot read properties of undefined \(reading 'length'\)[\s\S]*?at setSelected/
+const vueErrs = win.__vueErrors.filter((e) => !JS_DOM_SELECT_ERR.test(e))
+ok('全程无 Vue 错误', vueErrs.length === 0, vueErrs.slice(0, 1).map((e) => e.split('\n')[0]).join(' | '))
 
 try { rmSync(bundlePath, { force: true }) } catch { /* ignore */ }
 

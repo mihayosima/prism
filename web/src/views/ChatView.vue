@@ -35,7 +35,6 @@
         </div>
       </div>
       <div class="inputrow">
-        <VoiceButton :disabled="streaming" @final="onVoiceFinal" @unavailable="onVoiceUnavailable" />
         <textarea
           v-model="input"
           id="txt"
@@ -43,6 +42,9 @@
           placeholder="告诉 Agent 你要做什么……"
           @keydown="onKeydown"
         ></textarea>
+        <!-- ★ 语音按钮在**右侧按钮组**（紧挨发送）：麦克风是"输入动作"的另一种触发，
+             与发送同侧符合肌肉记忆；实时字幕/提示由组件悬浮在按钮上方，不挤输入行 -->
+        <VoiceButton :disabled="streaming" @final="onVoiceFinal" @unavailable="onVoiceUnavailable" />
         <button class="btn" id="send" :disabled="false" @click="send">{{ sendLabel }}</button>
       </div>
     </div>

@@ -118,7 +118,10 @@ if (contractFile) {
     ok('解析出 progress.py FRAME_TYPES', !!ft)
     if (ft) {
       const vals = [...ft[1].matchAll(/:\s*"([^"]+)"/g)].map((m) => m[1])
-      ok(`FRAME_TYPES 映射 6 类（实得 ${vals.length}）`, vals.length === 6, vals.join(','))
+      // ★ 7 类（2026-10-15）：新增 `Events.TODO_PROGRESS → "todo"`（规划完成度帧）。
+      //   这个数字**故意写死**——它的作用就是逼着"后端加帧 ⇒ 契约文档必须同步登记"；
+      //   本次它成功抓出了文档漏登记 todo 的欠账（已补 §3.13），不是该放宽的断言。
+      ok(`FRAME_TYPES 映射 7 类（实得 ${vals.length}）`, vals.length === 7, vals.join(','))
       const miss2 = vals.filter((v) => !doc.includes('`' + v + '`'))
       ok('每个映射值都在契约文档中登记', miss2.length === 0,
         miss2.length ? '缺失: ' + miss2.join(',') : '')
