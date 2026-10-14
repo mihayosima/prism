@@ -35,6 +35,7 @@
         </div>
       </div>
       <div class="inputrow">
+        <VoiceButton :disabled="streaming" @final="onVoiceFinal" @unavailable="onVoiceUnavailable" />
         <textarea
           v-model="input"
           id="txt"
@@ -66,6 +67,7 @@ import { esc } from '../components/markdown'
 import { streamChat, getStatus, getSession, answerApproval, getApprovalPending, setApprovalMode } from '../api/endpoints'
 import { rotateSessionId } from '../api/session'
 import { sseFrameName } from '../api/sse'
+import VoiceButton from '../components/VoiceButton.vue'
 import type { ApprovalMode } from '../api/types'
 
 // ---------- 档位文案（legacy app.js:576-577 原样）----------
@@ -162,6 +164,36 @@ function handleFrame(ev: string, p: Record<string, unknown>): void {
 }
 
 // ---------- 发送（legacy send，app.js:186-215）----------
+/**
+ * 语音定稿回填（模式 R）。
+ *
+ * ★ **只回填草稿，绝不自动发送**（方案硬要求）：语音识别会出错，
+ *   自动发出去等于替用户说了话。用户在输入框里看到文本、可改可删后再发。
+ *   追加而非覆盖：多数人边说边补，前面的草稿不该被冲掉。
+ */
+function onVoiceFinal(text: string): void {
+  const t = String(text || '')
+  if (!t) return
+  const cur = input.value
+  input.value = cur && !/\s$/.test(cur) ? cur + ' ' + t : cur + t
+  void nextTick()
+  const el = document.getElementById('txt') as HTMLTextAreaElement | null
+  if (el) el.focus()
+}
+
+/**
+ * 语音不可用（本地引擎未就绪且浏览器不支持）。
+ *
+ * ★ 刻意**不**往消息流里插提示气泡：`messageHtml` 把非 `user` 角色一律渲染成
+ *   「Agent」气泡（实测），用它提示会**伪装成 Agent 说的话**；而 `addUserNote`
+ *   显示为「你」也不对（这不是用户说的）。故只改输入框 placeholder——
+ *   不污染对话历史、不冒充任何一方说话。
+ */
+function onVoiceUnavailable(msg: string): void {
+  const el = document.getElementById('txt') as HTMLTextAreaElement | null
+  if (el) el.placeholder = '语音输入不可用：' + (msg || '未知原因') + '（请用文字输入）'
+}
+
 async function send(): Promise<void> {
   if (streaming && ctrl) {
     ctrl.abort()

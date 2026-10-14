@@ -102,11 +102,25 @@ class LlmUnavailableError(AgentError):
     """
 
 
+class EngineUnavailable(AgentError):
+    """本地能力引擎不可用：依赖缺失 / 模型未就位 / 加载失败。
+
+    中性错误（零业务词）：**具体是哪个引擎由抛出的插件自己说明**——内核只提供
+    「引擎不可用」这一族语义，与 ``LlmUnavailableError`` 并列。
+
+    ★ 为什么放内核而不是留在插件里：插件抛的异常若只在插件包内定义，消费方
+    （装配/传输层）就必须 ``import agent.plugins.<x>.<impl>`` 才能 ``except``，
+    直接撞上 ``test_plugin_decoupling`` 的「装配/传输层依赖业务插件实现」红线。
+    上提到此并经 ``agent.api`` 导出后，插件 raise、传输层 catch **都只认 api**。
+    """
+
+
 __all__ = [
     "AgentError",
     "CapabilityNotImplemented",
     "ConfigError",
     "CyclicDependencyError",
+    "EngineUnavailable",
     "EventDispatchError",
     "EventWiringError",
     "LlmUnavailableError",

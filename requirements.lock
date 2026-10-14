@@ -32,6 +32,10 @@ idna==3.20
     #   httpx
 iniconfig==2.3.0
     # via pytest
+numpy==2.5.4
+    # via
+    #   agent-runtime (pyproject.toml)
+    #   soundfile
 opentelemetry-api==1.45.0
     # via fastapi
 packaging==26.3
@@ -46,12 +50,20 @@ pygments==2.21.0
     # via pytest
 pytest==9.1.1
     # via agent-runtime (pyproject.toml)
+python-multipart==0.0.32
+    # via agent-runtime (pyproject.toml)
 redis==8.1.0
     # via
     #   agent-runtime (pyproject.toml)
     #   fakeredis
+sherpa-onnx==1.13.8
+    # via agent-runtime (pyproject.toml)
+sherpa-onnx-core==1.13.8
+    # via sherpa-onnx
 sortedcontainers==2.4.0
     # via fakeredis
+soundfile==0.14.0
+    # via agent-runtime (pyproject.toml)
 starlette==1.7.0
     # via fastapi
 typing-extensions==4.16.0
@@ -69,3 +81,5 @@ typing-inspection==0.4.4
     #   pydantic
 uvicorn==0.54.0
     # via agent-runtime (pyproject.toml)
+websockets==17.2
+    # via uvicorn

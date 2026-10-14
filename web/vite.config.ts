@@ -19,6 +19,9 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:8720',
         changeOrigin: true,
+        // ★ 语音输入的 WS（/api/asr/ws）在 dev 期必须靠这个透传。
+        //   缺它 ⇒ WS 握手被 proxy 当普通 HTTP 处理、前端拿不到 upgrade ⇒ 静默降级。
+        ws: true,
       },
     },
   },

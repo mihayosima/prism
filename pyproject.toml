@@ -16,13 +16,28 @@ requires-python = ">=3.10"
 # （--no-header 不写命令注释，便于 diff；带 dev 依赖时加 `--all-extras`）
 dependencies = [
     "fastapi>=0.142,<1.0",
-    "uvicorn>=0.54,<1.0",
+    # ★ 必须带 [standard] extras：ASR 的实时通道（/api/asr/ws）需要 uvicorn 的
+    #   WebSocket 协议实现，而它**不在基础依赖里**（裸装 uvicorn 时 `websockets`/
+    #   `wsproto` 都没有 ⇒ 握手直接 404，且 TestClient 仍全绿 ⇒ 极难定位）。
+    "uvicorn[standard]>=0.54,<1.0",
     "httpx>=0.28,<1.0",
     "redis>=5.0,<9.0",
+    # ★ 文件上传端点（模式 F：``POST /api/asr/file``）靠它解析 multipart/form-data。
+    #   它是**传输层契约**而非 ASR 引擎的一部分，故放主依赖（包体积极小）：
+    #   缺它时端点在 Starlette 解析阶段就 500，连"插件未启用"的 503 都发不出去。
+    "python-multipart>=0.0.9,<0.1",
 ]
 
+# ★ ASR 引擎运行时（**可选**）：三件套加起来数百 MB，且只在真的要用语音识别时才需要。
+#   装法：``pip install -e ".[asr]"``；不装时 ``plugins.asr`` **不崩服务**——
+#   延迟 import 失败 ⇒ 引擎状态 ``unavailable``，端点回 503 + 可读原因（前端降级 Web Speech）。
 [project.optional-dependencies]
 dev = ["pytest>=9.0,<10.0", "pytest-cov>=6.0,<8.0", "fakeredis>=2.0,<3.0"]
+asr = [
+    "sherpa-onnx>=1.13,<2.0",     # 本地推理引擎（自带 onnxruntime，wheel 较大）
+    "soundfile>=0.13,<0.15",      # 读 wav/音频文件（模式 F 输入解码）
+    "numpy>=1.26,<3.0",           # VAD 分段与 PCM 处理
+]
 
 [build-system]
 requires = ["setuptools>=61.0"]

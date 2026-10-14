@@ -8,6 +8,10 @@
 # 重新生成（需 uv）：
 #   uv pip compile pyproject.toml --python-version 3.12 -o requirements.lock            # full
 #   uv pip compile pyproject.toml --python-version 3.12 --no-extra dev -o requirements.txt  # prod
+#
+# ★ 2026-10-14：本机**无 uv** ⇒ ASR 相关行（numpy / python-multipart / sherpa-onnx /
+#   sherpa-onnx-core / soundfile）为**手工按本机已装版本同步**（见 pyproject 的 ``asr``
+#   extra）。下次有 uv 时整份重锁即可覆盖，无需特殊处理。
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
@@ -18,11 +22,28 @@ h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
 idna==3.20
+# ★ ASR（语音识别）运行时 —— 可选 extra ``.[asr]``，但**产品镜像需要它**：
+#   不装时 ``plugins.asr`` 引擎状态为 unavailable（端点 503 + 降级提示），不崩服务。
+#   传递依赖 sherpa-onnx-core 一并锁定（1.13.x 起引擎与 core 分包）。
+numpy==2.5.4
+    # via
+    #   agent-runtime (pyproject.toml)
+    #   soundfile
 opentelemetry-api==1.45.0
 pydantic==2.13.5
 pydantic-core==2.46.5
+python-multipart==0.0.32
+    # via agent-runtime (pyproject.toml)
 redis==8.1.0
+sherpa-onnx==1.13.8
+    # via agent-runtime (pyproject.toml)
+sherpa-onnx-core==1.13.8
+    # via sherpa-onnx
+soundfile==0.14.0
+    # via agent-runtime (pyproject.toml)
 starlette==1.7.0
 typing-extensions==4.16.0
 typing-inspection==0.4.4
-uvicorn==0.54.0
+# ★ [standard] extras 不可省：ASR 实时通道（/api/asr/ws）依赖 uvicorn 的 WebSocket
+#   协议实现（websockets / wsproto），裸装 uvicorn 不含它们 ⇒ WS 握手 404。
+uvicorn[standard]==0.54.0

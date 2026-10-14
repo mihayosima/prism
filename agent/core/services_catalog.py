@@ -57,6 +57,11 @@ class Services:
     #: 桥把本仓技能目录以 MCP 工具（``skill_list`` / ``skill_view``）对外暴露；
     #: 未启用（``skills_mcp.enabled=false``）时插件早退、不起子进程，但仍 provide 自身。
     SKILLS_MCP = "skills_mcp"
+    #: **语音识别**服务键（``plugins/asr``）：暴露 ``ASRService`` 门面
+    #: （``ensure_ready`` / ``transcribe_file`` / ``open_stream``）。
+    #: 端点（WS 实时流式 + 文件转写）在 ``run/chat.py`` 经 ``ctx.root.get`` **软取**，
+    #: 插件未启用 ⇒ None ⇒ 端点 503 明示 ⇒ 不崩服务（对齐 approval 的门面纪律）。
+    ASR = "asr"
 
 
 # 全部“内核服务键”值集合（供 AST 契约测试比对）
@@ -84,6 +89,7 @@ ALL = frozenset(
         Services.TODO,
         Services.SKILLS,
         Services.SKILLS_MCP,
+        Services.ASR,
     }
 )
 

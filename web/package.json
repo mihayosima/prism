@@ -13,10 +13,11 @@
     "check:views": "node --max-old-space-size=2048 tools/check-view-switch.mjs",
     "check:cards": "node --max-old-space-size=2048 tools/check-card-payload.mjs",
     "check:functional": "node --max-old-space-size=2048 tools/check-views-functional.mjs",
+    "check:asr": "node tools/check-asr-contract.mjs",
     "check:api": "node --max-old-space-size=2048 tools/check-api-contract.mjs",
     "check:direct": "node --max-old-space-size=2048 tools/check-direct-connect.mjs",
     "check:single": "node --max-old-space-size=2048 tools/check-single-port.mjs",
-    "check": "npm run typecheck && npm run check:sse && npm run check:cards && npm run check:views && npm run check:functional && npm run check:api",
+    "check": "npm run typecheck && npm run check:sse && npm run check:cards && npm run check:views && npm run check:functional && npm run check:api && npm run check:asr",
     "preview": "vite preview"
   },
   "dependencies": {

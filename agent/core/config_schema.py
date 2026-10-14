@@ -92,6 +92,12 @@ _SCHEMA: dict[str, Any] = {
         #   ``skills_mcp`` 登记（沿用 windows_mcp / playwright_mcp 的既有先例）。
         "skills": "_any",
         "skills_mcp": "_any",
+        # 语音识别（plugins.asr）：``_any`` 宽松节，理由与 skills/skills_mcp 同款——
+        # ``provider`` / ``sample_rate`` / ``num_threads`` / ``streaming`` / ``file`` / ``vad``
+        # 等键全部由插件自管（嵌套节还在各子层自行校验），标严格节只会让漏登记变成
+        # 装配期 ``ConfigError``（服务起不来）。**必须登记**：``_merge_cfg`` 把容器级
+        # 覆盖按 ``plugins.<名>`` → ``agent.<名>`` 映射进来，而 ``agent`` 节是严格校验节。
+        "asr": "_any",
         # G7 外部工具隔离（plugins.sandbox）：**逐键严格**而非 "_any"（沿用 context/budget 的纪律：
         # 拼错键在装配期即 fail-fast）。登记这一节是**硬前提**——``_merge_cfg`` 把容器级
         # 覆盖按 ``plugins.<名>`` → ``agent.<名>`` 映射进来，而 ``validate_config`` 在每次

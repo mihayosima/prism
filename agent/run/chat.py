@@ -68,11 +68,16 @@ _err_log = logging.getLogger("agent.chat")
 # FastAPI 用**模块全局**解析它们。故 ``Request``/``HTTPException`` 必须在模块级可见，
 # 只在 create_app 内局部 import 会被当成普通查询参数（实测：路由报 `query.request`
 # Field required，422）。fastapi 仍是**软依赖**（--once 无头形态不需要）：缺失时置 None。
+# ★ 同理，ASR 端点用到的 ``UploadFile``/``File``/``WebSocket`` 也必须在此登记：
+#   它们若只在 ``_register_asr`` 函数体内 import，签名注解会变成无法解析的 ForwardRef
+#   ⇒ pydantic ``TypeAdapter is not fully defined`` ⇒ 路由**根本注册不上**（实测踩过）。
 try:
     from fastapi import HTTPException, Request          # noqa: F401
+    from fastapi import File, UploadFile, WebSocket, WebSocketDisconnect  # noqa: F401
 except Exception:                                       # pragma: no cover
     Request = None                                      # type: ignore[assignment]
     HTTPException = None                                # type: ignore[assignment]
+    UploadFile = File = WebSocket = WebSocketDisconnect = None  # type: ignore[assignment]
 
 
 def _parse(argv: list[str] | None) -> argparse.Namespace:
@@ -755,6 +760,10 @@ class HandlerDeps:
     JSONResponse: type
     Request: type
     StreamingResponse: type
+    #: 访问令牌（2026-10-14，ASR WS 端点新增）。全局 http 中间件**不拦 WS 握手**
+    #: （Starlette 的 http 中间件只覆盖 http scope）⇒ WS 侧必须自行校验，否则开了
+    #: ``--token`` 的服务上 ``/api/asr/ws`` 会裸奔。空串 = 未启用鉴权（放行）。
+    token: str = ""
 
 
 def _register_probes(app, deps):
@@ -1543,12 +1552,201 @@ def _register_resources(app, deps):
             return JSONResponse({"ok": False, "error": f"参数错误: {exc}"}, status_code=400)
 
 
+#: 上传音频大小上限（模块级便于测试覆盖）：长录音常见 1–2 小时 wav
+#: （16kHz 单声道 ≈ 115MB/小时），200MB 留够余量。
+ASR_UPLOAD_MAX_BYTES = 200 * 1024 * 1024
+
+
+def _register_asr(app, deps):
+    """★ 语音识别路由（模式 R 的 WS + 模式 F 的文件转写）。
+
+    路由归属：``/api/asr/*`` 走**软取** ``Services.ASR``——插件（``plugins.asr``）
+    未启用时 ``_asr_or_none()`` 返回 ``None`` ⇒ 端点回 503 明示"插件未启用"，
+    **不崩服务**（对齐 ``approval_or_none`` 的既有纪律）。
+
+    两个端点都**不含任何编排/下游**（不写文档、不调分析）：ASR 只做"音频→文本"。
+
+    WS 协议（模式 R）
+    -----------------
+    客户端 → 服务端：
+      - 二进制帧：int16 PCM（16kHz mono，每帧 20–40ms）
+      - 文本帧 JSON：``{"type":"start"}`` / ``{"type":"stop"}``
+    服务端 → 客户端（文本帧 JSON）：
+      ``{"type":"ready"|"loading"|"partial"|"final"|"error", …}``
+
+    ★ **WS 内的鉴权**：全局 http 中间件**不拦** WS 握手（Starlette 的 http 中间件
+    只覆盖 http scope）⇒ 这里按 ``/api/`` 同款规则**自行校验** ``--token``
+    （query 或 Authorization 头），否则开了鉴权的服务上 WS 会裸奔。
+    """
+    c = deps.c
+    JSONResponse = deps.JSONResponse
+
+    def _asr_or_none():
+        if not c.root.has(Services.ASR):
+            return None
+        return c.root.get(Services.ASR)
+
+    def _token_ok(ws) -> bool:
+        """WS 侧 token 校验（与 ``_auth_mw`` 同口径：query → Authorization 头）。"""
+        expected = str(getattr(deps, "token", "") or "")
+        if not expected:
+            return True                      # 未启用鉴权 ⇒ 放行（与既有端点一致）
+        import hmac
+
+        got = str(ws.query_params.get("token") or "")
+        if not got:
+            auth = str(ws.headers.get("authorization") or "")
+            if auth[:7].lower() == "bearer ":
+                got = auth[7:].strip()
+        return hmac.compare_digest(got, expected)
+
+    @app.get("/api/asr/status")
+    async def _asr_status():
+        """只读：引擎是否就绪（前端据此决定要不要准备 Web Speech 降级）。"""
+        svc = _asr_or_none()
+        if svc is None:
+            return JSONResponse({"ok": False, "available": False,
+                                 "error": "ASR 插件未启用"}, status_code=503)
+        return JSONResponse({"ok": True, "available": True, "status": svc.status()})
+
+    @app.post("/api/asr/transcribe-file")
+    async def _asr_transcribe_file(file: UploadFile = File(...)):
+        """模式 F：长录音文件 → ``Segment[]``（VAD 分段 + 离线识别）。
+
+        - 格式支持以 libsndfile 为准（wav/flac/ogg/mp3 等）；**m4a/aac 不支持**，
+          读取失败如实回 400（不静默返回空结果——那是把错误说成"没说话"）；
+        - 超过 ``ASR_UPLOAD_MAX_BYTES``（200MB）⇒ 413（不把超大文件读进内存再报错）；
+        - 落盘到 ``data/asr_uploads/`` 临时目录，转写结束即删（不留用户音频）。
+        """
+        svc = _asr_or_none()
+        if svc is None:
+            return JSONResponse({"ok": False, "error": "ASR 插件未启用"}, status_code=503)
+
+        from agent.api import EngineUnavailable
+
+        name = str(getattr(file, "filename", "") or "audio.wav")
+        suffix = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ".wav"
+        upload_dir = Path("data/asr_uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        target = upload_dir / f"{uuid.uuid4().hex}{suffix}"
+        max_bytes = ASR_UPLOAD_MAX_BYTES
+        written = 0
+        try:
+            with open(target, "wb") as fh:
+                while True:
+                    chunk = await file.read(1 << 20)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > max_bytes:
+                        return JSONResponse(
+                            {"ok": False, "error": "文件超过 200MB 上限"},
+                            status_code=413)
+                    fh.write(chunk)
+            loop = asyncio.get_running_loop()
+            try:
+                result = await svc.transcribe_path(str(target), {})
+            except FileNotFoundError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+            except EngineUnavailable as exc:
+                inc_counter("agent_asr_unavailable_total")
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+            except (ValueError, RuntimeError) as exc:
+                # 解不动/损坏的音频：libsndfile 会抛这些 ⇒ 明确报错，不谎报"空结果"
+                return JSONResponse(
+                    {"ok": False, "error": f"无法解析音频（{suffix}）：{exc}"},
+                    status_code=400)
+            inc_counter("agent_asr_transcribe_file_total")
+            payload = result.to_dict()
+            return JSONResponse({"ok": True, **payload})
+        finally:
+            # 用户音频不留存（隐私：本地私有能力的底线）
+            try:
+                target.unlink(missing_ok=True)
+            except Exception:                   # noqa: BLE001
+                pass
+
+    @app.websocket("/api/asr/ws")
+    async def _asr_ws(ws: WebSocket):
+        """模式 R：流式识别（X-ASR）。见函数 docstring 的协议表。"""
+        if not _token_ok(ws):
+            await ws.close(code=4401)
+            return
+        await ws.accept()
+        svc = _asr_or_none()
+        if svc is None:
+            await ws.send_json({"type": "error", "error": "ASR 插件未启用"})
+            await ws.close(code=1011)
+            return
+        from agent.api import EngineUnavailable
+
+        await ws.send_json({"type": "loading"})
+        try:
+            await svc.ensure_ready()
+        except EngineUnavailable as exc:
+            # ★ 前端据此降级到 Web Speech ⇒ 必须给**可读原因**，不是 500
+            await ws.send_json({"type": "error", "error": str(exc)})
+            await ws.close(code=1011)
+            return
+
+        session = None
+        try:
+            await ws.send_json({"type": "ready"})
+            while True:
+                try:
+                    msg = await ws.receive()
+                except WebSocketDisconnect:
+                    break
+                mtype = msg.get("type")
+                if mtype == "websocket.disconnect":
+                    break
+                # 二进制帧 = PCM
+                if msg.get("bytes") is not None:
+                    if session is None:
+                        session = svc.open_stream()
+                    frames = await svc.feed_stream(session, msg["bytes"])
+                    for f in frames:
+                        await ws.send_json(f)
+                    continue
+                text = msg.get("text")
+                if text is None:
+                    continue
+                try:
+                    ctrl = json.loads(text)
+                except (ValueError, TypeError):
+                    continue
+                ctype = str(ctrl.get("type") or "")
+                if ctype == "stop":
+                    if session is not None:
+                        for f in await svc.finish_stream(session):
+                            await ws.send_json(f)
+                        session = None
+                    break
+                # start 帧：仅重置会话（首个 PCM 帧会懒建 session）
+                if ctype == "start" and session is not None:
+                    session.reset()
+        except EngineUnavailable as exc:
+            try:
+                await ws.send_json({"type": "error", "error": str(exc)})
+            except Exception:                   # noqa: BLE001
+                pass
+        except WebSocketDisconnect:
+            pass
+        finally:
+            if session is not None:
+                try:
+                    session.reset()
+                except Exception:               # noqa: BLE001
+                    pass
+            inc_counter("agent_asr_ws_connections_total")
+
+
 def _register_routes(app, deps):
     """★ 注册全部 HTTP 路由（2026-10-04 从 ``_serve`` 机械搬移）。
 
-    本函数只做**编排**：按固定顺序把同一个 ``HandlerDeps`` 交给三个域函数。
-    ① 探针/会话流 → ② approval → ③ 资源（``/api/settings`` 等）。
-    ④ 静态托管 ``mount("/")`` 由 ``_serve`` 在**本函数之后**追加
+    本函数只做**编排**：按固定顺序把同一个 ``HandlerDeps`` 交给各域函数。
+    ① 探针/会话流 → ② approval → ③ 资源（``/api/settings`` 等）→ ④ asr。
+    ⑤ 静态托管 ``mount("/")`` 由 ``_serve`` 在**本函数之后**追加
        （Starlette 按注册顺序匹配，Mount 会捕获其后一切 ⇒ 必须最后）。
 
     依赖经 ``HandlerDeps`` **整体**传递（2026-10-06 依赖显式化）：不再在此逐个
@@ -1558,10 +1756,13 @@ def _register_routes(app, deps):
 
     等价性守卫：``.workbuddy/verify_serve_split_equiv.py``
     （真跑一次 ``_serve``，与基线**逐字段比对有序路由表** + 断言 Mount 最后）。
+    ★ 新增 asr 后该守卫的基线需同步（路由表多两条）——它是**显式基线文件**，
+    不是自动发现的断言。
     """
     _register_probes(app, deps)
     _register_approval(app, deps)
     _register_resources(app, deps)
+    _register_asr(app, deps)
     from agent.run.skills_routes import register_skills_routes
     register_skills_routes(app, deps)
 
@@ -1777,7 +1978,7 @@ async def _serve(args: argparse.Namespace) -> int:
         identity=_identity, apply_rebuild=_apply_rebuild, sse=_sse,
         approval_or_none=_approval_or_none,
         JSONResponse=JSONResponse, Request=Request,
-        StreamingResponse=StreamingResponse)
+        StreamingResponse=StreamingResponse, token=_token)
     _register_routes(app, deps)
     # ---- B4：单端口托管前端产物（web/dist） ------------------------------------
     # 放在**全部 /api/* 路由注册之后**：Starlette 按注册顺序匹配，先注册者优先。

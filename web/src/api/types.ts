@@ -351,3 +351,63 @@ export interface SettingsPatchRequest {
 
 /** 设置写入作用域（G2 会话级化） */
 export type SettingsScope = 'container' | 'session'
+
+// ---------- ASR（语音输入，plugins.asr）----------
+
+/**
+ * 长录音转写的一个语音段（模式 F）。
+ * ⚠ 字段名**必须**与后端 `agent/plugins/asr/providers.py::Segment.to_dict()` 逐字一致
+ * （`snake_case`，不是本文件其余 DTO 的 camelCase）——后端未做 camel 转换。
+ */
+export interface AsrSegment {
+  index: number
+  start_sec: number
+  end_sec: number
+  text: string
+}
+
+/** `POST /api/asr/transcribe-file` 响应（`transcribe_file(...).to_dict()` + `ok`） */
+export interface AsrFileResponse {
+  ok: boolean
+  duration_sec: number
+  sample_rate: number
+  mode: string
+  segments: AsrSegment[]
+}
+
+/** `GET /api/asr/status` 中的引擎自述（`ASRService.status()`，未装配时整体 503） */
+export interface AsrEngineStatus {
+  state: 'idle' | 'loading' | 'ready' | 'unavailable'
+  reason: string
+  provider: {
+    name: string
+    streaming: boolean
+    file: boolean
+    ready: boolean
+    models?: Record<string, string>
+  }
+  models: Record<string, { dir: string; ready: boolean; missing: string[] }>
+}
+
+/**
+ * `GET /api/asr/status` 响应。
+ * ⚠ 该端点在插件未启用时返回 **503**（而非 200 + available:false），
+ * 与本文件其余"HTTP 错误一律抛 ApiRequestError"的约定不同 ⇒ 客户端需特殊处理。
+ */
+export interface AsrStatusResponse {
+  ok: boolean
+  available: boolean
+  status?: AsrEngineStatus
+  error?: string
+}
+
+/** `WS /api/asr/ws` 服务端帧类型（与后端 `_register_asr` 的发送点逐一对齐） */
+export type AsrWsFrame =
+  | { type: 'loading' }
+  | { type: 'ready' }
+  | { type: 'partial'; text: string }
+  | { type: 'final'; text: string }
+  | { type: 'error'; error: string }
+
+/** 录音采集源（AudioWorklet 优先，失败降级 ScriptProcessorNode） */
+export type AsrCaptureKind = 'worklet' | 'scriptprocessor'
