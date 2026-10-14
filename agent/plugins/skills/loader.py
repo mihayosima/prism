@@ -17,6 +17,31 @@ from .model import Skill
 
 logger = logging.getLogger(__name__)
 
+#: B3（2026-10-14）：目录式技能捆绑的资源扫描（scripts/ reference/ templates/
+#: examples/ assets/ 等）。深度 2、最多 50，避免把大目录全量灌进 skill_view 返回。
+_RESOURCE_MAX = 50
+_RESOURCE_MAX_DEPTH = 2
+
+
+def _scan_resources(base: Path) -> list[str]:
+    """扫目录式技能捆绑的资源文件（相对 basedir 的路径），深度 2、最多 50。
+
+    仅扫文件、跳过深层目录；返回相对 basedir 的路径，供 skill_view 一并返回。
+    """
+    if not base.is_dir():
+        return []
+    out: list[str] = []
+    for p in base.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(base)
+        if len(rel.parts) > _RESOURCE_MAX_DEPTH:
+            continue
+        out.append(rel.as_posix())            # 统一正斜杠（Agent Skills 标准，跨平台可移植）
+        if len(out) >= _RESOURCE_MAX:
+            break
+    return sorted(out)
+
 
 def _split_frontmatter(raw: str) -> tuple[str, str]:
     """拆分 ``---\\n...\\n---\\n...`` → (frontmatter, body)。无 frontmatter 则 ("", raw)。"""
@@ -120,6 +145,9 @@ def parse_skill_file(path: str | Path, default_name: str | None = None) -> Skill
         raise ValueError(f"技能文件 {p.name} 的 frontmatter 为空或缺少闭合 ---")
     fm = _parse_meta(meta)
     name = fm.get("name") or default_name or p.stem
+    # ★ B3：仅目录式技能（<name>/SKILL.md）扫捆绑资源；扁平式 basedir 是 skills/ 根，
+    # 扫了会把别的技能文件一并算进来，故跳过。
+    is_dir_skill = p.name == "SKILL.md"
     return Skill(
         name=name,
         description=fm.get("description", ""),
@@ -132,6 +160,7 @@ def parse_skill_file(path: str | Path, default_name: str | None = None) -> Skill
         enabled=True,
         source="file",
         basedir=str(p.parent),
+        resources=_scan_resources(p.parent) if is_dir_skill else [],
     )
 
 

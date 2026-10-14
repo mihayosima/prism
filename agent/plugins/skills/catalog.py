@@ -185,13 +185,17 @@ class SkillsCatalog:
         return (f"未知 action={action!r}（支持 load/invoke）", True)
 
     def index_block(self, max_chars: int = 8000) -> str:
-        """紧凑索引块（注入系统提示，免费常驻；超预算压缩/省略）。"""
+        """紧凑索引块（注入系统提示，免费常驻；超预算压缩/省略）。
+
+        ★ B1（2026-10-14）：改为 Claude Code 风 ``- name — <触发说明>`` 单行格式；
+        触发说明给足长度（``_slim(..., 200)``），因为它是模型做 Match 的唯一依据。
+        """
         lines = []
         for s in self._skills.values():
             if not s.enabled:
                 continue
             tag = "写" if s.risk != "read" else "读"
-            lines.append(f"- {s.name}（{tag}）：{_slim(s.description)}")
+            lines.append(f"- {s.name} — {_slim(s.description, 200)}（{tag}）")
         if not lines:
             return ""
         body = "\n".join(lines)

@@ -9,6 +9,8 @@
 | 2026-10-14 01:50 | v1.1 | **路径勘误（实施前必读）**：本文所引 `agent/run/skills_mcp_adapter.py` 已归位 `agent/plugins/skills/adapter.py`；`agent/core/skill.py` / `skills_catalog.py` / `skills_loader.py` 已归位 `agent/plugins/skills/` 下 `model.py` / `catalog.py` / `loader.py`（详见 `agent内部架构-开发文档.md` 2026-10-14 更新记录）。后续按本文施工时，所有旧路径一律按新路径执行；方案的技术判断（工具面、护栏、验收）不受影响 |
 | 2026-10-14 01:45 | v1.2 | **① P0 已实施**（提交 `fed1dcf`，2026-10-13）：skills 桥注册改传 risk，`skill_list`/`skill_view` 按 `_READ_ONLY_TOOLS` 白名单标 `read`、其余沿用 `write`（§1.3/§2.3/P0 节已同步标注）。**② 正文路径与行号按归位后代码全面校正**（适配器/目录/loader 新路径 + 真实行号）。**③ §2.4/§5 沙箱状态勘误**：`enforcement` 不再恒 `none`——分级沙箱 P4/P5 已落地（wsl2 进程级 / container 容器级后端），强度由真实后端驱动、off 档才是 `none`（详见 `分级沙箱对齐ClaudeCode方案-2026-10-13.md` v1.6）；本方案"路径不逃逸 + 默认关闭 + risk 审批"的宿主侧护栏设计不受影响，但**不得**再宣称"无任何隔离实现"。**④ §4 契约断言行改写**：适配器已与技能目录同包（包内相对导入合法），禁限是跨子系统直连（`sys.tasks`/`plugins.react`），不再是"只走 agent.api" |
 
+| 2026-10-14 15:44 | v1.3 | **B1–B3 已实施（策略 A，用户拍板）**：`allow_exec` 默认 **true**、`skills_mcp` 桥 `enabled` 默认 **true** ⇒ 开箱即用完全权限（直接操作电脑，无路径 jail）；`skill_view` 增 `view_range`、`index_block` 改 Claude Code 风 ``- name — 描述``；新增 Follow 三件套 `skill_bash`(danger)/`skill_file_create`(write)/`skill_str_replace`(write)，受 `SKILLS_ALLOW_EXEC` 门控（关 ⇒ 工具根本不出现，fail-closed）；`Skill.resources` + loader 资源扫描（深度2/最多50/正斜杠）+ `skill_view` 返回资源。**B4 社区直装搁置**（供应链风险）。命令黑名单机制保留、默认空。**§2.2「路径不逃逸」约束作废**（按用户"完全权限"诉求），§6 待拍板项全部收敛。 |
+
 > 前情：已提交 `2bcd35f`（Skill 插件 + 只读 MCP 适配器 + 格式对齐阶段 0/1/2）。
 > 本方案在此基础上补 **FastSkills MCP server 的完整工具面** 与 **对齐阶段 3/4/5**。
 > 相关文档：`Skill与MCP-Tool更新方案-2026-10-11.md`、`Skill对齐AgentSkills标准-基于FastSkills代码研究-2026-10-11.md`。
@@ -27,7 +29,7 @@
 | `approval.*`（ask / plan） | `plugins/approval/__init__.py:113,284` |
 | `agent.delegate` | `plugins/subagent/__init__.py:54` |
 | `todo.write` / `todo.list` | `plugins/todo/__init__.py:41,60` |
-| `mcp.playwright.*`(25) / `mcp.windows.*`(20) / `mcp.skills.*`(2) | 三个 MCP 桥 |
+| `mcp.playwright.*`(25) / `mcp.windows.*`(20) / `mcp.skills.*`(5) | 三个 MCP 桥（skills 现含 skill_list/view + Follow 三件套） |
 
 **结论：本仓无任何内置 shell / 文件读写工具**。命令执行与文件编辑目前只能借道 `windows_mcp`（外部 MCP，20 个工具）。
 因此 Follow 三件套是**真增量**，不是"重复造轮子"——这一点影响下面的工作量评估与护栏设计。
@@ -43,13 +45,13 @@
 
 | # | FastSkills 工具 | 现状 | 缺口性质 |
 | --- | --- | --- | --- |
-| A | `view` 的 `view_range` 分段读 | ❌ | 只读增强（大 SKILL.md 无法切片） |
-| B | `bash_tool`（cwd=`{baseDir}`，超时 120s） | ❌ | **执行能力**（社区技能跑 scripts/ 全靠它） |
-| C | `file_create` | ❌ | 写能力 |
-| D | `str_replace` | ❌ | 写能力 |
-| E | 阶段 3：索引块格式对齐 | ⏳ | `plugins/skills/catalog.py:187 index_block` |
-| F | 阶段 4：管理面展示捆绑资源 | ⏳ | `Skill` 无 `resources` 字段 |
-| G | 阶段 5：社区技能直装 | ⏳ | 无 `/api/skills/install` |
+| A | `view` 的 `view_range` 分段读 | ✅ 已实施（2026-10-14） | 只读增强 |
+| B | `skill_bash`（超时 120s，完全权限） | ✅ 已实施（2026-10-14，risk=danger） | **执行能力** |
+| C | `skill_file_create` | ✅ 已实施（2026-10-14） | 写能力 |
+| D | `skill_str_replace` | ✅ 已实施（2026-10-14） | 写能力 |
+| E | 阶段 3：索引块格式对齐（Claude Code 风） | ✅ 已实施（2026-10-14，`catalog.index_block`） | 索引可读性 |
+| F | 阶段 4：管理面展示捆绑资源 | ✅ 已实施（2026-10-14，`Skill.resources`+loader 扫描） | B3 资源发现 |
+| G | 阶段 5：社区技能直装 | ⏸ 本轮搁置（B4，供应链风险） | 无 `/api/skills/install` |
 | — | `search_cloud_skills` / `install_cloud_skill`（云注册表） | ❌ | **本方案不做**（外部依赖、运维增强，与"同款工具"正交） |
 
 ### 1.3 顺带发现的真实缺陷：MCP 工具风险级全被标成 `write`
@@ -83,14 +85,19 @@
 
 ⇒ 采用：适配器内 `asyncio.create_subprocess_shell`，cwd 锁定技能目录。
 
-### 2.2 三道硬约束（执行类工具）
+### 2.2 三道约束（执行类工具，2026-10-14 按策略 A 收口）
 
-1. **路径不逃逸**
-   - `skill_bash(cwd?)`：默认值 = 该技能 `basedir`；传入值 `Path(cwd).resolve()` 后必须 `is_relative_to(workdir)`，否则 `isError`。
-   - `skill_file_create` / `skill_str_replace(path)`：同上，必须落在 `workdir` 内。
-   - `workdir` = 配置 `workdir`，默认 `<data_dir>/skills_workspace`（新建），**不**默认指向整个 data 目录。
-2. **执行默认关闭**：配置 `allow_exec: false`（默认）。关闭时 `tools/list` **不返回** B/C/D 三个工具（比"返回但拒绝"更省 token、更不易误触）；开启后桥插件经环境变量 `SKILLS_ALLOW_EXEC=1` + `SKILLS_WORKDIR=<path>` 注入子进程。
-3. **超时 + 截断**：`timeout_s` 默认 120（可配 `exec_timeout_s`，上限 600）；stdout+stderr 合并后 `clip_text` 到 `output_max_chars`（默认 20000），并带回 `truncated` 标记。
+> ⚠️ **重大变更**：原"路径不逃逸"硬约束**已作废**——用户明确要求"完全权限、直接操作电脑"，
+> 故 Follow 三件套**不受 workdir jail 限制**（shell `cd` 本就可逃逸，jail 仅是假象）。安全靠
+> 分层：risk 分级（skill_bash=danger）+ 语义护栏（超时/截断/不静默覆盖/唯一替换）+ 可选命令黑名单，
+> 而非路径围栏。
+
+1. **执行默认开启（策略 A）**：`allow_exec` 与 `skills_mcp.enabled` **均默认 true** ⇒ 开箱即用完全权限。
+   关闭时 `tools/list` **不返回** B/C/D 三个工具（fail-closed：不可见即不可调用，不靠 guard 拦）。
+   桥经环境变量 `SKILLS_ALLOW_EXEC=1` + `SKILLS_WORKDIR=<用户主目录>` + `SKILLS_EXEC_TIMEOUT_S` + `SKILLS_BASH_DENY` 注入子进程。
+2. **`workdir` 仅作初始目录、不构成 jail**：默认 = `Path.home()`（用户主目录）；shell `cd` 可逃逸，符合"直接操作电脑"诉求。
+3. **超时 + 截断**：`SKILLS_EXEC_TIMEOUT_S` 默认 120（可配）；stdout+stderr 合并后截断到 20000 字符并附提示。
+4. **命令黑名单（机制在、默认空）**：`SKILLS_BASH_DENY` 逗号分隔；默认空 ⇒ 无拦截，完全权限；需收紧时往配置加命令片段即可。
 
 ### 2.3 风险级标注（修 1.3 缺陷）
 
@@ -98,7 +105,7 @@
   - `skill_list` / `skill_view` → `"read"`
   - `skill_bash` → `"danger"`
   - `skill_file_create` / `skill_str_replace` → `"write"`
-- 桥插件 `plugins/skills_mcp/__init__.py:190` 注册处取 risk 注册（✅ 已实施：现为 `risk="read" if name in _READ_ONLY_TOOLS else "write"`；后续 Follow 三件套落地时，白名单机制要升级为"按适配器声明的 risk 透传"，见 P2）。
+- 桥插件 `plugins/skills_mcp/__init__.py` 注册处取 risk：`risk="danger" if name in _DANGER_TOOLS else ("read" if name in _READ_ONLY_TOOLS else "write")`（✅ 已实施 2026-10-14：`_DANGER_TOOLS={"skill_bash"}`，Follow 三件套落地、`skill_bash` 标 `danger`）。
 - **本轮只改 skills 桥**；playwright / windows 桥的同款问题另开议题（属既有行为变更，需单独回归）。
 
 ### 2.4 沙箱的诚实说明
@@ -122,7 +129,7 @@
 
 验收（已过）：`/api/tools` 里 `mcp.skills.skill_list` 风险级 = read；plan 模式下仍可调。
 
-### P1 —— 只读增强 + 阶段 3（索引块格式）
+### P1 —— 只读增强 + 阶段 3（索引块格式）✅ 已实施（2026-10-14）
 | 落点 | 改动 |
 | --- | --- |
 | `_tools()` / `_HANDLERS` | `skill_view` 增 `view_range: [start, end]`（1-based，含端点；`-1` 表示到末尾，对齐 FastSkills `view` 语义） |
@@ -131,7 +138,7 @@
 
 验收：`code-review` 技能索引行显示为 `code-review — 对改动做评审…（含 Use when 触发语）`；`skill_view` 传 `view_range=[1,3]` 只回前三行。
 
-### P2 —— Follow 三件套（核心批次）
+### P2 —— Follow 三件套（核心批次）✅ 已实施（2026-10-14，策略 A）
 | 落点 | 改动 |
 | --- | --- |
 | `plugins/skills/adapter.py` | 新增 `_tool_bash` / `_tool_file_create` / `_tool_str_replace`，注册进 `_HANDLERS`；`_tools()` 按 `SKILLS_ALLOW_EXEC` 决定是否返回这三个 |
@@ -148,7 +155,7 @@ skill_str_replace(path: str, old: str, new: str, count?: int)    # old 必须唯
 ```
 验收：临时 `data/skills/echo/SKILL.md`，真子进程跑 `skill_bash(command="echo hi")` 返回 `hi`；`cwd="../../"` 被拒；超时用例返回 isError；`skill_list` 仍不含正文。
 
-### P3 —— 阶段 4：管理面展示捆绑资源
+### P3 —— 阶段 4：管理面展示捆绑资源 ✅ 已实施（2026-10-14，B3）
 | 落点 | 改动 |
 | --- | --- |
 | `plugins/skills/model.py` | `Skill` 增 `resources: list[str] = field(default_factory=list)`（相对 basedir 的相对路径） |
@@ -157,7 +164,7 @@ skill_str_replace(path: str, old: str, new: str, count?: int)    # old 必须唯
 | `run/skills_routes.py:42 _list_skills` | 透传（无需改签名）；`_get_skill`(:50) 已返回整卡 |
 | `web/src/views/SkillsView.vue` + `skills.logic.ts` | 详情区展示「捆绑资源」列表；**改完必须 `npm run build` 重建 `web/dist` 并查页面**（既有教训：不重建则页面看不到新产物） |
 
-### P4 —— 阶段 5：社区技能直装
+### P4 —— 阶段 5：社区技能直装 ⏸ 本轮搁置（B4，供应链风险，用户拍板）
 | 落点 | 改动 |
 | --- | --- |
 | `run/skills_routes.py` | 新增 `POST /api/skills/install {url, name?}`：下载（stdlib `urllib`）→ 解包（zip/tar）→ 校验根下存在 `SKILL.md` → 落到 `data/skills/<name>/` → 重载目录 |
@@ -199,10 +206,10 @@ skill_str_replace(path: str, old: str, new: str, count?: int)    # old 必须唯
 
 ---
 
-## 6. 待你拍板
+## 6. 待你拍板（已全部收敛，2026-10-14）
 
-1. **P2 默认开关**：`allow_exec` 默认 `false`（推荐，需显式开）还是默认 `true`（开箱即用，但一装上就带执行面）？
-2. **`workdir` 默认值**：`<data_dir>/skills_workspace`（推荐，独立目录）还是整个 `data` 目录（更方便但对 data 全局可写）？
-3. **`skill_bash` 是否需要命令黑名单**（如 `rm -rf` / `format` / `del /s`）？还是只靠 `risk=danger` + approval 问人？
-4. **P4 社区直装**是否本轮做（涉及网络出站与解包，风险面最大）？
-5. **P0 是否顺手覆盖 playwright / windows 桥**（统一修 `risk`）？
+1. **P2 默认开关** → **策略 A**：`allow_exec` 默认 `true`、`skills_mcp.enabled` 默认 `true`，开箱即用完全权限（直接操作电脑）。
+2. **`workdir` 默认值** → 用户主目录 `Path.home()`，**不构成 jail**（shell `cd` 可逃逸），契合"完全权限"。
+3. **`skill_bash` 命令黑名单** → 机制保留（`SKILLS_BASH_DENY`），**默认空**（无拦截）；需收紧时往配置加命令片段。
+4. **P4 社区直装** → **搁置**（供应链风险：下载即执行，本轮不做）。
+5. **P0 覆盖 playwright / windows 桥 risk** → 本轮未做（既有行为变更，需单独回归；列为待办）。

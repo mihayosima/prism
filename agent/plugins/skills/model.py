@@ -28,6 +28,9 @@ class Skill:
     risk: str = "read"               # "read" | "write"；影响 plan 模式裁剪
     tags: list[str] = field(default_factory=list)
     version: str = "0.1.0"
+    #: B3（2026-10-14）：目录式技能捆绑的资源相对路径（scripts/ reference/ …），
+    #: 由 loader 扫描填入，供 skill_view 一并返回（深度 2、最多 50，避免膨胀）。
+    resources: list[str] = field(default_factory=list)
     run: Callable[..., Any] | None = None   # 可选执行入口 run(ctx, **params) -> dict
     enabled: bool = True
     source: str = "file"             # "file" | "plugin"
@@ -43,7 +46,8 @@ class Skill:
 def skill(name: str, description: str, content: str = "", *,
           risk: str = "read", tags: list[str] | None = None,
           version: str = "0.1.0", run: Callable[..., Any] | None = None,
-          owner: str = "", source: str = "file", basedir: str = "") -> Skill:
+          owner: str = "", source: str = "file", basedir: str = "",
+          resources: list[str] | None = None) -> Skill:
     """构造一个技能。
 
     默认 ``source="file"``：绝大多数经工厂创建的技能是文件型；插件来源技能由调用方
@@ -52,7 +56,8 @@ def skill(name: str, description: str, content: str = "", *,
     """
     return Skill(name=name, description=description, content=content,
                  owner=owner, risk=risk, tags=tags or [], version=version,
-                 run=run, source=source, basedir=basedir)
+                 run=run, source=source, basedir=basedir,
+                 resources=resources or [])
 
 
 __all__ = ["Skill", "skill"]

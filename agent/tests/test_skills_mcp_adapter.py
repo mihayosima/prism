@@ -59,9 +59,15 @@ def test_notification_does_not_respond():
                       "params": {}}) is None
 
 
-def test_tools_list_exposes_two_readonly_tools():
-    names = [t["name"] for t in _tools()]
-    assert names == ["skill_list", "skill_view"]
+def test_tools_list_gating(monkeypatch):
+    """allow_exec 门控（B2）：关 ⇒ 仅 2 只读（fail-closed）；开 ⇒ 额外 3 执行工具。"""
+    monkeypatch.setenv("SKILLS_ALLOW_EXEC", "0")
+    assert [t["name"] for t in _tools()] == ["skill_list", "skill_view"]
+    monkeypatch.setenv("SKILLS_ALLOW_EXEC", "1")
+    assert [t["name"] for t in _tools()] == [
+        "skill_list", "skill_view", "skill_bash",
+        "skill_file_create", "skill_str_replace",
+    ]
     for t in _tools():
         assert "inputSchema" in t, f"{t['name']} 缺 inputSchema（build_task_schema 需要）"
 
@@ -156,6 +162,83 @@ def test_skill_dataclass_has_basedir():
     assert skill("skill.y", "d", basedir="/tmp/skills").basedir == "/tmp/skills"
 
 
+# ---------------------------- B2 Follow 三件套 + B1 view_range ---------------------------- #
+
+def test_skill_bash_executes(tmp_path, monkeypatch):
+    """B2：skill_bash 在宿主执行命令，合并 stdout/stderr 返回。"""
+    monkeypatch.setenv("SKILLS_ALLOW_EXEC", "1")
+    resp = _call(tmp_path, monkeypatch, "skill_bash", {"command": "echo hello-fastskills"})
+    assert resp["result"]["isError"] is False
+    assert "hello-fastskills" in _text(resp)
+
+
+def test_skill_bash_blacklist(tmp_path, monkeypatch):
+    """空黑名单默认无拦截；配置 SKILLS_BASH_DENY 后命中即拦（机制在、默认空）。"""
+    monkeypatch.setenv("SKILLS_ALLOW_EXEC", "1")
+    monkeypatch.setenv("SKILLS_BASH_DENY", "do-not-run")
+    resp = _call(tmp_path, monkeypatch, "skill_bash", {"command": "do-not-run --x"})
+    assert resp["result"]["isError"] is True
+    assert "黑名单" in _text(resp)
+
+
+def test_skill_file_create_writes_and_refuses_overwrite(tmp_path, monkeypatch):
+    """B2：写文件成功；已存在且不传 force ⇒ 拒绝；force=true ⇒ 覆盖。"""
+    monkeypatch.setenv("SKILLS_ALLOW_EXEC", "1")
+    target = tmp_path / "out.txt"
+    resp = _call(tmp_path, monkeypatch, "skill_file_create",
+                 {"path": str(target), "content": "v1"})
+    assert resp["result"]["isError"] is False
+    assert target.read_text(encoding="utf-8") == "v1"
+    resp2 = _call(tmp_path, monkeypatch, "skill_file_create",
+                  {"path": str(target), "content": "v2"})
+    assert resp2["result"]["isError"] is True
+    resp3 = _call(tmp_path, monkeypatch, "skill_file_create",
+                  {"path": str(target), "content": "v2", "force": True})
+    assert resp3["result"]["isError"] is False
+    assert target.read_text(encoding="utf-8") == "v2"
+
+
+def test_skill_str_replace_unique(tmp_path, monkeypatch):
+    """B2：唯一匹配替换成功；出现多次 ⇒ 报错（避免误改）。"""
+    monkeypatch.setenv("SKILLS_ALLOW_EXEC", "1")
+    target = tmp_path / "f.txt"
+    target.write_text("alpha beta alpha\n", encoding="utf-8")
+    resp = _call(tmp_path, monkeypatch, "skill_str_replace",
+                 {"path": str(target), "old_string": "beta", "new_string": "gamma"})
+    assert resp["result"]["isError"] is False
+    assert target.read_text(encoding="utf-8") == "alpha gamma alpha\n"
+    resp2 = _call(tmp_path, monkeypatch, "skill_str_replace",
+                  {"path": str(target), "old_string": "alpha", "new_string": "X"})
+    assert resp2["result"]["isError"] is True
+
+
+def test_skill_view_view_range(tmp_path, monkeypatch):
+    """B1：view_range 按 1-based 行切片。"""
+    _write_skill(tmp_path, "skill.lines", "多行技能", "L1\nL2\nL3\nL4\nL5")
+    resp = _call(tmp_path, monkeypatch, "skill_view",
+                 {"name": "skill.lines", "view_range": "2,4"})
+    assert resp["result"]["isError"] is False
+    assert _text(resp) == "L2\nL3\nL4"
+
+
+# ---------------------------- B3 资源扫描 ---------------------------- #
+
+def test_skill_view_lists_resources(tmp_path, monkeypatch):
+    """B3：目录式技能的捆绑资源经 skill_view 一并返回。"""
+    d = tmp_path / "skills" / "mytool"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text("---\nname: mytool\ndescription: 带资源\n---\n\n正文\n",
+                                encoding="utf-8")
+    (d / "scripts").mkdir()
+    (d / "scripts" / "run.py").write_text("x=1\n", encoding="utf-8")
+    (d / "reference.md").write_text("ref\n", encoding="utf-8")
+    resp = _call(tmp_path, monkeypatch, "skill_view", {"name": "mytool"})
+    assert resp["result"]["isError"] is False
+    text = _text(resp)
+    assert "scripts/run.py" in text
+    assert "reference.md" in text
+
+
 # ---------------------------- 配置登记 ---------------------------- #
 
 def test_config_schema_registers_skills_mcp_as_any():
@@ -207,14 +290,19 @@ def test_bridge_disabled_is_noop(tmp_path):
 
 
 def test_bridge_enabled_spawns_and_registers(tmp_path):
-    """启用态端到端：真起子进程 → 注册 ``mcp.skills.*`` → 调用真的拿到正文。"""
+    """启用态端到端：真起子进程 → 注册 ``mcp.skills.*``（策略 A：5 工具）→ 调用真的拿到正文。"""
     _write_skill(tmp_path, "skill.docker", "构建 docker 镜像", "步骤：docker build -t x .")
     ctx = _FakeCtx({"skills_mcp": {"enabled": True, "timeout_s": 30.0},
                     "db_path": str(tmp_path / "agent.db")})
     async def _flow():
         await SkillsMcp.apply(ctx)
-        assert sorted(ctx.tasks.registered) == ["mcp.skills.skill_list",
-                                                "mcp.skills.skill_view"]
+        assert sorted(ctx.tasks.registered) == [
+            "mcp.skills.skill_bash",
+            "mcp.skills.skill_file_create",
+            "mcp.skills.skill_list",
+            "mcp.skills.skill_str_replace",
+            "mcp.skills.skill_view",
+        ]
         # 真调一次：经 McpStdioClient 打到子进程
         handler = ctx.tasks.registered["mcp.skills.skill_view"]["handler"]
         res = await handler(name="skill.docker")
@@ -231,11 +319,11 @@ def test_bridge_enabled_spawns_and_registers(tmp_path):
 
 
 def test_read_only_tools_register_with_read_risk(tmp_path):
-    """★ P3 回归：只读工具必须标 ``risk="read"``，不能吃默认的 ``write``。
+    """★ P3 回归 + B2：只读工具 ``risk="read"``；skill_bash ``danger``；其余 write。
 
-    缺陷原貌：``sys/tasks.py`` 的 ``register(risk="write")`` 是默认值，三个 MCP 桥
-    注册时都没传 ⇒ 连 ``skill_list`` 这种纯读工具也是 write 级 ⇒ guard 在
-    ``risk.ask`` 下"读个技能也要问人"、plan 模式被裁。这条锁死修好的状态。
+    P3 缺陷原貌：``sys/tasks.py`` 的 ``register(risk="write")`` 是默认值，三个 MCP 桥
+    注册时都没传 ⇒ 连 ``skill_list`` 这种纯读工具也是 write 级。B2 扩展：``skill_bash``
+    是高危执行工具，须单独标 ``danger``（guard 默认可配 ``risk.danger=ask`` 收紧）。
     """
     _write_skill(tmp_path, "skill.docker", "构建 docker 镜像", "步骤：docker build")
     ctx = _FakeCtx({"skills_mcp": {"enabled": True, "timeout_s": 30.0},
@@ -243,8 +331,13 @@ def test_read_only_tools_register_with_read_risk(tmp_path):
     async def _flow():
         await SkillsMcp.apply(ctx)
         risks = {n: (rec or {}).get("risk") for n, rec in ctx.tasks.registered.items()}
-        assert risks == {"mcp.skills.skill_list": "read",
-                         "mcp.skills.skill_view": "read"}, f"risk 未修正: {risks}"
+        assert risks == {
+            "mcp.skills.skill_list": "read",
+            "mcp.skills.skill_view": "read",
+            "mcp.skills.skill_bash": "danger",
+            "mcp.skills.skill_file_create": "write",
+            "mcp.skills.skill_str_replace": "write",
+        }, f"risk 未修正: {risks}"
         if ctx.effect_fn is not None:
             await ctx.effect_fn()
 

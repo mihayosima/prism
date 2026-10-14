@@ -1,14 +1,16 @@
-"""插件包：skills_mcp —— 只读技能 MCP 桥（把本仓技能目录以 MCP 工具对外暴露）。
+"""插件包：skills_mcp —— 技能 MCP 桥（把本仓技能目录以 MCP 工具对外暴露；只读 + 可选执行）。
 
 与 ``playwright_mcp`` / ``windows_mcp`` **同形态**：起一个 stdio 子进程（技能目录自带的
 ``agent.plugins.skills.adapter``），把它的工具注册进 agent 工具目录，供 chat tool_call 调用。
 
-- **只读**：对端只暴露 ``skill_list`` / ``skill_view``，无任何写/执行动作（执行仍由内核
-  ``Skill.run`` 承担）。
+- **只读 + 可选执行**：对端常驻 ``skill_list`` / ``skill_view``；配置 ``allow_exec``（默认开）
+  时**额外**暴露 Follow 三件套（``skill_bash`` / ``skill_file_create`` / ``skill_str_replace``），
+  在宿主环境直接操作电脑。执行能力**不经**内核 ``Skill.run``，由对端 adapter 子进程直接落地。
 - **子进程无 ctx**：适配器拿不到 ``ctx``，故经环境变量 ``SKILLS_DATA_DIR`` 把数据目录
   传进去，让它从磁盘重建目录——与内核 ``plugins/skills`` 读同一份 ``<data_dir>/skills/*.md``。
   数据目录取法同 ``plugins/skills._resolve_data_dir``（= ``db_path`` 的父目录）。
-- **默认未启用**：配置节 ``enabled`` 为真才起子进程；否则 ``apply`` 早退，
+- **默认启用（策略 A，2026-10-14）**：``enabled`` 默认真（除非显式 ``false``）即起子进程；
+  若需关闭，配置节写 ``enabled: false`` 即 ``apply`` 早退——
   **不起进程、不 import 对端模块、不注册工具**，零影响。
   配置节位置见 ``_section``：``agent.skills_mcp``（覆盖文件通路）优先，回退顶层 ``skills_mcp``。
 - **零耦合**：本插件只 import ``agent.api``；不 import ``sys.skills`` / ``sys.tasks`` /
@@ -35,8 +37,10 @@ _BRIDGE = "skills_mcp"
 #: 依据：``plugins/skills/adapter.py`` 的两个工具只读 ``data/skills`` 后返回文本
 #（``skill_list`` 列卡片、``skill_view`` 读正文），**无任何写/执行副作用**。
 #: 未列入本集合的工具一律沿用 ``risk="write"``（保守：不因猜错而放行危险工具）。
-#: ⚠️ 后续 Follow 三件套（skill_bash/file_create/str_replace）**绝不可**加进这里。
+#: ★ B2（2026-10-14）：``skill_bash`` 是**高危**执行工具，单独列 ``_DANGER_TOOLS``，
+# 注册时标 ``risk="danger"``（guard 默认可配 ``risk.danger=ask`` 收紧；当前默认 open 放行）。
 _READ_ONLY_TOOLS = frozenset({"skill_list", "skill_view"})
+_DANGER_TOOLS = frozenset({"skill_bash"})
 
 #: 适配器模块（以 ``python -m`` 方式拉起，无需额外安装任何依赖）。
 #: ★ 2026-10-14 归位：适配器从 ``agent.run`` 迁入 **``plugins/skills`` 包内**
@@ -91,7 +95,7 @@ class SkillsMcp:
     provides = [Services.SKILLS_MCP]
     # apply() 里 ctx.tasks.register(...)：声明内核服务依赖，装配顺序才可机器校验
     inject = [Services.TASKS]
-    description = "只读技能 MCP 桥（skill_list / skill_view；经 stdio 子进程暴露本仓技能）"
+    description = "技能 MCP 桥（skill_list / skill_view 只读；allow_exec 开时加 skill_bash / skill_file_create / skill_str_replace 直接操作电脑）"
 
     def __init__(self):
         self._client: McpStdioClient | None = None
@@ -138,9 +142,22 @@ class SkillsMcp:
             return None
 
     def _spawn(self, cfg: dict) -> McpStdioClient:
-        """按配置造一个客户端（注入 ``SKILLS_DATA_DIR``；装上沙箱时再叠落点）。"""
+        """按配置造一个客户端（注入 SKILLS_DATA_DIR / SKILLS_ALLOW_EXEC / SKILLS_WORKDIR /
+        SKILLS_EXEC_TIMEOUT_S / SKILLS_BASH_DENY；装上沙箱时再叠落点）。"""
         command, args, timeout = resolve(cfg, {})
-        env = {"SKILLS_DATA_DIR": self._data_dir()}
+        # ★ B2（2026-10-14，策略 A）：默认完全权限——allow_exec 默认开、workdir 默认用户主目录
+        # （shell ``cd`` 仍可逃逸，故"workdir"仅作初始目录，不构成路径 jail）。
+        allow_exec = cfg.get("allow_exec", True)
+        workdir = str(cfg.get("workdir") or Path.home())
+        deny = cfg.get("bash_deny") or []
+        deny_str = ",".join(deny) if isinstance(deny, list) else str(deny)
+        env = {
+            "SKILLS_DATA_DIR": self._data_dir(),
+            "SKILLS_ALLOW_EXEC": "1" if allow_exec else "0",
+            "SKILLS_WORKDIR": workdir,
+            "SKILLS_EXEC_TIMEOUT_S": str(float(cfg.get("timeout_s", 120.0))),
+            "SKILLS_BASH_DENY": deny_str,
+        }
         env.update({str(k): str(v) for k, v in (cfg.get("env") or {}).items()})
         ws = self._workspace()
         if ws:
@@ -160,8 +177,8 @@ class SkillsMcp:
         cfg = _section(ctx)
         self._cfg = cfg
         self._ctx = ctx
-        if not cfg.get("enabled", False):
-            # 未启用：只登记自身（供 status/插件页显示），不起进程、不注册工具 ⇒ 零影响
+        if not cfg.get("enabled", True):
+            # 未启用（显式 enabled=false）：只登记自身（供 status/插件页显示），不起进程、不注册工具 ⇒ 零影响
             ctx.provide(Services.SKILLS_MCP, self)
             return
         client = self._spawn(cfg)
@@ -190,7 +207,9 @@ class SkillsMcp:
             ctx.tasks.register(ctx, f"mcp.skills.{name}", schema=task_schema,
                                handler=self._make_handler(name),
                                owner=self.name,
-                               risk="read" if name in _READ_ONLY_TOOLS else "write",
+                               risk=("danger" if name in _DANGER_TOOLS
+                                     else "read" if name in _READ_ONLY_TOOLS
+                                     else "write"),
                                description=f"skills-mcp: {t.get('description') or name}")
         ctx.provide(Services.SKILLS_MCP, self)
         ctx.effect(self._close)

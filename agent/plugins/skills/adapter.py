@@ -1,10 +1,12 @@
-"""agent.plugins.skills.adapter —— 只读技能 MCP 服务器（stdlib stdio JSON-RPC）。
+"""agent.plugins.skills.adapter —— 技能 MCP 服务器（stdlib stdio JSON-RPC；只读 + 可选执行）。
 
 把本仓 ``Services.SKILLS`` 的技能目录以 MCP 工具形式对外暴露，供子 agent / 外部 MCP
 客户端消费。设计要点（均经真实代码核实）：
 
-- **只读**：仅暴露 ``skill_list`` / ``skill_view`` 两个读工具，不提供任何写/执行动作。
-  执行能力由技能自带的 ``Skill.run`` 承担，**不经**本适配器。
+- **只读 + 可选执行**：常驻暴露 ``skill_list`` / ``skill_view`` 两个只读工具；配置
+  ``SKILLS_ALLOW_EXEC=1``（桥默认开，策略 A）时**额外**暴露 Follow 三件套
+  （``skill_bash`` / ``skill_file_create`` / ``skill_str_replace``），在宿主环境
+  直接操作电脑（受 120s 超时、20k 截断、可选命令黑名单约束）。执行**不经**内核 ``Skill.run``。
 - **零第三方依赖**：``core/mcp_client.py`` 是 stdlib 的 JSON-RPC stdio 客户端，本模块是
   它的**对端**——同样用 stdlib 手写服务端。实测本机 ``fastmcp`` / ``mcp`` 均未安装且无 uv，
   故不走框架路线（方案 §7-5 的「手写 stdio 桥」选项）。
@@ -31,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -89,7 +92,7 @@ def _tool_list(args: dict) -> tuple[str, bool]:
 
 
 def _tool_view(args: dict) -> tuple[str, bool]:
-    """``skill_view``：读取单个技能的完整正文（``{baseDir}`` 已替换）。"""
+    """``skill_view``：读取单个技能的完整正文（``{baseDir}`` 已替换）；可选 ``view_range`` 行切片。"""
     name = str(args.get("name") or "").strip()
     if not name:
         return "参数 name 必填", True
@@ -97,15 +100,144 @@ def _tool_view(args: dict) -> tuple[str, bool]:
     s = cat.load(name)
     if s is None:
         return f"未找到技能 {name!r}", True
-    return cat.render_content(s), False
+    text = cat.render_content(s)
+    vr = args.get("view_range")
+    if vr:
+        try:
+            if isinstance(vr, str):
+                vr = [int(x) for x in vr.split(",")]
+            start, end = int(vr[0]), int(vr[1])
+            lines = text.split("\n")
+            if start < 1:
+                start = 1
+            if end > len(lines):
+                end = len(lines)
+            if start > end:
+                return "view_range 非法：start > end", True
+            text = "\n".join(lines[start - 1:end])
+        except Exception as exc:                       # noqa: BLE001
+            return f"view_range 解析失败：{exc}", True
+    resources = getattr(s, "resources", None) or []
+    if resources:
+        text += "\n\n## 捆绑资源（B3）\n" + "\n".join(f"- {r}" for r in resources)
+    return text, False
 
 
-_HANDLERS = {"skill_list": _tool_list, "skill_view": _tool_view}
+# --------------------------------------------------------------------------- #
+# 执行类工具（Follow 三件套，B2：受 SKILLS_ALLOW_EXEC 门控）
+# --------------------------------------------------------------------------- #
+
+_TRUNCATE_CHARS = 20000
+
+
+def _allow_exec() -> bool:
+    """门控：allow_exec=false 时执行类工具整体不可见（fail-closed）。"""
+    return os.environ.get("SKILLS_ALLOW_EXEC", "0") == "1"
+
+
+def _exec_timeout() -> float:
+    try:
+        return max(1.0, float(os.environ.get("SKILLS_EXEC_TIMEOUT_S", "120")))
+    except ValueError:
+        return 120.0
+
+
+def _bash_deny() -> list[str]:
+    """命令黑名单（默认空 ⇒ 无拦截，完全权限）。可经 SKILLS_BASH_DENY 配置。"""
+    raw = os.environ.get("SKILLS_BASH_DENY", "") or ""
+    return [x.strip().lower() for x in raw.split(",") if x.strip()]
+
+
+def _truncate(text: str) -> str:
+    if len(text) > _TRUNCATE_CHARS:
+        return text[:_TRUNCATE_CHARS] + f"\n…[输出已截断至 {_TRUNCATE_CHARS} 字符]"
+    return text
+
+
+def _tool_bash(args: dict) -> tuple[str, bool]:
+    """``skill_bash``：在宿主环境执行 shell 命令（完全权限，直接操作电脑）。"""
+    cmd = str(args.get("command") or "").strip()
+    if not cmd:
+        return "参数 command 必填", True
+    low = cmd.lower()
+    for den in _bash_deny():
+        if den and den in low:
+            return f"命令被黑名单拦截：命中 {den!r}", True
+    cwd = os.environ.get("SKILLS_WORKDIR") or os.getcwd()
+    try:
+        proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True,
+                              text=True, timeout=_exec_timeout(),
+                              encoding="utf-8", errors="replace")
+    except subprocess.TimeoutExpired as exc:
+        out = (exc.stdout or "") + (exc.stderr or "")
+        return _truncate(f"[超时 >{_exec_timeout():.0f}s 已中断]\n" + out), True
+    except Exception as exc:                       # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}", True
+    return _truncate(f"$ {cmd}\n\n" + ((proc.stdout or "") + (proc.stderr or ""))), False
+
+
+def _tool_file_create(args: dict) -> tuple[str, bool]:
+    """``skill_file_create``：写/创建文件（不静默覆盖；存在且非 force 则报错）。"""
+    path = str(args.get("path") or "").strip()
+    content = str(args.get("content") or "")
+    force = bool(args.get("force", False))
+    if not path:
+        return "参数 path 必填", True
+    p = Path(path)
+    if p.exists() and not force:
+        return f"文件已存在（如需覆盖请传 force=true）：{path}", True
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+    except Exception as exc:                       # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}", True
+    return f"已写入 {p}（{len(content)} 字符）", False
+
+
+def _tool_str_replace(args: dict) -> tuple[str, bool]:
+    """``skill_str_replace``：文件内唯一匹配替换（不匹配/多匹配均报错）。"""
+    path = str(args.get("path") or "").strip()
+    old = str(args.get("old_string") or "")
+    new = str(args.get("new_string") or "")
+    if not path:
+        return "参数 path 必填", True
+    if not old:
+        return "参数 old_string 必填", True
+    p = Path(path)
+    if not p.exists():
+        return f"文件不存在：{path}", True
+    try:
+        text = p.read_text(encoding="utf-8")
+    except Exception as exc:                       # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}", True
+    count = text.count(old)
+    if count == 0:
+        return "old_string 未在文件中出现", True
+    if count > 1:
+        return f"old_string 出现 {count} 次，不唯一；请提供更长上下文", True
+    try:
+        p.write_text(text.replace(old, new, 1), encoding="utf-8")
+    except Exception as exc:                       # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}", True
+    return f"已在 {p} 替换 1 处", False
+
+
+_HANDLERS = {
+    "skill_list": _tool_list,
+    "skill_view": _tool_view,
+    "skill_bash": _tool_bash,
+    "skill_file_create": _tool_file_create,
+    "skill_str_replace": _tool_str_replace,
+}
 
 
 def _tools() -> list[dict]:
-    """MCP ``tools/list`` 返回的工具清单（含 inputSchema，供 ``build_task_schema`` 转换）。"""
-    return [
+    """MCP ``tools/list`` 返回的工具清单（含 inputSchema，供 ``build_task_schema`` 转换）。
+
+    ★ B2（2026-10-14）：执行类工具（Follow 三件套）受 ``SKILLS_ALLOW_EXEC`` 门控——
+    关闭时**根本不返回**，fail-closed（不可见即不可调用，不靠 guard 拦）。
+    """
+    tools = [
         {
             "name": "skill_list",
             "description": ("列出可用技能（只读）：返回名称/描述/风险/来源，**不含正文**。"
@@ -123,16 +255,62 @@ def _tools() -> list[dict]:
         {
             "name": "skill_view",
             "description": ("读取指定技能的完整说明正文（只读）。正文里的 {baseDir} 占位"
-                            "已替换成该技能文件所在目录。"),
+                            "已替换成该技能文件所在目录。可传 view_range 按行切片。"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "技能名，如 docker-build / skill.docker（不存在的名字会报错）"},
+                    "view_range": {"type": "string",
+                                   "description": "可选，行切片 'start,end'（1-based，含 end），如 '1,50'"},
                 },
                 "required": ["name"],
             },
         },
     ]
+    if _allow_exec():
+        tools += [
+            {
+                "name": "skill_bash",
+                "description": ("在宿主环境执行 shell 命令（完全权限，直接操作电脑）。"
+                                "返回合并的 stdout/stderr，超时与超长自动截断。"),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "要执行的 shell 命令"},
+                    },
+                    "required": ["command"],
+                },
+            },
+            {
+                "name": "skill_file_create",
+                "description": ("写/创建文件（不静默覆盖：已存在且未传 force=true 会报错）。"
+                                "直接操作电脑，路径可为绝对或相对 SKILLS_WORKDIR。"),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "文件写入路径"},
+                        "content": {"type": "string", "description": "文件内容（默认空）"},
+                        "force": {"type": "boolean", "description": "已存在时是否覆盖，默认 false"},
+                    },
+                    "required": ["path"],
+                },
+            },
+            {
+                "name": "skill_str_replace",
+                "description": ("文件内唯一匹配替换：old_string 必须精确出现且仅出现一次，"
+                                "否则报错（避免误改）。直接操作电脑。"),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "目标文件路径"},
+                        "old_string": {"type": "string", "description": "待替换的原文（须唯一）"},
+                        "new_string": {"type": "string", "description": "替换后的新文（默认空=删除）"},
+                    },
+                    "required": ["path", "old_string"],
+                },
+            },
+        ]
+    return tools
 
 
 # --------------------------------------------------------------------------- #
