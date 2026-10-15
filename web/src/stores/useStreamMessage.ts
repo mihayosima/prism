@@ -175,6 +175,8 @@ export function createStreamKernel(opts: StreamKernelOptions): StreamKernel {
         if (bufThink) {
           appendText(tk, bufThink)
           bufThink = ''
+          // 流式且展开时贴底，保证最新思考可见（固定窗口内滚动，不撑高整页）
+          if (think && think.open) tk.scrollTop = tk.scrollHeight
         }
       },
 

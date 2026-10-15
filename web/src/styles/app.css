@@ -45,6 +45,17 @@ section[data-view].active{display:flex;flex-direction:column}
 .text code{background:var(--brand-soft);color:var(--brand-ink);border-radius:4px;padding:1px 5px;font-family:var(--mono);font-size:12px}
 .text b{font-weight:600}
 .msg.user .text{display:none}
+/* 思考过程：固定窗口 + 滚动条（仿 WorkBuddy 推理折叠区，D4） */
+.think{margin:0 0 8px;border:1px solid var(--line);border-radius:var(--r);background:var(--card);overflow:hidden}
+.think>summary{display:flex;align-items:center;gap:6px;padding:8px 12px;cursor:pointer;font-size:12px;color:var(--muted);user-select:none;list-style:none}
+.think>summary::-webkit-details-marker{display:none}
+.think>summary::before{content:"▸";font-size:10px;color:var(--muted2);transition:transform .15s}
+.think[open]>summary::before{transform:rotate(90deg)}
+.think>summary:hover{background:var(--bg)}
+.tk{max-height:220px;overflow-y:auto;padding:0 12px 10px;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+.tk::-webkit-scrollbar{width:8px}
+.tk::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
+.tk::-webkit-scrollbar-track{background:transparent}
 /* step trace（tool calls，dsh 签名） */
 .steps{margin-top:8px;border:1px solid var(--line);border-radius:var(--r);background:var(--card);overflow:hidden}
 .step{border-bottom:1px solid var(--line);font-size:12.5px}
