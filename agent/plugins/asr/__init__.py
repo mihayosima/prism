@@ -122,7 +122,9 @@ class ASR:
     version = "0.1.0"
     layer = "business"
     provides = [Services.ASR]
-    inject = []                      # 不需要内核服务（配置经 ctx.config / 会话视图读）
+    # ★ 工具暴露（整合进 agent 工作流）：注册 ``asr.transcribe_file`` 需要内核任务注册表，
+    #   故声明注入 TASKS（system 层先装配，无循环依赖，与 skills_mcp 同姿态）。
+    inject = [Services.TASKS]
     tables = ()                      # 无持久表：识别结果经端点返回，不落库
 
     async def apply(self, ctx) -> None:
@@ -135,6 +137,35 @@ class ASR:
         #   内部承担（状态机可见），端点要的就是可直接调用的门面。给函数会让
         #   ``ctx.get(Services.ASR).status()`` 直接 AttributeError（已实测踩到）。
         ctx.provide(Services.ASR, self._service)
+
+        # ★ 暴露为 agent 工具（让 LLM 在推理中主动转写本地音频，整合进工作流）。
+        #   - owner=self.name ⇒ 工具域 ``plugins.asr``，可在 ``tool_domains`` 白名单裁剪；
+        #   - risk="read"：仅读取文件、不改任何状态（对齐 skill_list/skill_view 的只读归类）；
+        #   - handler 走 ``transcribe_path``（读文件→重采样→VAD 分段→离线识别），引擎未就绪时
+        #     由 ``ASRService.ensure_ready`` 抛 ``EngineUnavailable``，**不静默**、不谎报。
+        async def _transcribe_file(path: str, min_segment_sec: float = 0.0) -> dict:
+            result = await self._service.transcribe_path(
+                path, {"min_segment_sec": float(min_segment_sec or 0.0)})
+            return result.to_dict()
+
+        ctx.tasks.register(
+            ctx, "asr.transcribe_file",
+            schema={
+                "path": {"type": "str", "required": True,
+                         "description": "音频文件绝对路径或相对项目根的路径"},
+                "min_segment_sec": {"type": "float", "required": False, "default": 0.0,
+                                   "description": "过滤短于该秒数的语音段（默认 0 不过滤）"},
+            },
+            handler=_transcribe_file,
+            owner=self.name,
+            description=(
+                "转写本地音频文件为带时间戳的文本段列表。"
+                "支持 wav/flac/ogg/mp3 等（以 libsndfile 为准）；m4a/aac/wma 不支持会报错。"
+                "返回 {duration_sec, sample_rate, mode, segments:[{index,start_sec,end_sec,text}]}。"
+                "仅读取文件、不修改任何状态。"
+            ),
+            risk="read",
+        )
 
         def _dispose() -> None:
             self._service.dispose()
