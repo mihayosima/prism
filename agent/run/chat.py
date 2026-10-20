@@ -308,7 +308,7 @@ _SETTING_META: dict[str, dict] = {
     # ---- 模型生成上限（agent.llm；单次 API 调用的输出 token 上限，reasoning 与正文共享）----
     # 容器级：属「模型属性」（同 cost_calibration / provider），会话化无意义；改后重建容器生效。
     # 调大可为长正文预留空间、降低 reasoning 占满触顶导致的空响应
-    # （见 docs/refactor/React空响应与reasoning膨胀修复方案-2026-10-11.md 方案 C）。
+    # （见 docs/plugins/react/React空响应与reasoning膨胀修复方案-2026-10-11.md 方案 C）。
     "max_tokens": {
         "spec": (int, 1024, 1_000_000), "plugin": "plugins.llm",
         "default": 8192, "scope": "container"},

@@ -47,7 +47,7 @@ BASE_AGENT_CONFIG: dict = {
                   # enabled 默认 **关**（与 lazy_tools 同款灰度纪律，未启用逐字节等价现状）；
                   # 白名单为空视同未配置（**不做全隐藏**，避免一处笔误把工具全关掉）。
                   # 硬前提：仅 lazy_tools=True 时生效——非懒加载无检索通道，裁剪＝死锁。
-                  # 详见 docs/governance/工具税域级裁剪实施方案-2026-09-30.md
+                  # 详见 docs/reports/context/工具税域级裁剪实施方案-2026-09-30.md
                   "tool_domains_enabled": False,
                   "tool_domains": [],
                   "alignment_enabled": True},

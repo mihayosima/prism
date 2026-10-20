@@ -13,7 +13,7 @@ CORE = AGENT_PKG / "core"
 # 业务词清单（来自业务文档词表）：出现在内核树即判污染
 # ★ 2026-10-14：「skill」已移出本表——**同形异义**（先例见下 ``test_core_business_terms_are_domain_neutral``
 #   对 ``order`` 的处理：`_Listener.order` 是"执行序"不是"订单"，加入前必须确认内核用法无歧义）。
-#   词表里的 skill 指**选品域的策略技能**（`docs/archive/选品策略技能库-设计.md`：
+#   词表里的 skill 指**选品域的策略技能**（早期归档文档《选品策略技能库-设计.md》，已随 `docs/archive/` 清空删除：
 #   ``skills/`` = 20 条选品策略 YAML、``agent/skills`` = 策略注册表、``run_skill`` →
 #   评分/排榜），与 Skill 插件系统**不是同一概念**——后者是 harness 自身的扩展机制
 #   （skill.md 指令包 + 元工具/lazy 注入），按设计文档三层语义属插件层设施

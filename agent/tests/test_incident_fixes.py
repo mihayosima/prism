@@ -1,4 +1,4 @@
-"""事故修复一期测试（docs/governance/事故修复计划-预算与截断-2026-09-28.md）：
+"""事故修复一期测试（docs/reports/context/事故修复计划-预算与截断-2026-09-28.md）：
 
 - A：预算收尾预留额度（正常调用 max-reserve 封顶、finalize=True 可用至 max）
 - B：缺参报错附必填/可省清单

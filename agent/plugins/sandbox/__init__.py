@@ -18,7 +18,7 @@
 
 **为什么要转**：此前本插件同时持有一份 allow/deny/risk 名单，与 ``sys/guard.py``
 **功能重叠** —— 两份配置并存、互相打洞、无单一真相。核定过程见
-``docs/reform of production line/沙箱与权限管理器重叠核定-2026-10-03.md``。
+``docs/sandbox/沙箱与权限管理器重叠核定-2026-10-03.md``。
 名字匹配（尾部 ``*``）与域限定（``targets``）已迁入 guard（guard 是 ``LLM_PRE_CALL``
 的**唯一**挂载者，也是唯一覆盖非 MCP 内置工具的裁决者）。
 
@@ -310,7 +310,7 @@ def _config(ctx) -> dict:
 class Sandbox:
     """外部工具**隔离档位提供方**（不再裁决准入——那是 guard / approval 的活）。
 
-    2026-10-03 转型（依据 ``docs/reform of production line/沙箱与权限管理器重叠核定-2026-10-03.md``）：
+    2026-10-03 转型（依据 ``docs/sandbox/沙箱与权限管理器重叠核定-2026-10-03.md``）：
     本插件曾同时做"策略判定"与"审计"，而策略判定与 ``sys/guard.py`` **功能重叠**（两份名单
     并存、互相打洞、无单一真相）。现按下述分工收敛：
 

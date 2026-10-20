@@ -1,6 +1,6 @@
 """沙箱 confinement **后端**骨架（P0，2026-10-13）。
 
-设计依据 ``docs/refactor/分级沙箱对齐ClaudeCode方案-2026-10-13.md`` v1.2。
+设计依据 ``docs/sandbox/分级沙箱对齐ClaudeCode方案-2026-10-13.md`` v1.2。
 
 ★ **为什么落 ``core``**（分层铁律）：后端要被插件/传输层构造，而 ``agent/api.py``
 **不得 import ``agent.sys``** ⇒ 任何需被插件取用的对象必须能被 api 导出 ⇒ 只能落 core。

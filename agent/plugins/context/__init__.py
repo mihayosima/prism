@@ -3,7 +3,7 @@
 目录插件（agent/plugins/context），语义上是**系统组件**（layer=system，
 与 guard/budget 同级）；来源（目录）决定生命周期——经「插件」页可启用 / 停用 / 卸载。
 
-职责（分阶段落地，见 docs/governance/上下文治理-设计方案.md）：
+职责（分阶段落地，见 docs/context/上下文治理-设计方案.md）：
   G0（已完成）：预算模型 + token 化历史收窗；服务键 ``Services.CONTEXT``；
               接缝 ``ctx.get("context.governor") or ContextGovernor(...)`` 可注入替换。
   G1（已完成）：**分块装配统一编排** ``assemble(blocks)``——注册制（块自声明存在性）+

@@ -5,8 +5,8 @@
 slim Cordis 运行时 + 系统层插件 + 可管理目录插件（everything-is-a-plugin）。独立可离线自举，零外部引擎依赖。
 
 - 内核：`agent/`（`agent.api` 唯一出口）
-- 设计文档（工程根）：《agent内部架构-开发文档.md》《agent记忆架构-方案.md》《记忆插件-能力缺口分析.md》《agent通用能力-完善路线.md》《ReAct插件-设计方案.md》《审批插件-设计方案.md》《B5B6-流式与取消-设计方案.md》
-- 历史归档（**不作为工作文件参考**）：`doc/` —— 专用领域设计 / 接口接入设计 / 旧计划与路线图，说明见 `doc/README.md`
+- 设计文档（`docs/`，**总索引见 `docs/README.md`**）：《agent内部架构-开发文档.md》《agent记忆架构-方案.md》《记忆插件-能力缺口分析.md》《agent通用能力-完善路线.md》《ReAct插件-设计方案.md》《审批插件-设计方案.md》《B5B6-流式与取消-设计方案.md》
+- `docs/` 按**主题域**（`architecture` `plugins` `memory` `context` `sandbox` `spec` `roadmap`）+ **`reports/`（带日期的评估快照）** 组织；早期 `doc/` 归档已清空删除。整理说明见 [`docs/文档迁移清单-2026-10-20.md`](docs/文档迁移清单-2026-10-20.md)
 
 **已完成**：内核（`agent.api`）· 系统插件（events / loop / llm / tasks / storage / budget / guard）· 双驱动（`loop` 任务驱动 + `chat` 会话驱动）· 真实 DeepSeek provider · 目录插件管理（引擎式 desired/actual/delta，插件页可启用 / 停用 / 卸载）· 记忆插件 `plugins.memory`（LLM 提取[过 guard/budget] + 打分衰减 + recall/context 注入；**目录插件形态，默认启用**）· **ReAct 多步循环插件 `plugins.react`**（Think→Act+Observe→收敛 + `max_steps`/时延/预算三把闸 + 工具结果截断；**目录插件形态，默认启用**）· MCP 工具桥 `plugins.windows_mcp`。· **隐式契约加固**（事件名 / 配置键 / 接线守卫三层 fail-fast）· **B5 流式输出（SSE）** · **B6 取消中断**。**639 项离线测试全绿**（另含 ruff lint 与覆盖率门禁）。CI（`.github/workflows/ci.yml`）在每次推送时自动跑：后端全量 pytest（含 `ruff` lint + 覆盖率 ≥85% 门禁 + pip-audit）+ 前端契约自检/单元测试/生产构建 + 镜像构建与 `/health` 冒烟。
 

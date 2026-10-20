@@ -1,7 +1,7 @@
 """G7 外部工具隔离档位自述（plugins.sandbox）—— 2026-10-03 转型后的行为契约。
 
 转型前本插件是「准入网关 + 审计」，转型后**只做隔离档位自述**（准入判定归 guard，
-问人归 approval）。详见 ``docs/reform of production line/沙箱与权限管理器重叠核定-2026-10-03.md``。
+问人归 approval）。详见 ``docs/sandbox/沙箱与权限管理器重叠核定-2026-10-03.md``。
 
 覆盖 11 组（★ 标的都是转型后**新增或改写**的）：
 1. 恒放行 + 落 ``agent/sandbox/confinement`` 审计（真容器 + 真 ``tasks.invoke``，真实 waterfall）

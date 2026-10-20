@@ -217,7 +217,7 @@ class Budget:
         async def _pre(payload: dict, next) -> dict:
             # est 覆盖 messages + tools 目录（native 形态）+ schema；
             # 经 core 估算器按 wire 同构计量，根治此前按「工具名列表」估算 26% 系统性低估
-            # （详见 docs/governance/token口径对账-问题记录.md）。
+            # （详见 docs/context/token口径对账-问题记录.md）。
             raw_est = estimate_request_cost(
                 payload.get("messages", []),
                 payload.get("tools") or None,

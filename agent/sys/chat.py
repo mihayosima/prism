@@ -64,7 +64,7 @@ PLAN_SCHEMA = {
 
 HISTORY_LIMIT = 12   # 短期记忆窗口：最近 N 条消息（≈6 轮）
 
-# G4：治理器 token 配额 → memory.context max_chars 反推（详见 docs/governance/记忆配额反推方案-2026-09-28.md）
+# G4：治理器 token 配额 → memory.context max_chars 反推（详见 docs/context/记忆配额反推方案-2026-09-28.md）
 # 反推系数：core/tokens.py 的 CJK 启发式为 0.75 token/字 ⇒ 1 token ≈ 1.33 中文字符；
 # 取 1.5 为宽松经验值（中文主导场景留余量）；严格不超 token 配额可改 1.33（=1/0.75）。
 _MEMORY_TOKEN_TO_CHAR = 1.5

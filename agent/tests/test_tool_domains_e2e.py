@@ -1,7 +1,7 @@
 """工具税「域级裁剪」端到端验收（P5）。
 
-依据：``docs/governance/工具税域级裁剪实施方案-2026-09-30.md`` §6/§10、
-上游 ``docs/governance/工具税域级治理方案-2026-09-30.md``。
+依据：``docs/reports/context/工具税域级裁剪实施方案-2026-09-30.md`` §6/§10、
+上游 ``docs/context/工具税域级治理方案-2026-09-30.md``。
 
 与 ``test_followup_topics.py`` 里的纯函数单测**分层**：本文件在**真实容器内真跑
 ``ctx.react.run(...)``**，用 ``_SpyReasoner`` 替换推理接缝（**不调 LLM、完全离线**），

@@ -11,7 +11,7 @@
     下沉为公共原语后，sys/llm 改调本模块，避免两处各自演化）；
   - ``estimate_request_cost``：请求级 token 估算，按 wire 形态序列化后统一走
     ``estimate_tokens``，故 est ≈ 真实账单，根治预算护栏此前 26% 的系统性低估
-    （详见 docs/governance/token口径对账-问题记录.md）。
+    （详见 docs/context/token口径对账-问题记录.md）。
 """
 
 from __future__ import annotations
@@ -145,7 +145,7 @@ def estimate_request_cost(
     关键：messages / tools 先按 wire 形态序列化（与真实发送 payload 同构），
     再统一走 ``estimate_tokens``——tools 使用**完整参数 schema**（`description[:200]` +
     ``parameters`），而非仅名字。故 est ≈ 真实账单，根治预算护栏此前 26% 的系统性低估
-    （详见 docs/governance/token口径对账-问题记录.md）。
+    （详见 docs/context/token口径对账-问题记录.md）。
 
     - ``tools`` 传 native 工具目录（``catalog()`` 形状）；``None``/空 → 不计入；
     - ``schema`` 传 JSON 响应结构；非 ``None`` → 计入 ``response_format`` 附加项

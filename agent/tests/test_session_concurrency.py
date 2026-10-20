@@ -1,6 +1,6 @@
 """R1：旁路会话键/归组键的**请求级强隔离**（ContextVar）—— 并发两会话不得串账。
 
-背景（详见 `docs/reform of production line/配置作用域治理/R1方案选型分析-2026-10-02.md`）：
+背景（详见 `docs/reports/engineering/R1方案选型分析-2026-10-02.md`）：
 
 ``SESSION_KEY`` / ``REACT_RUN_ID`` 是「**当前请求是谁**」的选择器，此前统一读写**容器级**
 ``ctx.state``。容器级 state 被并发请求共享 ⇒ 交错时后写覆盖先写：A 的预算记进 B 的桶、
