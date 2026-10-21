@@ -53,7 +53,14 @@ Issues = "https://github.com/mihayosima/prism/issues"
 #   装法：``pip install -e ".[asr]"``；不装时 ``plugins.asr`` **不崩服务**——
 #   延迟 import 失败 ⇒ 引擎状态 ``unavailable``，端点回 503 + 可读原因（前端降级 Web Speech）。
 [project.optional-dependencies]
-dev = ["pytest>=9.0,<10.0", "pytest-cov>=6.0,<8.0", "fakeredis>=2.0,<3.0"]
+dev = [
+    "pytest>=9.0,<10.0",
+    "pytest-cov>=6.0,<8.0",
+    "fakeredis>=2.0,<3.0",
+    # numpy 是**测试**依赖而非引擎依赖：test_asr_file.py 直接 import 它构造 PCM。
+    # asr extra 里那条是给运行时用的，同一区间；CI 只装 .[dev]，不装它测试就收集失败。
+    "numpy>=1.26,<3.0",
+]
 asr = [
     "sherpa-onnx>=1.13,<2.0",     # 本地推理引擎（自带 onnxruntime，wheel 较大）
     "soundfile>=0.13,<0.15",      # 读 wav/音频文件（模式 F 输入解码）
