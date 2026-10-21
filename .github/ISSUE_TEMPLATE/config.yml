@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/mihayosima/prism/security/advisories/new
+    about: 安全相关问题请用 Security Advisory 私密报告，不要开公开 Issue。
+  - name: 文档索引
+    url: https://github.com/mihayosima/prism/blob/main/docs/README.md
+    about: 设计文档总索引，提问前可先查阅。

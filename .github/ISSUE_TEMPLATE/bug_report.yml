@@ -1,0 +1,81 @@
+name: Bug 报告
+description: 报告一个明确的行为缺陷
+title: "fix: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先确认：已在 `main` 最新代码上复现，且不是配置问题。
+        安全漏洞**不要**在这里报，见 [SECURITY.md](../../SECURITY.md)。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象
+      description: 实际发生了什么？与期望的差别在哪？
+      placeholder: 调用 /api/chat/stream 后，取消请求发出但后端仍在跑 LLM。
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 最小复现路径，能贴命令就贴命令
+      placeholder: |
+        1. python -m agent.run.chat --fixture
+        2. curl -X POST http://127.0.0.1:8720/api/chat/stream -d '...'
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / commit
+      description: `git rev-parse --short HEAD`
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及模块
+      multiple: true
+      options:
+        - agent/core（内核）
+        - agent/sys（系统层）
+        - plugins/react
+        - plugins/memory
+        - plugins/approval
+        - plugins/sandbox
+        - plugins/skills
+        - MCP 工具桥
+        - run/chat（HTTP 层）
+        - web（前端）
+        - CI / 构建
+        - 其他 / 不确定
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 堆栈
+      description: 关键日志或 traceback，请脱敏后粘贴
+      render: shell
+
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境
+      description: 操作系统、Python 版本、Redis 可用性、是否容器部署
+      placeholder: Windows 11 / Python 3.13 / Redis 不可用（降级）/ 宿主机直跑

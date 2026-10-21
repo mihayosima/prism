@@ -36,9 +36,8 @@ agent_chat_server.log
 _diag_final2/
 # 根目录下一次性的会话诊断转储（如 _diag_recent_session.txt）
 /_diag_*.txt
-_diag_mcp/*.json
-_diag_mcp/*.log
-_diag_mcp/*.txt
+# MCP 桥的一次性诊断脚本与转储：验证完即弃，整目录不入版本库
+_diag_mcp/
 
 # 可行性原型（spike）：验证完即弃，不并入主码
 _spike/

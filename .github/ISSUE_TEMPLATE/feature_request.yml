@@ -1,0 +1,54 @@
+name: 功能请求
+description: 提出新能力或改进建议
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先搜一下现有 Issue，避免重复。设计层面的大改动建议先开 Discussion 或直接带方案文档来。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 现在缺什么、痛在哪？请给具体场景
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望方案
+      description: 你希望它怎么工作？涉及内核接缝或插件时请说明挂载点
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已考虑的替代方案
+      description: 包括"不改"的代价
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 影响面
+      options:
+        - 新插件
+        - 现有插件增强
+        - 内核 / 系统层
+        - HTTP / API
+        - 前端
+        - 文档
+        - 不确定
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: compat
+    attributes:
+      label: 兼容性
+      options:
+        - label: 我确认这个改动不需要破坏现有插件契约（或已说明如何迁移）
+        - label: 我愿意协助实现
