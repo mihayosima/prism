@@ -874,7 +874,14 @@ class ReactLoop:
                     # 是「用户本轮主动拒」，
                     # 不计连拒；步数/时延闸仍兜底。策略类拒绝重试无益，照旧计数。
                     if str(getattr(r, "denied_by", "") or "") == "user":
-                        pass
+                        # 与连拒闸同口径：用户本轮主动拒不算"原地打转"。
+                        # 指纹是执行前批量收集的，这里把本次请求撤出窗口，
+                        # 否则无进展检测器会在步数上限之前提前终止，
+                        # 使"用户拒 → 换方案继续"这条路根本走不到。
+                        for _i in range(len(call_sigs) - 1, -1, -1):
+                            if call_sigs[_i][0] == r.name:
+                                del call_sigs[_i]
+                                break
                     else:
                         rejected[r.name] += 1
                         if rejected[r.name] > cfg.max_rejects:

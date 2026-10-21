@@ -115,13 +115,17 @@ class LlmService:
             raise CapabilityNotImplemented(
                 "agent.llm.complete", decision.get("reason", "被 guard/budget 否决")
             )
+        # 内层 try 只做签名兼容，失败处置统一交给外层：
+        # 重试调用必须留在受保护的区域内，否则重试失败会绕过 pre 预借的退还与审计，
+        # 账面凭空多出一笔永不回收的预借。
         try:
-            data = await self._provider.complete(ctx, messages, schema=schema, tools=tools,
-                                                 max_tokens=max_tokens)
-        except TypeError as exc:                       # 兼容未实现 max_tokens 的 provider
-            if "max_tokens" not in str(exc):
-                raise
-            data = await self._provider.complete(ctx, messages, schema=schema, tools=tools)
+            try:
+                data = await self._provider.complete(ctx, messages, schema=schema, tools=tools,
+                                                     max_tokens=max_tokens)
+            except TypeError as exc:                   # 兼容未实现 max_tokens 的 provider
+                if "max_tokens" not in str(exc):
+                    raise
+                data = await self._provider.complete(ctx, messages, schema=schema, tools=tools)
         except Exception as exc:
             # 失败路径——durable 审计 + live 通知，随后原样抛出。
             # 成功路径行为零变化。

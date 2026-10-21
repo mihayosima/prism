@@ -21,6 +21,7 @@ from agent.api import (
     CapabilityNotImplemented,
     Events,
     Services,
+    StateKeys,
     current_plugin,
     durable,
     guard_source,
@@ -37,7 +38,7 @@ logger = logging.getLogger("agent.tasks")
 _REDACT_KEYS: tuple[str, ...] = (
     "content", "text", "body", "data", "payload", "input", "output",
     "secret", "token", "key", "password", "passwd", "credential",
-    "api_key", "apikey", "auth", "cookie", "session_key",
+    "api_key", "apikey", "auth", "cookie", StateKeys.SESSION_KEY,
 )
 
 # : 单个键的保留长度：防大对象把审计表撑爆。
