@@ -235,12 +235,20 @@ def test_wsl2_spawn_options_emits_wrap():
     assert wrap["inner"].startswith("bwrap")                     # 实测可用的包裹命令
     assert "--unshare-net" in wrap["inner"]
     assert "--bind /mnt/c/repo/data/sandbox/s1" in wrap["inner"]  # workspace-write 可写
-    assert "--ro-bind /mnt" in wrap["inner"]                     # 项目根只读
+    # 项目根只读。判据取 ``to_wsl_path(os.getcwd())`` 而不能硬写 ``/mnt``：
+    # 后者只是 Windows 上"盘符路径恰以 /mnt 开头"的巧合，Linux 仓库在
+    # /home/... 下时该断言永不成立（CI 实测红），而它想锁的不变量
+    # ——"项目根本身被 ro-bind"——与平台无关。
+    repo_wsl = to_wsl_path(os.getcwd())
+    assert f"--ro-bind {repo_wsl} {repo_wsl}" in wrap["inner"]
 
 
 def test_wsl2_read_only_has_no_writable_bind():
     d = _wsl_opts(mode="read-only")
-    assert "--bind /mnt" not in d["wrap"]["inner"]               # 无可写目录（仅 tmpfs）
+    # 无可写目录（仅 tmpfs）。判据取"整条命令里没有 --bind"而非字面 "/mnt"：
+    # 后者在 Linux 上恒真（压根不存在 /mnt 路径），是**假绿**——看着过了，
+    # 其实什么都没验。注意 ``--ro-bind`` 不含 ``--bind`` 子串，不会误伤。
+    assert "--bind " not in d["wrap"]["inner"]
 
 
 def test_wsl2_allow_network_does_not_unshare_net():

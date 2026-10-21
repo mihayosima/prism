@@ -137,6 +137,13 @@ def _add_route_before_mount(app, path: str, handler):
     ⚠️ 插入点的判定条件：``Mount("/")`` 实例的 ``path`` 属性是**空字符串**
     （实测 ``app.mount("/")`` → ``Mount.path == ""``），**不是 ``"/"``**。
     写成 ``r.path == "/"`` 会永远匹配不到 ⇒ 静默退化成"没插入"。
+
+    **没有 Mount 时直接追加**：``web/dist`` 未构建（CI 全新 checkout 即是）时
+    ``_serve`` 改注一个"产物缺失"说明页，压根不注册 catch-all。
+    此时不存在"被静态处理器截走"的可能，追加与前置等价。
+    原先行此处的硬断言让整个模块在无 dist 的环境下恒红——那是测试在对
+    自己的假设宣誓，不是在生产行为上设防；真正的防位由下面的 500 断言承担
+    （路由真被截走会拿到 404，立刻红）。
     """
     from starlette.routing import Route
 
@@ -144,9 +151,11 @@ def _add_route_before_mount(app, path: str, handler):
     routes = app.router.routes
     # 第一个 Mount 之前插入（用类型判，不靠 path —— Mount.path 是 ""）
     idx = next((i for i, r in enumerate(routes)
-                if type(r).__name__ == "Mount"), len(routes))
-    assert idx < len(routes), "没找到 Mount —— 生产若不再托管静态文件，本helper需更新"
-    routes.insert(idx, route)
+                if type(r).__name__ == "Mount"), None)
+    if idx is None:
+        routes.append(route)
+    else:
+        routes.insert(idx, route)
     return route
 
 

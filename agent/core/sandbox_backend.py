@@ -49,6 +49,14 @@ BACKENDS = ("auto", "off", "null", "win-token", "wsl2", "container", "cloud")
 # : 网络限制轴。
 NET_POLICIES = ("allow", "deny", "proxy")
 
+# : 探测子进程的输出解码编码。
+# : Windows 用 ``mbcs``（ANSI 代码页，控制台中文不乱码）；其它平台用 UTF-8。
+# : ★ **不能硬写 ``mbcs``**：该编码名只在 Windows 的 codecs 里注册，
+# :   Linux 上会抛 ``LookupError: unknown encoding: mbcs`` ——而它既不是
+# :   ``OSError`` 也不是 ``SubprocessError``，探测函数原有的 except 接不住，
+# :   于是"docker 没装"这件本该诚实回落的事变成整个调用方崩栈（CI 实测）。
+_SUBPROC_ENCODING = "mbcs" if os.name == "nt" else "utf-8"
+
 # --------------------------------------------------------------------------- #
 # 目标可移植性 —— 桥能不能在给定 backend 下运行
 # --------------------------------------------------------------------------- #
@@ -521,8 +529,11 @@ def _container_probe_uncached() -> dict:
     try:
         r = subprocess.run(["docker", "version", "--format", "{{.Server.Version}}"],
                            capture_output=True, timeout=45, text=True,
-                           encoding="mbcs", errors="replace")
-    except (OSError, subprocess.SubprocessError) as exc:
+                           encoding=_SUBPROC_ENCODING, errors="replace")
+    except Exception as exc:                              # noqa: BLE001 —— 见下
+        # 探针的契约是"永不抛，只汇报"：它由 select_backend/审计在装配期调用，
+        # 一个意料外的异常类型（历史上正是 mbcs 的 LookupError）会让服务起不来。
+        # 与 _wsl2_probe_uncached 同口径用宽捕获，把未知故障降级成"不可用"。
         return {"available": False, "reason": f"docker 不可用：{type(exc).__name__}"}
     if r.returncode != 0:
         return {"available": False,
@@ -547,7 +558,7 @@ def _wsl2_probe_uncached() -> dict:
         return {"available": False, "reason": "wsl2 backend 仅在 Windows 宿主上有意义"}
     try:
         r = subprocess.run(["wsl.exe", "-l", "-v"], capture_output=True, timeout=90,
-                           text=True, encoding="mbcs", errors="replace")
+                           text=True, encoding=_SUBPROC_ENCODING, errors="replace")
     except Exception as exc:                                      # noqa: BLE001
         return {"available": False, "reason": f"wsl.exe 不可达: {type(exc).__name__}"}
     if r.returncode != 0:
@@ -563,7 +574,7 @@ def _wsl2_probe_uncached() -> dict:
     try:
         r2 = subprocess.run(["wsl.exe", "-e", "bash", "-lc", "command -v bwrap"],
                             capture_output=True, timeout=90, text=True,
-                            encoding="mbcs", errors="replace")
+                            encoding=_SUBPROC_ENCODING, errors="replace")
     except Exception as exc:                                      # noqa: BLE001
         return {"available": False, "reason": f"WSL 内探测 bwrap 异常: {type(exc).__name__}"}
     if "bwrap" not in (r2.stdout or ""):

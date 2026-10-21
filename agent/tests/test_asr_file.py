@@ -158,6 +158,19 @@ def _cfg(**over):
     return base
 
 
+@pytest.fixture(autouse=True)
+def _stub_ensure_ready(monkeypatch):
+    """把 ``providers.ensure_ready`` 换成 no-op。
+
+     本文件用假 sherpa + 假 VAD 验"切段边界、结果顺序/时间戳、不可用时怎么办"，
+     这些都不需要 ONNX 图；``ensure_ready`` 只查模型文件在不在磁盘上，而
+     ``data/asr_models`` 按设计不入库。不挡它，CI 上没有模型目录时
+     ``load()`` 直接抛 ``EngineUnavailable``，被测的切段契约全部够不着。
+    """
+    monkeypatch.setattr("agent.plugins.asr.providers.ensure_ready",
+                        lambda *a, **k: None)
+
+
 # --------------------------------------------------------------------------
 # VadModule 自身
 # --------------------------------------------------------------------------

@@ -60,6 +60,10 @@ dev = [
     # numpy 是**测试**依赖而非引擎依赖：test_asr_file.py 直接 import 它构造 PCM。
     # asr extra 里那条是给运行时用的，同一区间；CI 只装 .[dev]，不装它测试就收集失败。
     "numpy>=1.26,<3.0",
+    # soundfile 同理：test_asr_routes.py 的 _wav_bytes() 靠它合成上传夹具，
+    # 且 test_transcribe_path_propagates_read_error 要真解码一次才算验到行为
+    # （缺它时该用例会被 ModuleNotFoundError 冒充成"异常已上抛"的假绿）。
+    "soundfile>=0.13,<0.15",
 ]
 asr = [
     "sherpa-onnx>=1.13,<2.0",     # 本地推理引擎（自带 onnxruntime，wheel 较大）
@@ -78,6 +82,11 @@ include = ["agent*"]
 [tool.pytest.ini_options]
 testpaths = ["agent/tests"]
 addopts = "-q"
+markers = [
+    # ASR 测试里少数几条要的就是"模型文件不在"这一真实状态，
+    # 不能被"桩掉 ensure_ready"的 autouse fixture 抹掉。
+    "real_model_fs: 需要真实模型文件系统状态（缺文件/目录不存在）的用例",
+]
 
 # ---------------------------------------------------------------------------
 # ruff（2026-10-04 新增）：零 lint 是明账欠债，先上**不改变现有行为**的一档。

@@ -110,6 +110,28 @@ def _cfg(**over):
 
 
 # --------------------------------------------------------------------------
+# 模型文件不参与本文件的契约判定
+# --------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _stub_ensure_ready(monkeypatch, request):
+    """把 ``providers.ensure_ready`` 换成 no-op。
+
+     本文件全部用例都注入假 sherpa / 假 VAD，被测的是加载编排、参数传递、
+     状态机与降级路径这些 wiring 契约；``ensure_ready`` 只做"模型文件齐不齐"
+     的磁盘检查，而 ``data/asr_models`` 按设计不入库（几百 MB）。不挡它，
+     CI 上一旦没有模型目录，``load()`` 就抛 ``EngineUnavailable``，
+     把上述契约测试全部染红——那与"引擎不可得时优雅降级"的项目哲学相反：
+     这里要的恰恰是"引擎侧一切正常"这个前提。
+
+     确需真实"缺模型"行为的用例加 ``@pytest.mark.real_model_fs`` 退出。
+    """
+    if "real_model_fs" in request.keywords:
+        return
+    monkeypatch.setattr("agent.plugins.asr.providers.ensure_ready",
+                        lambda *a, **k: None)
+
+
+# --------------------------------------------------------------------------
 # provider 抽象
 # --------------------------------------------------------------------------
 def test_asr_provider_is_abstract():
@@ -186,6 +208,7 @@ def test_missing_sherpa_raises_engine_unavailable(monkeypatch):
     assert "sherpa-onnx" in str(exc.value)
 
 
+@pytest.mark.real_model_fs
 def test_missing_model_raises_engine_unavailable(tmp_path):
     """模型缺失且 auto_download=False ⇒ 明确报错（不静默、不假就绪）。"""
     p = SherpaOnnxProvider(_cfg(), sherpa=_FakeSherpa)
@@ -243,20 +266,29 @@ def test_default_config_vad_model_must_be_empty():
     assert DEFAULT_CONFIG["vad"]["model"] == ""
 
 
-def test_status_and_load_agree_on_vad_override():
+def test_status_and_load_agree_on_vad_override(tmp_path):
     """★ 回归：``status()`` 的模型视图必须与 ``load()`` 用**同一套** spec 解析。
 
     漏掉 vad override 时：status 报"就绪"而 load 实际失败 —— 状态与事实错位，
     前端会因此判定引擎可用却拿不到识别结果。
+
+    模型根指向临时目录并自备一个非空 ``silero_vad.onnx``：本用例要验的是
+    "文件齐 ⇒ ready=True 且 status 报的路径与 load 会用的逐字一致"，与真模型
+    内容无关。``data/asr_models`` 不入库，直接用它会让本用例的成败取决于
+    开发机本地有没有下过模型——那不是契约，是环境。
     """
     from agent.plugins.asr import DEFAULT_CONFIG as DC
 
-    cfg = {**DC, "auto_download": False}
+    root = tmp_path / "models"
+    root.mkdir()
+    # missing() 要求 is_file 且 size>0，空文件不算就绪
+    (root / "silero_vad.onnx").write_bytes(b"stub")
+    cfg = {**DC, "auto_download": False, "model_root": str(root)}
     svc = ASRService(cfg)
     try:
         st = svc.status()
         spec = spec_for("vad", str((cfg.get("vad") or {}).get("model") or ""))
-        paths = spec.paths()
+        paths = spec.paths(str(root))
         # status 报告的 files 必须与 load 实际会用的路径逐字一致
         assert st["models"]["vad"]["files"]["model"] == paths["model"]
         assert st["models"]["vad"]["ready"] is True
@@ -340,6 +372,7 @@ def test_service_lazy_loading_state_transitions():
     asyncio.run(_run())
 
 
+@pytest.mark.real_model_fs
 def test_service_unavailable_state_is_visible():
     """不可用 ⇒ state=unavailable + reason（前端据此降级 Web Speech）。"""
     async def _run():
