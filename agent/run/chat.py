@@ -1613,7 +1613,7 @@ def _register_asr(app, deps):
                             {"ok": False, "error": "文件超过 200MB 上限"},
                             status_code=413)
                     fh.write(chunk)
-            loop = asyncio.get_running_loop()
+            _loop = asyncio.get_running_loop()
             try:
                 result = await svc.transcribe_path(str(target), {})
             except FileNotFoundError as exc:

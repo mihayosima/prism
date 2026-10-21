@@ -39,7 +39,6 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -137,7 +136,7 @@ def status(root: str | os.PathLike[str] = DEFAULT_MODEL_ROOT,
      返回 ``{角色: {"dir":..., "present": bool, "missing": [...]}}``。
      """
     out: dict[str, dict] = {}
-    for key, spec in SPECS.items():
+    for key, _spec in SPECS.items():
         name = (overrides or {}).get(key) or ""
         s = spec_for(key, name)
         paths = s.paths(root)

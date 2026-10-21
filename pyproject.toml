@@ -93,6 +93,10 @@ select = ["E4", "E7", "E9", "F", "W", "B"]     # 语法/未用名/潜在 bug；*
 ignore = [
     "B008",    # 函数默认值里调函数（FastAPI 的 Depends/File 惯用法）——项目必用
     "B904",    # raise ... from ——我们**刻意**在少数处用裸 raise 保留原异常
+    # 下面两条在上一段注释里就写了"不开"，但 select 的 E7/E4 其实把它们带进来了，
+    # 配置自相矛盾直到 CI 才暴露 ⇒ 显式关掉，与注释口径对齐：
+    "E731",    # lambda 赋值 ——测试里当工厂用，写成 def 反而啰嗦
+    "E402",    # 模块级 import 不在顶部 ——api.py 的 re-export 需要按依赖顺序摆放
 ]
 
 [tool.ruff.lint.per-file-ignores]

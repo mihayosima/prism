@@ -34,7 +34,6 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable
 
 from agent.api import AgentError, ServiceConflictError, clip_text, current_permission_mode
 from .loader import (delete_skill_file, discover_skills, load_state,

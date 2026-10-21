@@ -39,7 +39,7 @@ class Skills:
     description = "技能目录（说明型 + 可选代码入口；react 经 ctx.get 反向读取）"
 
     async def apply(self, ctx) -> None:
-        cfg = ((ctx.config or {}).get("agent") or {}).get("skills") or {}
+        _cfg = ((ctx.config or {}).get("agent") or {}).get("skills") or {}
         data_dir = _resolve_data_dir(ctx)
         catalog = SkillsCatalog(data_dir)
         try:

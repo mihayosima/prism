@@ -181,7 +181,7 @@ def test_segment_file_calls_flush_before_popping():
 
     vad = VadModule("dummy.onnx", sherpa=fake)
     vad.load()
-    det = fake.VoiceActivityDetector(None, 30)      # 再造一个只为拿 flush 记录
+    _det = fake.VoiceActivityDetector(None, 30)     # 再造一个只为拿 flush 记录
     vad._vad.flush = lambda: det_box.setdefault("flushed", True)
     vad.segment_file(np.zeros(1600, dtype=np.float32))
     assert det_box.get("flushed") is True
@@ -244,7 +244,7 @@ def test_segment_file_feeds_in_chunks_to_avoid_ring_overflow():
     sr = 16000
     fake = _fake_sherpa_with_segments([(int(sr * 0.0), int(sr * 0.5)), (int(sr * 2.0), int(sr * 0.5))])
     vad = VadModule("dummy.onnx", sample_rate=sr, sherpa=fake)
-    det_holder = {}
+    _det_holder = {}
 
     class _SpyDet:
         """记 accept_waveform 调用次数（含 init 期间构造的那一个实例不可得，
@@ -380,7 +380,7 @@ def test_transcribe_path_propagates_read_error(tmp_path):
     bad.write_bytes(b"this is not audio")
     try:
         asyncio.run(svc.ensure_ready())
-        with pytest.raises(Exception):
+        with pytest.raises(Exception):  # noqa: B017 —— 非法音频的异常类型由 soundfile 决定，此处只断言必须报错而非静默成功
             asyncio.run(svc.transcribe_path(str(bad), {}))
     finally:
         svc.dispose()

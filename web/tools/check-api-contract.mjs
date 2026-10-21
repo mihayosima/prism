@@ -1,7 +1,7 @@
 /**
  * B3 API 契约自检（CORS / Token / API_BASE 直连）
  * ------------------------------------------------------------------
- * 目的：把 `docs/refactor/SSE事件契约-2026-09-30.md` 与 B3 的两项后端开关
+ * 目的：把 `docs/spec/SSE事件契约-2026-09-30.md` 与 B3 的两项后端开关
  * （`--cors-origin` / `--token`）以及前端 `VITE_API_BASE` 直连能力做成**常驻断言**，
  * 而不是"某次手工 curl 过了就算"。
  *
@@ -85,11 +85,12 @@ if (existsSync(join(root, '.env.example'))) {
 // B. 契约文档与 sse.ts 帧名双向一致
 // ============================================================
 console.log('\n[B] SSE 契约文档对齐（B3.4）')
-const docsDir = join(repo, 'docs', 'refactor')
+// 2026-10-20 文档重组后契约文档归到主题域 docs/spec/，原 docs/refactor/ 已不存在
+const docsDir = join(repo, 'docs', 'spec')
 const contractFile = existsSync(docsDir)
   ? readdirSync(docsDir).find((f) => /^SSE事件契约-.*\.md$/.test(f))
   : undefined
-ok('契约文档存在（docs/refactor/SSE事件契约-*.md）', !!contractFile,
+ok('契约文档存在（docs/spec/SSE事件契约-*.md）', !!contractFile,
   contractFile ? '' : `未在 ${docsDir} 找到`)
 if (contractFile) {
   const doc = read(join(docsDir, contractFile))

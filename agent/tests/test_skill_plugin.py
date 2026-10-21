@@ -9,9 +9,11 @@ _tools_for_step 合并技能常驻工具、TaskContext.skill_docs 字段存在�
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from agent.api import ServiceConflictError, Services, StateKeys
+from agent.api import AgentError, ServiceConflictError, Services, StateKeys
 from agent.plugins.react.loop import ReactLoop, TaskContext
 from agent.plugins.skills.catalog import SkillsCatalog
 from agent.plugins.skills.loader import (_state_path, delete_skill_file,
@@ -152,7 +154,7 @@ def test_persist_add_remove(tmp_path):
     assert not (tmp_path / "skills" / "skill.persist.md").exists()
     # 插件来源不可经管理面移除
     cat.register(skill("skill.plugin", "p", source="plugin"))
-    with pytest.raises(Exception):
+    with pytest.raises(AgentError):
         cat.remove("skill.plugin", persist=False)
     # 启停持久化
     cat.set_enabled("skill.alpha", False, persist=True)
@@ -164,7 +166,7 @@ def test_persist_add_remove(tmp_path):
 
 
 def test_loader_roundtrip(tmp_path):
-    p = write_skill_file(tmp_path, skill("skill.file", "文件技能", content="正文", risk="read", tags=["a", "b"]))
+    _p = write_skill_file(tmp_path, skill("skill.file", "文件技能", content="正文", risk="read", tags=["a", "b"]))
     skills = discover_skills(tmp_path)
     assert len(skills) == 1
     s = skills[0]
@@ -181,7 +183,7 @@ def test_loader_failed_parse_skipped(tmp_path):
     bad = tmp_path / "skills"
     bad.mkdir(parents=True, exist_ok=True)
     (bad / "broken.md").write_text("不是合法的frontmatter但无---起始\n正文", encoding="utf-8")
-    good = write_skill_file(tmp_path, skill("skill.ok", "ok", content="ok"))
+    _good = write_skill_file(tmp_path, skill("skill.ok", "ok", content="ok"))
     skills = discover_skills(tmp_path)
     names = {s.name for s in skills}
     assert "skill.ok" in names

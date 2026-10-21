@@ -143,7 +143,7 @@ def test_parse_skill_file_records_basedir(tmp_path):
 
 
 def test_render_content_replaces_basedir(tmp_path):
-    p = _write_skill(tmp_path, "skill.docker", "构建镜像", "run {baseDir}/s.sh")
+    _p = _write_skill(tmp_path, "skill.docker", "构建镜像", "run {baseDir}/s.sh")
     cat = SkillsCatalog(tmp_path)
     cat.load_from_disk()
     s = cat.load("skill.docker")
