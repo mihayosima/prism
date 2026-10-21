@@ -1,3 +1,7 @@
+# 本机 agent 工作区（每日记忆日志与一次性验证脚本）：属个人上下文，不进公共仓库。
+# 记忆已迁至独立的个人仓库，此处仅保留本地工作副本。
+.workbuddy/
+
 # runtime artifacts
 __pycache__/
 *.py[cod]
