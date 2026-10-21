@@ -55,7 +55,7 @@ Issues = "https://github.com/mihayosima/prism/issues"
 [project.optional-dependencies]
 dev = [
     "pytest>=9.1.1,<10.0",
-    "pytest-cov>=6.0,<8.0",
+    "pytest-cov>=7.1.0,<8.0",
     "fakeredis>=2.40.0,<3.0",
     # numpy 是**测试**依赖而非引擎依赖：test_asr_file.py 直接 import 它构造 PCM。
     # asr extra 里那条是给运行时用的，同一区间；CI 只装 .[dev]，不装它测试就收集失败。
