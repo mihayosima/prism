@@ -1,11 +1,11 @@
-"""子 Agent 角色定义（MVP：内置三角色；YAML 扩展点预留，阶段 3 启用）。
+"""子 Agent 角色定义。
 
-设计稿 v0.3 §3.4：角色是**安全下界**——``tools`` 白名单语义为「交集」，
-只能比父可见集更窄（审查意见 #2 / #R3：role.tools 是安全下界，父权限裁剪仍生效）。
+设计稿 v0.3：角色是安全下界——``tools`` 白名单语义为「交集」，
+只能比父可见集更窄。
 
-MVP 不读 YAML（扩展点预留），只内置 ``default`` / ``explorer`` / ``worker`` 三档；
-三者差异化以 ``system_note``（注入到子任务提示）体现，真正的工具白名单收窄
-（列具体工具名/域）在阶段 3 经 ``agent.react.subagents`` YAML 表达。
+MVP 不读 YAML，只内置 ``default`` / ``explorer`` / ``worker`` 三档；
+三者差异化以 ``system_note`` 体现，真正的工具白名单收窄
+在阶段 3 经 ``agent.react.subagents`` YAML 表达。
 """
 
 from __future__ import annotations
@@ -18,26 +18,26 @@ from typing import Iterable
 
 logger = logging.getLogger("agent.subagent.roles")
 
-# 阶段 3（R1）：**子永远是叶子节点** —— 委派工具绝不下传给子循环。
+# 阶段 3：子永远是叶子节点 —— 委派工具绝不下传给子循环。
 # 用「排除项」表达而非枚举「其余全部」：后者会随工具目录变化静默失效。
 LEAF_TOOL = "agent.delegate"
 
-# 角色可覆盖的运行时护栏与上下文治理字段（Q4 轻量形态）。
-# 只允许**收窄**子循环（更小/更短），不允许超过父级默认 ⇒ 角色不能成为放大面。
+# 角色可覆盖的运行时护栏与上下文治理字段。
+# 只允许收窄子循环，不允许超过父级默认 ⇒ 角色不能成为放大面。
 MAX_ROLE_STEPS = 32
 MAX_ROLE_DEADLINE_S = 600.0
 # ``context`` 允许的字段 = ReactConfig / 治理器上真实存在的上下文治理旋钮。
-# 未在治理器实例上找到同名字段 ⇒ 诚实跳过（记账 warning），绝不静默塞进对象。
+# 未在治理器实例上找到同名字段 ⇒ 诚实跳过，绝不静默塞进对象。
 CONTEXT_KEYS = ("react_keep_recent", "act_fold_tokens", "history_keep",
                 "clip_max_tokens", "clip_head_tokens", "clip_tail_tokens")
 
-# 角色文件名（= 角色名）合法字符集：与会话键净化同款口径，防路径穿越/注入。
-# ★ 首尾必须落在 [A-Za-z0-9_]，中间才允许 . 与 - —— 否则 "..evil" / ".hidden"
-# 这类以点开头（含路径穿越语义）的名字会被 {1,64} 的通配点号放行。
+# 角色文件名合法字符集：与会话键净化同款口径，防路径穿越/注入。
+# 首尾必须落在 [A-Za-z0-9_]，中间才允许 . 与 - —— 否则 "..evil" / ".hidden"
+# 这类以点开头的名字会被 {1,64} 的通配点号放行。
 _ROLE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}[A-Za-z0-9_]$|^[A-Za-z0-9_]$")
 
-# 内置角色。``tools`` 为 ``None`` 时表示「不额外收窄」（仍受父权限裁剪）；
-# 为具体名单时表示在该角色下**只允许**这些工具名/域（与父可见集取交集）。
+# 内置角色。``tools`` 为 ``None`` 时表示「不额外收窄」；
+# 为具体名单时表示在该角色下只允许这些工具名/域。
 BUILTIN_ROLES: dict[str, dict] = {
     "default": {
         "description": "通用子 Agent：继承父的全部可见工具（不额外收窄）；适合任何独立子任务。",
@@ -70,11 +70,11 @@ BUILTIN_ROLES: dict[str, dict] = {
 
 
 class Role:
-    """解析后的角色（不可变视图）。
+    """解析后的角色。
 
-    阶段 3 增补 ``max_steps`` / ``deadline_s`` / ``context``：前两者进 ``cfg_overrides``，
-    ``context`` 供「子 Agent 独立上下文治理（Q4）」使用（经 ``governance_override`` 生效）。
-    """
+     阶段 3 增补 ``max_steps`` / ``deadline_s`` / ``context``：前两者进 ``cfg_overrides``，
+     ``context`` 供「子 Agent 独立上下文治理」使用。
+     """
 
     __slots__ = ("name", "description", "tools", "system_note",
                  "max_steps", "deadline_s", "context")
@@ -92,11 +92,11 @@ class Role:
 
 
 def get_role(name: str, extra: dict | None = None) -> Role:
-    """按名取角色；未知名回落 ``default``（诚实降级，不抛异常，避免父循环崩溃）。
+    """按名取角色；未知名回落 ``default``，诚实降级，不抛异常，避免父循环崩溃。
 
-    ``extra`` 是经 :func:`load_role_files` 校验过的目录式角色表（阶段 2）；
-    文件角色**不覆盖**内置角色（内置优先，保证升级不改变既有语义）。
-    """
+     ``extra`` 是经 :func:`load_role_files` 校验过的目录式角色表；
+     文件角色不覆盖内置角色。
+     """
     name = (name or "default").strip() or "default"
     spec = BUILTIN_ROLES.get(name)
     if spec is None:
@@ -111,29 +111,27 @@ def get_role(name: str, extra: dict | None = None) -> Role:
 
 
 def list_roles(extra: dict | None = None) -> list[str]:
-    """已注册角色名（目录 / 调试用）。"""
+    """已注册角色名。"""
     names = set(BUILTIN_ROLES) | set(extra or {})
     return sorted(names)
 
 
-# ---------------------------------------------------------------------------
-# 阶段 2：目录式角色文件（设计稿 §3.4 评审 R4）
-# ---------------------------------------------------------------------------
+# 阶段 2：目录式角色文件
 
 def roles_dir(data_dir: str | pathlib.Path) -> pathlib.Path:
-    """角色目录 = ``<data_dir>/agent_roles``（**非 Web 可写目录**）。"""
+    """角色目录 = ``<data_dir>/agent_roles``。"""
     return pathlib.Path(data_dir) / "agent_roles"
 
 
 def validate_role_spec(name: str, spec: dict,
                        catalog_names: set[str], catalog_domains: set[str]) -> dict:
-    """校验单个角色定义，非法 ⇒ 抛 ``ValueError``（调用方跳过该文件并记账）。
+    """校验单个角色定义，非法 ⇒ 抛 ``ValueError``。
 
-    安全边界（评审 R4）：工具名/域名**必须在当前工具目录内**。
-    为什么「未知工具」要整份拒绝而不是静默丢弃：白名单是**安全下界**，
-    一处笔误若被静默忽略，角色就会静默变成「不收窄」——表面正常、实际越权。
-    故宁可让该角色不可用（并记账），也不给一个语义被悄悄改写的角色。
-    """
+     安全边界：工具名/域名必须在当前工具目录内。
+     为什么「未知工具」要整份拒绝而不是静默丢弃：白名单是安全下界，
+     一处笔误若被静默忽略，角色就会静默变成「不收窄」——表面正常、实际越权。
+     故宁可让该角色不可用，也不给一个语义被悄悄改写的角色。
+     """
     if not isinstance(spec, dict):
         raise ValueError(f"角色 {name!r}：文件内容必须是对象")
     unknown_keys = set(spec) - {"description", "tools", "system_note",
@@ -156,7 +154,7 @@ def validate_role_spec(name: str, spec: dict,
     if not isinstance(desc, str):
         raise ValueError(f"角色 {name!r}：description 必须是字符串")
     out = {"description": desc, "tools": tools, "system_note": note}
-    # ---- 阶段 3：可覆盖的护栏（只允许收窄，不允许放大） ----
+    # ---- 阶段 3：可覆盖的护栏 ----
     ms = spec.get("max_steps")
     if ms is not None:
         if not isinstance(ms, int) or isinstance(ms, bool) or not (1 <= ms <= MAX_ROLE_STEPS):
@@ -181,23 +179,23 @@ def validate_role_spec(name: str, spec: dict,
         for k, v in cx.items():
             if not isinstance(v, int) or isinstance(v, bool) or v < 0:
                 raise ValueError(f"角色 {name!r}：context.{k} 必须是非负整数")
-        # 空 dict ⇒ 不写入（保持「未声明」与「声明为空」行为一致）
+        # 空 dict ⇒ 不写入
         if cx:
             out["context"] = dict(cx)
     return out
 
 
 def load_role_files(directory: str | pathlib.Path, catalog: list[dict]) -> dict:
-    """扫描角色目录，返回**校验通过**的角色表；非法文件跳过并记账（不掀起委派）。
+    """扫描角色目录，返回校验通过的角色表；非法文件跳过并记账。
 
-    - 目录不存在 ⇒ 返回空表（内置角色照常可用，零行为变化）；
-    - 单个文件坏 ⇒ 跳过该文件，**不影响其他角色与内置角色**；
-    - 角色名 = 文件名主干，须匹配 ``[A-Za-z0-9_.-]{1,64}``（防路径穿越/注入）；
-    - 内置角色优先，文件角色**不覆盖**内置（升级不改变既有语义）。
+     - 目录不存在 ⇒ 返回空表；
+     - 单个文件坏 ⇒ 跳过该文件，不影响其他角色与内置角色；
+     - 角色名 = 文件名主干，须匹配 ``[A-Za-z0-9_.-]{1,64}``；
+     - 内置角色优先，文件角色不覆盖内置。
 
-    每次 ``delegate`` 调用时扫目录：读几个小文件的 IO 相对「起一个 LLM 子循环」
-    可忽略，换来「加角色不用改代码」（评审 R4 选 (a)，不引入文件监视器）。
-    """
+     每次 ``delegate`` 调用时扫目录：读几个小文件的 IO 相对「起一个 LLM 子循环」
+     可忽略，换来「加角色不用改代码」。
+     """
     names = {str(t.get("name") or "") for t in catalog or []}
     domains = {str(t.get("owner") or "") for t in catalog or [] if t.get("owner")}
     out: dict[str, dict] = {}
@@ -218,16 +216,16 @@ def load_role_files(directory: str | pathlib.Path, catalog: list[dict]) -> dict:
 
 
 def apply_leaf_rule(tools: list[str] | None) -> list[str]:
-    """在白名单上叠加「子永远是叶子节点」（R1）：**排除**委派工具本身。
+    """在白名单上叠加「子永远是叶子节点」：排除委派工具本身。
 
-    为什么是「排除」而不是「枚举允许项」：子要继承父的宽工具面（否则角色内的
-    具体白名单会随目录变化失效），唯一要拿掉的只有委派工具 ⇒ 排除语义最贴合。
-    该函数只产出标识符（``["*", "-agent.delegate"]``），真正的过滤由 react 的
-    ``_apply_whitelist`` / ``_split_whitelist_denied`` 执行 —— 提示层与执行层同口径。
+     为什么是「排除」而不是「枚举允许项」：子要继承父的宽工具面，否则角色内的
+     具体白名单会随目录变化失效，唯一要拿掉的只有委派工具 ⇒ 排除语义最贴合。
+     该函数只产出标识符，真正的过滤由 react 的
+     ``_apply_whitelist`` / ``_split_whitelist_denied`` 执行 —— 提示层与执行层同口径。
 
-    - ``None``（不收窄）⇒ ``["*", "-agent.delegate"]``；
-    - 具体名单 ⇒ 去掉委派工具 + 追加排除项（**执行层仍会再拦一次**，防提示层绕过）。
-    """
+     - ``None``⇒ ``["*", "-agent.delegate"]``；
+     - 具体名单 ⇒ 去掉委派工具 + 追加排除项。
+     """
     if tools is None:
         return ["*", f"-{LEAF_TOOL}"]
     kept = [t for t in tools if str(t) != LEAF_TOOL]
@@ -236,17 +234,16 @@ def apply_leaf_rule(tools: list[str] | None) -> list[str]:
 
 def combine_tools(role_tools: Iterable[str] | None,
                   param_tools: Iterable[str] | None) -> list[str] | None:
-    """角色白名单与请求白名单取**交集**（纯函数，便于单测）。
+    """角色白名单与请求白名单取交集。
 
-    语义（v0.3 §3.4 / §3.2）：两层任一都只能再收窄，不能放宽。
-    - 任一层为 ``None``/空 ⇒ 不收窄该层（返回另一层；两层皆空 ⇒ ``None``）；
-    - 含 ``"*"`` 的层 ⇒ 不额外收窄（返回另一层）；
-    - 两层皆为具体名单 ⇒ 取**同时出现在两层**者（交集）；
-    - 两层具体名单无交集 ⇒ 抛 ``ValueError``（配置错误，交由调用方转 AgentError，
-      绝不让「无交集」退化成「全放行」——``_apply_whitelist`` 对空列表的语义是「不收窄」）。
+     语义：两层任一都只能再收窄，不能放宽。
+     - 任一层为 ``None``/空 ⇒ 不收窄该层；
+     - 含 ``"*"`` 的层 ⇒ 不额外收窄；
+     - 两层皆为具体名单 ⇒ 取同时出现在两层者；
+     - 两层具体名单无交集 ⇒ 抛 ``ValueError``。
 
-    返回 ``None`` 表示「不收窄」，交由工厂再做父权限裁剪；返回具体列表即收窄结果。
-    """
+     返回 ``None`` 表示「不收窄」，交由工厂再做父权限裁剪；返回具体列表即收窄结果。
+     """
     rt = list(role_tools or [])
     pt = list(param_tools or [])
     if not rt:

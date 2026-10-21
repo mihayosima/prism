@@ -1,10 +1,9 @@
-"""agent.plugins.skills.loader —— 文件型技能发现与持久化（data/skills/*.md）。
+"""agent.plugins.skills.loader —— 文件型技能发现与持久化。
 
-frontmatter 为极简 YAML（``key: value`` + ``tags: [a, b]``），避免引入 PyYAML 依赖。
-仅扫描 ``data/skills/``（用户决策：不过度扫各插件子目录，省启动耗时）。
+frontmatter 为极简 YAML，避免引入 PyYAML 依赖。
+仅扫描 ``data/skills/``。
 
-★ 2026-10-14 归位：随 Skill 插件系统从 ``agent/core`` 移入 ``plugins/skills``
-（设计文档三层语义：业务词只允许出现在插件层；归位论证见 ``model.py`` docstring）。
+归位：随 Skill 插件系统从 ``agent/core`` 移入 ``plugins/skills``。
 """
 
 from __future__ import annotations
@@ -17,17 +16,16 @@ from .model import Skill
 
 logger = logging.getLogger(__name__)
 
-#: B3（2026-10-14）：目录式技能捆绑的资源扫描（scripts/ reference/ templates/
-#: examples/ assets/ 等）。深度 2、最多 50，避免把大目录全量灌进 skill_view 返回。
+# : B3：目录式技能捆绑的资源扫描。深度 2、最多 50，避免把大目录全量灌进 skill_view 返回。
 _RESOURCE_MAX = 50
 _RESOURCE_MAX_DEPTH = 2
 
 
 def _scan_resources(base: Path) -> list[str]:
-    """扫目录式技能捆绑的资源文件（相对 basedir 的路径），深度 2、最多 50。
+    """扫目录式技能捆绑的资源文件，深度 2、最多 50。
 
-    仅扫文件、跳过深层目录；返回相对 basedir 的路径，供 skill_view 一并返回。
-    """
+     仅扫文件、跳过深层目录；返回相对 basedir 的路径，供 skill_view 一并返回。
+     """
     if not base.is_dir():
         return []
     out: list[str] = []
@@ -37,7 +35,7 @@ def _scan_resources(base: Path) -> list[str]:
         rel = p.relative_to(base)
         if len(rel.parts) > _RESOURCE_MAX_DEPTH:
             continue
-        out.append(rel.as_posix())            # 统一正斜杠（Agent Skills 标准，跨平台可移植）
+        out.append(rel.as_posix())            # 统一正斜杠
         if len(out) >= _RESOURCE_MAX:
             break
     return sorted(out)
@@ -57,19 +55,18 @@ def _split_frontmatter(raw: str) -> tuple[str, str]:
 
 
 def _parse_meta(meta: str) -> dict:
-    """解析极简 YAML frontmatter（**支持多行块**，无 PyYAML 依赖）。
+    """解析极简 YAML frontmatter。
 
-    支持三种形态：
+         支持三种形态：
 
-    - ``key: value``            单行标量
-    - ``key: [a, b]``           行内列表（仅 ``tags`` 走此解析）
-    - ``key: |`` / ``key: >``   YAML 块标量：其后**缩进更深**的行整体作为值
-      （``|`` 保留换行、``>`` 折叠为空格连接）
+         - ``key: value`` 单行标量
+         - ``key: [a, b]`` 行内列表
+         - ``key: |`` / ``key: >`` YAML 块标量：其后缩进更深的行整体作为值
+ 
 
-    ★ 块标量是为 Agent Skills 标准补的：标准里 ``description`` 常写成多行触发说明
-    （``Use when… / Triggers include…``），是模型做 Match 的**唯一依据**；若被截断成
-    首行，命中率会明显下降。
-    """
+         块标量是为 Agent Skills 标准补的：标准里 ``description`` 常写成多行触发说明，是模型做 Match 的唯一依据；若被截断成
+         首行，命中率会明显下降。
+         """
     out: dict = {}
     lines = meta.split("\n")
     i = 0
@@ -106,12 +103,12 @@ def _parse_meta(meta: str) -> dict:
 
 
 def _safe_name(name: str) -> str:
-    """名称 → 安全文件名（防路径穿越；目录分隔符一律转 ``_``）。"""
+    """名称 → 安全文件名。"""
     return str(name).replace("/", "_").replace("\\", "_")
 
 
 def _render(skill: Skill) -> str:
-    """Skill → ``SKILL.md`` 全文（description 含换行时改用 ``|`` 块写回，避免丢行）。"""
+    """Skill → ``SKILL.md`` 全文，description 含换行时改用 ``|`` 块写回，避免丢行。"""
     desc = skill.description or ""
     if "\n" in desc:
         block = "\n".join("  " + ln for ln in desc.split("\n"))
@@ -125,17 +122,16 @@ def _render(skill: Skill) -> str:
 
 
 def parse_skill_file(path: str | Path, default_name: str | None = None) -> Skill:
-    """解析单个技能文件为 Skill（source="file"）。
+    """解析单个技能文件为 Skill。
 
-    ★ Agent Skills 标准对齐（名称）：名称 = frontmatter 的 ``name``，缺省则取
-    **所在目录名**（目录式 ``<dir>/SKILL.md``）或文件名（扁平式 ``*.md``）。
-    不再强制加 ``skill.`` 前缀——社区/Claude Code 技能用的是文件夹名
-    （如 ``docker-build``、``duckduckgo-websearch``），加前缀会让它们改名、破坏
-    技能正文里对自身名称的引用。显式写了 ``skill.xxx`` 的既有技能**照原样保留**。
+         Agent Skills 标准对齐：名称 = frontmatter 的 ``name``，缺省则取
+         所在目录名或文件名。
+         不再强制加 ``skill.`` 前缀——社区/Claude Code 技能用的是文件夹名，加前缀会让它们改名、破坏
+         技能正文里对自身名称的引用。显式写了 ``skill.xxx`` 的既有技能照原样保留。
 
-    缺少 ``---`` 起始的 frontmatter 视为非法，抛 ``ValueError``——``discover_skills``
-    会捕获并跳过，避免把随手丢进 ``data/skills/`` 的普通 markdown 当成技能加载。
-    """
+         缺少 ``---`` 起始的 frontmatter 视为非法，抛 ``ValueError``——``discover_skills``
+         会捕获并跳过，避免把随手丢进 ``data/skills/`` 的普通 markdown 当成技能加载。
+         """
     p = Path(path)
     raw = p.read_text(encoding="utf-8")
     if not raw.lstrip().startswith("---"):
@@ -145,7 +141,7 @@ def parse_skill_file(path: str | Path, default_name: str | None = None) -> Skill
         raise ValueError(f"技能文件 {p.name} 的 frontmatter 为空或缺少闭合 ---")
     fm = _parse_meta(meta)
     name = fm.get("name") or default_name or p.stem
-    # ★ B3：仅目录式技能（<name>/SKILL.md）扫捆绑资源；扁平式 basedir 是 skills/ 根，
+    # 仅目录式技能扫捆绑资源；扁平式 basedir 是 skills/ 根，
     # 扫了会把别的技能文件一并算进来，故跳过。
     is_dir_skill = p.name == "SKILL.md"
     return Skill(
@@ -165,20 +161,20 @@ def parse_skill_file(path: str | Path, default_name: str | None = None) -> Skill
 
 
 def discover_skills(data_dir: str | Path) -> list[Skill]:
-    """扫描技能（解析失败告警跳过，不拖垮启动）。
+    """扫描技能。
 
-    支持两种布局，**目录式优先**：
+     支持两种布局，目录式优先：
 
-    - 目录式（Agent Skills 标准）：``<data_dir>/skills/<name>/SKILL.md``
-      ——可同目录捆绑 ``scripts/ reference/ templates/ examples/ assets/``，
-      名称取目录名，``basedir`` 指向该目录（供正文 ``{baseDir}`` 占位替换）。
-    - 扁平式（本仓既有）：``<data_dir>/skills/*.md``——名称取文件名。
+     - 目录式：``<data_dir>/skills/<name>/SKILL.md``
+     ——可同目录捆绑 ``scripts/ reference/ templates/ examples/ assets/``，
+     名称取目录名，``basedir`` 指向该目录。
+     - 扁平式：``<data_dir>/skills/*.md``——名称取文件名。
 
-    ★ 重名处理：目录式先扫、同名者**告警跳过**（保留先到的）。刻意不让重名把容器
-    装配拖崩——两种布局并存时同名是很容易发生的运维失误，比起服务起不来，
-    告警+跳过更可取；``SkillsCatalog.register`` 的**显式**同名冲突仍照旧抛
-    ``ServiceConflictError``（"不静默覆盖"的决策未变）。
-    """
+     重名处理：目录式先扫、同名者告警跳过。刻意不让重名把容器
+     装配拖崩——两种布局并存时同名是很容易发生的运维失误，比起服务起不来，
+     告警+跳过更可取；``SkillsCatalog.register`` 的显式同名冲突仍照旧抛
+     ``ServiceConflictError``。
+     """
     d = Path(data_dir) / "skills"
     if not d.is_dir():
         return []
@@ -197,11 +193,11 @@ def discover_skills(data_dir: str | Path) -> list[Skill]:
         seen.add(s.name)
         return s
 
-    for p in sorted(d.glob("*/SKILL.md")):            # 目录式（标准）
+    for p in sorted(d.glob("*/SKILL.md")):            # 目录式
         s = _try(p, p.parent.name)
         if s is not None:
             out.append(s)
-    for p in sorted(d.glob("*.md")):                  # 扁平式（兼容）
+    for p in sorted(d.glob("*.md")):                  # 扁平式
         s = _try(p, None)
         if s is not None:
             out.append(s)
@@ -209,12 +205,12 @@ def discover_skills(data_dir: str | Path) -> list[Skill]:
 
 
 def write_skill_file(data_dir: str | Path, skill: Skill) -> Path:
-    """写入技能（persist）。
+    """写入技能。
 
-    ★ 目录式技能**写回原 ``SKILL.md``**：管理面编辑一个来源于目录的技能时，若按
-    扁平路径另存，就会同时存在 ``<name>/SKILL.md`` 与 ``<name>.md`` 两份 ⇒ 下次扫描
-    重名冲突（且用户改的其实是新那份）。故优先写回原目录。
-    """
+     目录式技能写回原 ``SKILL.md``：管理面编辑一个来源于目录的技能时，若按
+     扁平路径另存，就会同时存在 ``<name>/SKILL.md`` 与 ``<name>.md`` 两份 ⇒ 下次扫描
+     重名冲突。故优先写回原目录。
+     """
     d = Path(data_dir) / "skills"
     if skill.basedir:
         bd = Path(skill.basedir)
@@ -229,11 +225,10 @@ def write_skill_file(data_dir: str | Path, skill: Skill) -> Path:
 
 
 def delete_skill_file(data_dir: str | Path, name: str) -> bool:
-    """删除技能文件（扁平 ``<name>.md`` 或目录式 ``<name>/SKILL.md``）；成功返回 True。
+    """删除技能文件；成功返回 True。
 
-    只删入口文件，不动同目录捆绑的 ``scripts/`` 等资源（删除是高危操作，保留资源
-    便于误删后恢复）。
-    """
+     只删入口文件，不动同目录捆绑的 ``scripts/`` 等资源。
+     """
     d = Path(data_dir) / "skills"
     safe = _safe_name(name)
     for p in (d / f"{safe}.md", d / safe / "SKILL.md"):
@@ -248,7 +243,7 @@ def _state_path(data_dir: str | Path) -> Path:
 
 
 def load_state(data_dir: str | Path) -> set[str]:
-    """读 disabled 集合（缺文件/损坏回落空集）。"""
+    """读 disabled 集合。"""
     p = _state_path(data_dir)
     if not p.exists():
         return set()

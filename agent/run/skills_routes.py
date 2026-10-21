@@ -1,16 +1,12 @@
-"""agent.run.skills_routes —— 技能管理面 HTTP 路由（增 / 删 / 查 / 改 / 启停）。
+"""agent.run.skills_routes —— 技能管理面 HTTP 路由。
 
-与运行时加载路径同一套解耦范式：路由经 ``c.root.get(Services.SKILLS)`` **反向读取**
-``SkillsCatalog``，**不 import skills 插件**；未装配 ⇒ 返回 enabled=False。
+与运行时加载路径同一套解耦范式：路由经 ``c.root.get(Services.SKILLS)`` 反向读取
+``SkillsCatalog``，不 import skills 插件；未装配 ⇒ 返回 enabled=False。
 
-★ 2026-10-14 归位后本模块**不再 import 任何技能类/loader 函数**：Skill 插件系统已从
-core 迁入 ``plugins/skills``，api 不再导出技能符号，而 run/ 层只准 import ``agent.api``
-⇒ 写操作全部改经目录自身的管理面 API（``add_fields`` / ``persist`` / ``reload_from_disk``），
-HTTP 行为与错误码保持不变。
 
-写入操作（POST/PUT/DELETE）受权限档软约束（deny 模式拒写）；后期可升级为硬闸门。
-持久化：add/remove 写 ``data/skills/<name>.md``（reload 从盘重读），启停改
-``data/skills_state.json``。同名冲突 / 插件来源技能移除等按决策报错（4xx）。
+写入操作受权限档软约束；后期可升级为硬闸门。
+持久化：add/remove 写 ``data/skills/<name>.md``，启停改
+``data/skills_state.json``。同名冲突 / 插件来源技能移除等按决策报错。
 """
 
 from __future__ import annotations
@@ -19,10 +15,10 @@ from agent.api import AgentError, ServiceConflictError, Services
 
 
 def _valid_name(name: str) -> bool:
-    """技能名合法性（防路径穿越）：非空、不含路径分隔符、不含 ``..``、不以 ``.`` 开头。
+    """技能名合法性：非空、不含路径分隔符、不含 ``..``、不以 ``.`` 开头。
 
-    ★ 不再要求 ``skill.`` 前缀：Agent Skills 标准用文件夹名（如 ``docker-build``）。
-    """
+ 不再要求 ``skill.`` 前缀：Agent Skills 标准用文件夹名。
+ """
     if not name or name.strip() != name:
         return False
     if "/" in name or "\\" in name or ".." in name or name.startswith("."):
@@ -31,7 +27,7 @@ def _valid_name(name: str) -> bool:
 
 
 def register_skills_routes(app, deps) -> None:
-    """把技能管理路由挂到 FastAPI ``app`` 上（由 ``_register_routes`` 调用）。"""
+    """把技能管理路由挂到 FastAPI ``app`` 上。"""
     c = deps.c
     JSONResponse = deps.JSONResponse
 
@@ -64,8 +60,8 @@ def register_skills_routes(app, deps) -> None:
         name = str(body.get("name") or "").strip()
         if not name:
             return JSONResponse({"error": "name 必填"}, status_code=400)
-        # ★ 不再强制 ``skill.`` 前缀（Agent Skills 标准：名称 = 文件夹名）。
-        #   既有显式写了前缀的技能照原样保留，不改写。
+        # 不再强制 ``skill.`` 前缀。
+        # 既有显式写了前缀的技能照原样保留，不改写。
         if not _valid_name(name):
             return JSONResponse(
                 {"error": "name 非法：不得为空/含 / \\ .. 或以 . 开头"}, status_code=400)

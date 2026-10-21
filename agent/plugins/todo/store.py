@@ -1,11 +1,11 @@
-"""plugins.todo —— 待办存储（纯逻辑、可单测；P2-1）。
+"""plugins.todo —— 待办存储。
 
-按会话分桶（照搬 approval 的 ``current_session_key`` 分桶思路）：子 ctx 的 ``state``
+按会话分桶：子 ctx 的 ``state``
 不继承父级，且 ``ctx.state`` 是容器级 —— 直接写 ``ctx.state`` 会跨会话串号。``TodoStore``
 只认会话键，绝不依赖 ``ctx.state``。
 
-严格状态机（Claude Code TodoWrite 同款）：恰好一个 ``in_progress``；多则自动归一
-（保留列表中最后一个，其余回退 ``pending``），不在工具层拒绝调用以免打断规划流。
+严格状态机：恰好一个 ``in_progress``；多则自动归一
+，不在工具层拒绝调用以免打断规划流。
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ class Todo:
     id: str
     content: str
     status: str = "pending"          # pending | in_progress | completed | blocked
-    active_form: str = ""            # 进行时短语（进度条展示用）
+    active_form: str = ""            # 进行时短语
     created_at: str = ""
     updated_at: str = ""
 
@@ -32,8 +32,8 @@ class Todo:
 class TodoStore:
     """按会话分桶的待办存储：整表替换 + 严格状态机 + 完成度。
 
-    会话键 → 该会话的待办列表；**不持久化**（会话内存态，重启即清；卸载零残留）。
-    """
+ 会话键 → 该会话的待办列表；不持久化。
+ """
 
     def __init__(self) -> None:
         self._buckets: dict[str, list[Todo]] = {}
@@ -41,8 +41,8 @@ class TodoStore:
     def write(self, session_key: str, todos: list[dict]) -> dict:
         """整表替换 + 严格状态机归一，返回完成度 ``summary``。
 
-        ``todos`` 每项：``content``(必填) / ``status`` / ``activeForm`` / ``id``(可选)。
-        """
+ ``todos`` 每项：``content``(必填) / ``status`` / ``activeForm`` / ``id``(可选)。
+ """
         items: list[Todo] = []
         in_prog = 0
         for t in (todos or []):
@@ -60,7 +60,7 @@ class TodoStore:
                 active_form=str(t.get("activeForm", "")),
                 created_at=str(t.get("created_at") or now_iso()),
                 updated_at=now_iso()))
-        # 严格状态机：恰好一个 in_progress（多则保留最后一个、其余回退 pending）
+        # 严格状态机：恰好一个 in_progress
         if in_prog > 1:
             seen = 0
             for t in reversed(items):

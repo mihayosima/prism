@@ -1,12 +1,12 @@
-"""agent.plugins.short_term.truncate —— 两层压缩的纯逻辑（可单测，不依赖 ctx）。
+"""agent.plugins.short_term.truncate —— 两层压缩的纯逻辑。
 
-- ``truncate_content`` / ``truncate_messages``：第一层**本地截短**（窗口内可逆、不改原文）。
-- ``compress_summary_to_budget``：第二层 LLM 摘要返回后的**优先级预算压缩**（兜底约束）。
+- ``truncate_content`` / ``truncate_messages``：第一层本地截短。
+- ``compress_summary_to_budget``：第二层 LLM 摘要返回后的优先级预算压缩。
 
-职责边界（与上下文治理器区分）：
-- 本地截短 / 摘要预算都是**短期记忆对自己内容的管理**（内容层），不是调度层收窗；
-- 收窗机制已移除（``pick_history`` 暂未使用，保留供未来 G1 分块装配复用）；
-  本模块仅作单条超大消息的可逆截短安全网，不参与历史条数决策。
+职责边界：
+- 本地截短 / 摘要预算都是短期记忆对自己内容的管理，不是调度层收窗；
+- 收窗机制已移除；
+ 本模块仅作单条超大消息的可逆截短安全网，不参与历史条数决策。
 """
 
 from __future__ import annotations
@@ -15,12 +15,12 @@ import re
 
 from agent.api import clip_text, estimate_tokens
 
-# 五类优先级：低 → 高（压缩时从最低优先级裁起）
+# 五类优先级：低 → 高
 _PRIORITY_LOW_TO_HIGH = ["entity", "facts", "goal", "unresolved", "feedback"]
 # 受保护区：绝不牺牲
 _PROTECTED = frozenset({"feedback", "unresolved"})
 
-# 摘要分节标题（中英文 + 编号都可解析）
+# 摘要分节标题
 _SECTION_SPLIT = re.compile(
     r"(?m)^(?:#{2,3}\s*|\s*(?:[1-5])[.、]\s*)"
     r".*(反馈|未决|待解决|目标|意图|事实|决策|实体|人名|项目|文件).*$"
@@ -28,7 +28,7 @@ _SECTION_SPLIT = re.compile(
 
 
 def _looks_like_file(content: str) -> bool:
-    """启发：多行且含代码/结构特征 → 视为文件内容（用更大阈值）。"""
+    """启发：多行且含代码/结构特征 → 视为文件内容。"""
     if content.count("\n") < 15:
         return False
     return any(k in content for k in
@@ -39,10 +39,10 @@ def _looks_like_file(content: str) -> bool:
 def truncate_content(text: str, max_tokens: int) -> tuple[str, int]:
     """本地截短单条内容：保结构/首尾/关键行，返回 ``(新文本, 省略 token 数)``。
 
-    - 未超阈值 → 原样；
-    - 多行 → 保前 50% 行 + 后 20% 行（结构/关键行），中间省去并标注省略行数；
-    - 单行大块（如工具结果 JSON）→ 退化为头尾字符保留（``clip_text``）。
-    """
+ - 未超阈值 → 原样；
+ - 多行 → 保前 50% 行 + 后 20% 行，中间省去并标注省略行数；
+ - 单行大块→ 退化为头尾字符保留。
+ """
     total = estimate_tokens(text)
     if total <= max_tokens:
         return text, 0
@@ -66,12 +66,12 @@ def truncate_messages(
     tool_threshold: int = 6000,
     file_threshold: int = 12000,
 ) -> list[dict]:
-    """对消息列表做窗口内本地截短：**仅老内容**（距末尾 ≥ recent_rounds 轮）且超阈值才截。
+    """对消息列表做窗口内本地截短：仅老内容且超阈值才截。
 
-    - 最近 ``recent_rounds * 2`` 条（≈ 3 轮）一律不截，保证进行中的推理有完整上下文；
-    - 老消息：疑似文件 → ``file_threshold``，否则 ``tool_threshold``；超则 ``truncate_content``；
-    - **不改原文**：返回的 content 是截短后视图，``agent_messages`` 原文由 store 独立保留。
-    """
+ - 最近 ``recent_rounds * 2`` 条一律不截，保证进行中的推理有完整上下文；
+ - 老消息：疑似文件 → ``file_threshold``，否则 ``tool_threshold``；超则 ``truncate_content``；
+ - 不改原文：返回的 content 是截短后视图，``agent_messages`` 原文由 store 独立保留。
+ """
     n = len(messages)
     if n == 0:
         return []
@@ -95,7 +95,7 @@ def truncate_messages(
     return out
 
 
-# ---- 第二层：摘要优先级预算压缩（LLM 返回后的兜底约束） ----
+# ---- 第二层：摘要优先级预算压缩 ----
 
 _SECTION_KIND_MAP = {
     "反馈": "feedback", "纠正": "feedback", "修正": "feedback",
@@ -128,7 +128,7 @@ def parse_sections(summary_text: str) -> dict[str, str]:
 
 
 def _render(sections: dict[str, str]) -> str:
-    """按固定顺序渲染（反馈→未决→目标→事实→实体），稳定且受保护区在前。"""
+    """按固定顺序渲染，稳定且受保护区在前。"""
     order = ["feedback", "unresolved", "goal", "facts", "entity", "misc"]
     parts: list[str] = []
     for k in order:
@@ -149,10 +149,10 @@ def compress_summary_to_budget(
 ) -> str:
     """把摘要按优先级 + 独立预算压缩到软上限。
 
-    - 单类超自身预算 → 该类内部 clip（保头尾）；
-    - 总 token 仍超软上限 → 从最低优先级（实体→事实→目标）依次裁到其独立预算（受保护区跳过）；
-    - 反馈/未决受保护，绝不牺牲（即便总超也不裁）。
-    """
+ - 单类超自身预算 → 该类内部 clip；
+ - 总 token 仍超软上限 → 从最低优先级依次裁到其独立预算；
+ - 反馈/未决受保护，绝不牺牲。
+ """
     sections = parse_sections(summary_text)
     if not sections:
         # 无分节：整体当作可裁内容，clip 到软上限

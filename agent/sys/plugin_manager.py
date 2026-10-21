@@ -1,19 +1,19 @@
-"""agent.sys.plugin_manager —— 插件管理（发现/启停/新增/卸载），语义对齐引擎 PluginManager。
+"""agent.sys.plugin_manager —— 插件管理，语义对齐引擎 PluginManager。
 
-- 约定目录：``agent/plugins/<业务名>/__init__.py``（或 ``plugin.py``）内含 ``@plugin`` 类。
-  以 ``__init__.py`` 为入口的插件是**插件包**：可含子模块并用包内相对导入（``from .loop import …``）。
-- 期望态：``data/agent_plugin_state.json``（enabled / removed）。
-- 诚实边界：装配在启动时一次性完成 → 启停为「重启/重建后生效」（不热插拔）；卸载 = 停用 + 删目录 + removed 标记。
+- 约定目录：``agent/plugins/<业务名>/__init__.py`` 内含 ``@plugin`` 类。
+ 以 ``__init__.py`` 为入口的插件是插件包：可含子模块并用包内相对导入。
+- 期望态：``data/agent_plugin_state.json``。
+- 诚实边界：装配在启动时一次性完成 → 启停为「重启/重建后生效」；卸载 = 停用 + 删目录 + removed 标记。
 
-独立实现：零 import 引擎（与 agent 运行时同一纪律）。
+独立实现：零 import 引擎。
 
-⚠️ 双命名空间语义（有意取舍，消费方须知）：
+双命名空间语义：
 目录插件经本管理器以文件路径加载，模块登记在 ``agent_plugins.<包名>`` 命名空间下——
-与常规导入路径 ``agent.plugins.<包名>`` 下的同名类**不是同一对象**。因此：
-- 对目录插件实例做 ``isinstance(x, agent.plugins.xxx.Cls)`` 会**失败**；
-  比较类型请用 ``type(x).__name__``，或依赖 ``@plugin`` 元数据（name/provides）。
-- 插件之间、插件对内核**不得**经 ``agent.plugins.*`` 导入互通（分层守卫本就禁止）；
-  本语义只影响测试/诊断中的类型识别，不影响装配与运行。
+与常规导入路径 ``agent.plugins.<包名>`` 下的同名类不是同一对象。因此：
+- 对目录插件实例做 ``isinstance(x, agent.plugins.xxx.Cls)`` 会失败；
+ 比较类型请用 ``type(x).__name__``，或依赖 ``@plugin`` 元数据。
+- 插件之间、插件对内核不得经 ``agent.plugins.*`` 导入互通；
+ 本语义只影响测试/诊断中的类型识别，不影响装配与运行。
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ logger = logging.getLogger("agent.plugin_manager")
 
 _MARKERS = ("__init__.py", "plugin.py")
 
-_NS_PKG = "agent_plugins"        # 目录插件的命名空间父包（使插件可作为「包」被加载）
+_NS_PKG = "agent_plugins"        # 目录插件的命名空间父包
 
 _PLUGIN_TEMPLATE = '''"""插件包：{name}（一个业务 = 一个插件）。
 
@@ -80,7 +80,7 @@ class PluginManager:
     # ---------- 发现 ----------
 
     def discovered(self) -> list[dict]:
-        """扫描约定目录下的候选业务插件（轻量元数据）。"""
+        """扫描约定目录下的候选业务插件。"""
         out: list[dict] = []
         if not self._dir.is_dir():
             return out
@@ -106,7 +106,7 @@ class PluginManager:
                             "runnable": _candidate_runnable(p)})
         return out
 
-    # ---------- 启停（持久化期望态） ----------
+    # ---------- 启停 ----------
 
     def enabled(self) -> list[str]:
         return self._read_state().get("enabled", [])
@@ -143,7 +143,7 @@ class PluginManager:
             _PLUGIN_TEMPLATE.format(name=name, cls=cls, svc0=provides[0],
                                     provides_repr=str(provides)),
             encoding="utf-8")
-        self.set_enabled(f"plugins.{name}", True)   # 新增即自动启用（引擎语义）
+        self.set_enabled(f"plugins.{name}", True)   # 新增即自动启用
         return {"path": str(root), "name": name, "provides": provides, "cls": cls}
 
     def remove(self, name_or_id: str) -> dict:
@@ -163,7 +163,7 @@ class PluginManager:
         return {"removed": removed_ok, "package": pkg}
 
     def package(self, name_or_id: str) -> str:
-        """插件 id/包名 → 目录名（优先候选 package 字段）。"""
+        """插件 id/包名 → 目录名。"""
         try:
             for c in self.discovered():
                 if c.get("name") == name_or_id or c.get("package") == name_or_id:
@@ -172,7 +172,7 @@ class PluginManager:
             pass
         return name_or_id.rsplit(".", 1)[-1] if "." in name_or_id else name_or_id
 
-    # ---------- 加载（装配前） ----------
+    # ---------- 加载 ----------
 
     def load(self) -> list[Plugin]:
         """加载「启用 id」对应的目录插件 Plugin 对象。"""
@@ -198,7 +198,7 @@ class PluginManager:
 
     @property
     def state_file(self) -> Path:
-        """期望态文件路径（公开只读；诊断/控制台展示用，勿写）。"""
+        """期望态文件路径。"""
         return self._state_file
 
     def _read_state(self) -> dict:
@@ -207,8 +207,7 @@ class PluginManager:
         try:
             return json.loads(self._state_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            # S7：状态文件损坏——告警 + 备份坏文件，不再静默当作空状态
-            #（静默清空 = 一次文件损坏即禁用全部目录插件且无人知晓）。
+            # 状态文件损坏——告警 + 备份坏文件，不再静默当作空状态
             backup = self._state_file.with_suffix(".corrupt")
             logger.error("插件状态文件 %s 损坏（%s）；已备份为 %s，按空状态处理",
                          self._state_file, exc, backup.name)
@@ -234,11 +233,11 @@ def _find_locator(pkg_dir: Path) -> Path | None:
 
 
 def _ensure_namespace_pkg() -> None:
-    """登记命名空间父包 ``agent_plugins``（只建一次）。
+    """登记命名空间父包 ``agent_plugins``。
 
-    有了它，插件包内的相对导入（``from .loop import X``）才能解析 —— 否则
-    ``agent_plugins.react`` 没有父包，`__path__` 子模块查找会失败。
-    """
+        有了它，插件包内的相对导入才能解析 —— 否则
+        ``agent_plugins.react`` 没有父包，`__path__` 子模块查找会失败。
+        """
     if _NS_PKG in sys.modules:
         return
     import types
@@ -251,10 +250,10 @@ def _ensure_namespace_pkg() -> None:
 def _load_module(locator: Path) -> Any:
     """加载插件模块。
 
-    - ``__init__.py``（插件**包**）：以包方式加载（带 ``__path__``）→ 包内相对导入可用，
-      按设计可分多文件（prompt / components / loop / __init__）。
-    - ``plugin.py``（单文件插件）：普通模块加载。
-    """
+        - ``__init__.py``：以包方式加载→ 包内相对导入可用，
+          按设计可分多文件。
+        - ``plugin.py``：普通模块加载。
+        """
     _ensure_namespace_pkg()
     module_name = f"{_NS_PKG}.{locator.parent.name}"
     if locator.name == "__init__.py":

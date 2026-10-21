@@ -1,7 +1,4 @@
-"""agent.core.errors —— 诚实边界：统一错误族（slim Cordis）。
-
-零业务词（test_agent_purity 守卫）。语义对齐引擎错误族，代码独立。
-"""
+"""内核抛出的错误族定义。"""
 
 from __future__ import annotations
 
@@ -11,7 +8,7 @@ class AgentError(Exception):
 
 
 class ServiceNotFoundError(AgentError):
-    """读取未提供的服务键；附可用键清单（诊断友好）。"""
+    """读取未提供的服务键；附可用键清单。"""
 
     def __init__(self, key: str, ctx_name: str, *, action: str = "读取",
                  available: list[str] | None = None):
@@ -23,7 +20,7 @@ class ServiceNotFoundError(AgentError):
 
 
 class ServiceConflictError(AgentError):
-    """D-3：同作用域重复注册同一服务键。"""
+    """同作用域重复注册同一服务键时抛出。"""
 
     def __init__(self, key: str, ctx_name: str):
         self.key = key
@@ -31,7 +28,7 @@ class ServiceConflictError(AgentError):
 
 
 class ScopeClosedError(AgentError):
-    """作用域已关闭仍执行变更操作（防僵尸引用/泄漏）。"""
+    """作用域已关闭仍执行变更操作。"""
 
     def __init__(self, ctx_name: str):
         super().__init__(f"ctx[{ctx_name}] 已关闭，拒绝变更操作")
@@ -54,7 +51,7 @@ class CyclicDependencyError(AgentError):
 
 
 class TeardownError(AgentError):
-    """对称卸载聚合错误（不阻断其余卸载）。"""
+    """对称卸载聚合错误。"""
 
     def __init__(self, ctx_name: str, errors: list[BaseException]):
         self.ctx_name = ctx_name
@@ -66,17 +63,11 @@ class TeardownError(AgentError):
 
 
 class EventDispatchError(AgentError):
-    """事件分发失败（监听器异常聚合/传播）。"""
+    """事件分发失败。"""
 
 
 class CapabilityNotImplemented(AgentError):
-    """诚实边界：能力未实现/未配置/缺数据 → 该插槽不虚标能力。
-
-    ``denied_by``：拒绝来源标记（第 3 期语义化，设计稿《审批插件》§9-1 配套）——
-    ``""``（缺省，guard/预算等既有拒绝）| ``"approval"``（审批判定：名单/plan/超时，
-    重试无益）| ``"user"``（用户本轮主动拒，模型应读理由换方案）。消费方
-    （react 连拒闸）据此区分「工具坏循环」与「人不同意」，其余场合可忽略。
-    """
+    """能力未实现 / 未配置 / 缺数据时抛出。``denied_by`` 标记拒绝来源：``""`` 缺省、``"approval"`` 审批判定、``"user"`` 用户主动拒绝。"""
 
     def __init__(self, capability: str, reason: str = "", *, denied_by: str = ""):
         self.capability = capability
@@ -86,33 +77,19 @@ class CapabilityNotImplemented(AgentError):
 
 
 class ConfigError(AgentError):
-    """配置 schema 校验失败（键拼错 / 类型不符）。"""
+    """配置 schema 校验失败。"""
 
 
 class EventWiringError(AgentError):
-    """capability 接缝接线校验失败（装配期/运行期监听缺失）。"""
+    """capability 接缝接线校验失败。"""
 
 
 class LlmUnavailableError(AgentError):
-    """模型调用在重试耗尽后仍不可用（429/5xx/网络抖动/超时）。
-
-    由 provider 内部重试逻辑抛出；沿 ``LlmService.complete`` 既有失败路径上行
-    （durable ``LLM_CALL_FAILED`` + emit + budget 同步退款），**不引入备用 provider**——
-    避免「当前用哪个 provider」隐藏状态及其预算归组/审计归因/错误语义改写（属后续阶段）。
-    """
+    """模型调用重试耗尽后仍不可用时抛出。"""
 
 
 class EngineUnavailable(AgentError):
-    """本地能力引擎不可用：依赖缺失 / 模型未就位 / 加载失败。
-
-    中性错误（零业务词）：**具体是哪个引擎由抛出的插件自己说明**——内核只提供
-    「引擎不可用」这一族语义，与 ``LlmUnavailableError`` 并列。
-
-    ★ 为什么放内核而不是留在插件里：插件抛的异常若只在插件包内定义，消费方
-    （装配/传输层）就必须 ``import agent.plugins.<x>.<impl>`` 才能 ``except``，
-    直接撞上 ``test_plugin_decoupling`` 的「装配/传输层依赖业务插件实现」红线。
-    上提到此并经 ``agent.api`` 导出后，插件 raise、传输层 catch **都只认 api**。
-    """
+    """本地能力引擎不可用时抛出。"""
 
 
 __all__ = [

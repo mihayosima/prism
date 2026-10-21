@@ -1,20 +1,18 @@
-"""插件包：windows_mcp —— 把 windows-mcp-server（MCP stdio）封装为 agent 工具插件。
+"""插件包：windows_mcp —— 把 windows-mcp-server 封装为 agent 工具插件。
 
-管理：本包位于 agent/plugins/，经「插件」页可停用 / 启用 / 卸载（引擎式 desired/actual/delta）。
+管理：本包位于 agent/plugins/，经「插件」页可停用 / 启用 / 卸载。
 默认未启用——在插件页点「启用」，或配置 env，工具即出现在 Agent 的工具目录里。
 
-- 启动一个 MCP stdio 子进程（windows-mcp-server，如 node/npx/npx.cmd 入口），
-  其工具（process/screenshot/window 等）自动注册到 agent 工具目录，供 chat tool_call 调用。
+- 启动一个 MCP stdio 子进程，
+ 其工具自动注册到 agent 工具目录，供 chat tool_call 调用。
 - 生命周期对称：apply 起子进程 → effect 关子进程；guard 矩阵照常管辖 tool 调用。
-- 诚实边界：未配置 command → 装配时报告未就绪（不假挂）；进程启动失败 → 报告原因。
+- 诚实边界：未配置 command → 装配时报告未就绪；进程启动失败 → 报告原因。
 
-S4 加固（死因可见 / 自愈 / 状态不撒谎）：
-- 子进程 stderr 经 ``on_stderr`` 打到 **warning**（此前默认走 ``logger.debug``，默认级别下
-  被彻底丢弃 ⇒ 「子进程为什么死」在日志里零痕迹）；
-- handler 调用前**探活**（``client.is_alive``），发现已死就**就地重启**子进程
-  ⇒ 不必再重启整个后端；重启失败则如实抛错并写入 ``MCP_ERROR``；
-- ``status()`` 增 ``alive`` 实时字段 ⇒ 插件页不再显示"假健康"（此前运行期死亡时
-  ``error`` 恒为 null）。
+S4 加固：
+- 子进程 stderr 经 ``on_stderr`` 打到 warning；
+- handler 调用前探活，发现已死就就地重启子进程
+ ⇒ 不必再重启整个后端；重启失败则如实抛错并写入 ``MCP_ERROR``；
+- ``status()`` 增 ``alive`` 实时字段 ⇒ 插件页不再显示"假健康"。
 """
 
 from __future__ import annotations
@@ -33,7 +31,7 @@ _BRIDGE = "windows_mcp"
 
 
 def _on_stderr(text: str) -> None:
-    """子进程 stderr → warning（S4：这是「死因」的唯一通路，绝不能降级丢弃）。"""
+    """子进程 stderr → warning。"""
     if text.strip():
         logger.warning("[%s] %s", _BRIDGE, text)
 
@@ -49,7 +47,7 @@ def _env_args(raw: str | None) -> list[str]:
 
 
 def resolve(cfg: dict, environ: dict | None = None) -> tuple[str, list[str], float]:
-    """解析启动命令（纯函数，便于离线测试）：config > env > 默认 uvx。"""
+    """解析启动命令：config > env > 默认 uvx。"""
     environ = environ or {}
     command = cfg.get("command") or environ.get("WINDOWS_MCP_COMMAND") or "uvx"
     args = list(cfg.get("args") or _env_args(environ.get("WINDOWS_MCP_ARGS")))
@@ -61,7 +59,7 @@ def resolve(cfg: dict, environ: dict | None = None) -> tuple[str, list[str], flo
 
 @plugin
 class WindowsMcp:
-    """把 windows-mcp-server 的工具挂进 agent 工具目录（可管理插件）。"""
+    """把 windows-mcp-server 的工具挂进 agent 工具目录。"""
 
     name = "plugins.windows_mcp"
     version = "0.1.0"
@@ -79,7 +77,7 @@ class WindowsMcp:
         self._lock = asyncio.Lock()
 
     def _spawn(self, cfg: dict) -> McpStdioClient:
-        """按配置造一个客户端（含 S4 stderr 接线 + 可选落点收拢）。"""
+        """按配置造一个客户端。"""
         command, args, timeout = resolve(cfg, os.environ)
         env = dict(cfg.get("env") or {})
         cwd = self._workspace()
@@ -90,15 +88,15 @@ class WindowsMcp:
                               on_stderr=_on_stderr, cwd=(cwd or {}).get("cwd"))
 
     def _workspace(self) -> dict | None:
-        """取沙箱落点接缝（2026-10-04）：声明了档位 ⇒ 把子进程挪出项目根。
+        """取沙箱落点接缝：声明了档位 ⇒ 把子进程挪出项目根。
 
-        沙箱未装配 / ``mode=none`` ⇒ ``None`` ⇒ 行为与今天完全一致（opt-in，不劣化）。
-        接缝故障**不得拖垮桥启动**（沙箱是增强维度，不是硬前提）。
-        """
+         沙箱未装配 / ``mode=none`` ⇒ ``None`` ⇒ 行为与今天完全一致。
+         接缝故障不得拖垮桥启动，沙箱是增强维度，不是硬前提。
+         """
         if self._ctx is None:
             return None
-        # ★ 用 getattr 取而不是直接 ``self._ctx.get(...)``：部分装配/测试桩的 ctx 未必
-        # 实现 ``get``。沙箱是**增强维度**，缺了就退回无落点，绝不能把桥启动搞崩。
+        # 用 getattr 取而不是直接 ``self._ctx.get(...)``：部分装配/测试桩的 ctx 未必
+        # 实现 ``get``。沙箱是增强维度，缺了就退回无落点，绝不能把桥启动搞崩。
         getter = getattr(self._ctx, "get", None)
         if not callable(getter):
             return None
@@ -109,7 +107,7 @@ class WindowsMcp:
         if not callable(fn):
             return None
         try:
-            # ★ P8：传桥 id —— windows_mcp 是**不可移植目标**（跨不了 WSL/容器边界），
+            # 传桥 id —— windows_mcp 是不可移植目标，
             # 由沙箱侧据此把本桥降级为 off，而不是硬套包装把它弄崩。
             return call_spawn_provider(fn, current_session_key(self._ctx), _BRIDGE)
         except Exception:                       # noqa: BLE001 —— 沙箱故障 ⇒ 退回无落点
@@ -126,7 +124,7 @@ class WindowsMcp:
             tools = await client.list_tools()
         except Exception as exc:  # noqa: BLE001 —— 起不来诚实报，不拖垮装配
             logger.warning("windows_mcp 启动失败: %s", exc)
-            # S4：起不来的子进程同样要收干净，否则 uvx→uv→python 会变孤儿长期驻留
+            # 起不来的子进程同样要收干净，否则 uvx→uv→python 会变孤儿长期驻留
             try:
                 await client.close()
             except Exception:  # noqa: BLE001
@@ -140,7 +138,7 @@ class WindowsMcp:
         ctx.state[StateKeys.MCP_TOOLS.format(bridge=_BRIDGE)] = self._tools
         ctx.state[StateKeys.MCP_ERROR.format(bridge=_BRIDGE)] = None
         for t in tools:
-            # S6/P2：保真转换（enum / anyOf / default / 属性描述一并带出），
+            # S6/P2：保真转换，
             # 此前只抄 type ⇒ 模型的工具卡里看不到 mode 的合法取值
             task_schema = build_task_schema(t.get("inputSchema"))
             ctx.tasks.register(ctx, f"mcp.windows.{t.get('name')}", schema=task_schema,
@@ -157,7 +155,7 @@ class WindowsMcp:
         return _call
 
     async def _ensure_client(self) -> McpStdioClient:
-        """探活 + 自愈：活着直接用；死了就地重启（免去重启整个后端）。"""
+        """探活 + 自愈：活着直接用；死了就地重启。"""
         c = self._client
         if c is not None and c.is_alive:
             return c
@@ -208,7 +206,7 @@ class WindowsMcp:
         c = self._client
         return {"tools": ctx.state.get(StateKeys.MCP_TOOLS.format(bridge=_BRIDGE), []),
                 "error": ctx.state.get(StateKeys.MCP_ERROR.format(bridge=_BRIDGE)),
-                # S4：实时存活（由 _wait_loop 维护），避免"假健康"
+                # 实时存活，避免"假健康"
                 "alive": bool(c is not None and c.is_alive)}
 
 

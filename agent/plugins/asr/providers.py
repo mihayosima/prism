@@ -1,29 +1,29 @@
-"""provider 层：``ASRProvider`` 抽象 + ``SherpaOnnxProvider``（本地双识别器）。
+"""provider 层：``ASRProvider`` 抽象 + ``SherpaOnnxProvider``。
 
 为什么要有抽象
 --------------
-模式 R（实时）与模式 F（长录音）用的是**两个不同模型/两个不同 API**
-（``OnlineRecognizer`` transducer vs ``OfflineRecognizer`` SenseVoice），
+模式 R与模式 F用的是两个不同模型/两个不同 API
+，
 但对外承诺的能力形状是同一个：能吃音频、能出文本。第二版要引入
 「实时出字 + 离线润色」的 Hybrid 组合，若没有这层抽象，就得把 provider 的
 分支散进 service/端点里，换引擎时四处改。
 
-因此抽象只锁**能力形状**，不锁实现：
+因此抽象只锁能力形状，不锁实现：
 
-    name / streaming_supported / file_supported
-    load()                      -> None
-    transcribe_file(...)        -> list[Segment]
-    create_stream_session()     -> StreamSession | None
-    refine(text)                -> str     ★ 首版 passthrough（第二版接离线润色）
-    vad                         -> VadModule | None
-    describe()                  -> dict    （status/ 端点如实自述，含**缺口**）
+ name / streaming_supported / file_supported
+ load() -> None
+ transcribe_file(...) -> list[Segment]
+ create_stream_session() -> StreamSession | None
+ refine(text) -> str 首版 passthrough
+ vad -> VadModule | None
+ describe() -> dict 
 
-★ **诚实性纪律**（对齐 ``plugins/sandbox``）：``describe()`` 必须报告真实能力——
-模型没下载就报 ``ready=False`` 并列出缺什么，**绝不**返回一个"看起来能用"的
+诚实性纪律：``describe()`` 必须报告真实能力——
+模型没下载就报 ``ready=False`` 并列出缺什么，绝不返回一个"看起来能用"的
 provider。降级是显式选择，不是隐式��默。
 
-Segment 契约（模式 F 的输出，下游 AI 分析/飞书工作流按它消费）
-    ``{"index": int, "start_sec": float, "end_sec": float, "text": str}``
+Segment 契约
+ ``{"index": int, "start_sec": float, "end_sec": float, "text": str}``
 """
 
 from __future__ import annotations
@@ -39,16 +39,15 @@ from .vad import VadModule
 
 logger = logging.getLogger("agent.plugins.asr.providers")
 
-#: 引擎不可用（缺包/缺模型）——**受控失败**，由 service 转成明确状态，不静默。
-#:
-#: ★ 类型本体在 ``agent.core.errors``，经 ``agent.api`` 导出后在此 **re-export**：
-#:   插件（raise）与传输层（except）因此**都只认 api**，传输层不必 import 本模块
-#:   （否则撞「装配/传输层依赖业务插件实现」红线，见 core/errors 的同名注释）。
+# : 引擎不可用——受控失败，由 service 转成明确状态，不静默。
+# : 类型本体在 ``agent.core.errors``，经 ``agent.api`` 导出后在此 re-export：
+# : 插件与传输层因此都只认 api，传输层不必 import 本模块
+# : ，否则撞「装配/传输层依赖业务插件实现」红线，见 core/errors 的同名注释。
 
 
 @dataclass
 class Segment:
-    """长录音的一个语音段（时间戳 + 文本）。``to_dict`` 供端点序列化。"""
+    """长录音的一个语音段。``to_dict`` 供端点序列化。"""
 
     index: int
     start_sec: float
@@ -74,28 +73,28 @@ class FileTranscribeResult:
 
 
 class StreamSession(ABC):
-    """一次实时识别会话（一个 WS 连接 = 一个 session）。
+    """一次实时识别会话。
 
-    与 provider 的关系：provider 持**重资源**（模型），session 持**易变状态**
-    （stream/缓冲）。这样并发连接不会互相污染 endpoint 判定。
-    """
+ 与 provider 的关系：provider 持重资源，session 持易变状态
+ 。这样并发连接不会互相污染 endpoint 判定。
+ """
 
     @abstractmethod
     def push(self, pcm_int16: bytes, sample_rate: int = TARGET_SAMPLE_RATE) -> list[dict]:
-        """喂一块 int16 PCM，返回本次产生的帧（可为空）。帧形如
-        ``{"type":"partial"|"final", "text": str}``。"""
+        """喂一块 int16 PCM，返回本次产生的帧。帧形如
+ ``{"type":"partial"|"final", "text": str}``。"""
 
     @abstractmethod
     def finish(self) -> list[dict]:
-        """收尾（客户端发 stop）：冲刷剩余音频并返回 final 帧。"""
+        """收尾：冲刷剩余音频并返回 final 帧。"""
 
     @abstractmethod
     def reset(self) -> None:
-        """清空会话状态（复用或异常断开时调用）。"""
+        """清空会话状态。"""
 
 
 class ASRProvider(ABC):
-    """识别引擎的能力契约（**不含传输层**：不管 WS/HTTP 怎么来）。"""
+    """识别引擎的能力契约。"""
 
     name: str = "abstract"
     streaming_supported: bool = False
@@ -106,7 +105,7 @@ class ASRProvider(ABC):
 
     @abstractmethod
     def load(self) -> None:
-        """加载/自检引擎。不可用时抛 ``EngineUnavailable``（**不静默**）。"""
+        """加载/自检引擎。不可用时抛 ``EngineUnavailable``。"""
 
     @abstractmethod
     def describe(self) -> dict:
@@ -119,23 +118,23 @@ class ASRProvider(ABC):
     @abstractmethod
     def transcribe_file(self, samples, sample_rate: int,
                         opts: dict | None = None) -> FileTranscribeResult:
-        """长录音转写：``samples`` 为 float32/16k 单声道（由 service 保证）。"""
+        """长录音转写：``samples`` 为 float32/16k 单声道。"""
 
     def refine(self, text: str) -> str:
-        """实时出字的**定稿钩子**（第二版：接 SenseVoice 补标点/ITN）。
+        """实时出字的定稿钩子。
 
-        ★ 首版 **passthrough**：原样返回，明确不是"已润色"——避免下游误以为
-        标点已规范。开关在 ``config['refine']['enabled']``（默认关）。
-        """
+ 首版 passthrough：原样返回，明确不是"已润色"——避免下游误以为
+ 标点已规范。开关在 ``config['refine']['enabled']``。
+ """
         return text
 
 
 class SherpaStreamingSession(StreamSession):
     """``OnlineRecognizer`` + ``endpoint detection`` 的流式会话。
 
-    断句靠 sherpa 自带的 endpoint 规则（rule1 尾静音 / rule2 长尾静音 / rule3 最短句长），
-    判定为 endpoint 即回 ``final`` 并 ``reset`` 该 stream，开始下一句。
-    """
+ 断句靠 sherpa 自带的 endpoint 规则，
+ 判定为 endpoint 即回 ``final`` 并 ``reset`` 该 stream，开始下一句。
+ """
 
     def __init__(self, recognizer, tokens_stream, *, sample_rate: int,
                  rule1_min_trailing_silence: float, rule2_min_trailing_silence: float,
@@ -190,23 +189,23 @@ def _silence(sample_rate: int, seconds: float = 0.6) -> "object":
 
 
 def _is_endpoint_by_rules(_last_chunk, r1: float, r2: float, r3: float) -> bool:
-    """占位：真实规则判定目前**由 sherpa 的 ``is_endpoint`` 承担**。
+    """占位：真实规则判定目前由 sherpa 的 ``is_endpoint`` 承担。
 
-    保留参数与函数形状，是为了让"自定义尾静音阈值"在第二版有明确落点；
-    首版返回 False（不与 sherpa 规则重复判定，避免双重断句）。
-    """
+ 保留参数与函数形状，是为了让"自定义尾静音阈值"在第二版有明确落点；
+ 首版返回 False，不与 sherpa 规则重复判定，避免双重断句。
+ """
     return False
 
 
 def _sense_voice_text(result) -> str:
-    """从 SenseVoice 的识别结果里取**纯文本**。
+    """从 SenseVoice 的识别结果里取纯文本。
 
-    ★ ``OfflineStream.result`` 对 SenseVoice 而言是 **JSON 字符串**，形如
-      ``{"lang":"<|zh|>","emotion":"<|NEUTRAL|>","event":"<|Speech|>",
-        "text":"昨天是星期一","timestamps":[...],"tokens":[...]}``
-      —— 直接把它当文本返回，会把整段 JSON 当成转写结果发给前端/下游（实测踩到）。
-    ⇒ 必须解析后取 ``text``。对非 JSON（其它离线模型给的是 str）则原样返回。
-    """
+ ``OfflineStream.result`` 对 SenseVoice 而言是 JSON 字符串，形如
+ ``{"lang":"<|zh|>","emotion":"<|NEUTRAL|>","event":"<|Speech|>",
+ "text":"昨天是星期一","timestamps":[...],"tokens":[...]}``
+ —— 直接把它当文本返回，会把整段 JSON 当成转写结果发给前端/下游。
+ ⇒ 必须解析后取 ``text``。对非 JSON 则原样返回。
+ """
     if result is None:
         return ""
     if isinstance(result, dict):
@@ -222,16 +221,16 @@ def _sense_voice_text(result) -> str:
 
 
 class SherpaOnnxProvider(ASRProvider):
-    """sherpa-onnx 本地引擎：持**两个**识别器，按模式路由。
+    """sherpa-onnx 本地引擎：持两个识别器，按模式路由。
 
-    - 实时（模式 R）：``OnlineRecognizer.from_transducer`` + X-ASR chunk-480ms
-      （``model_type="zipformer2"``，cjkchar 分词，**无需 bpe**）；
-    - 长录音（模式 F）：``OfflineRecognizer.from_sense_voice`` + SenseVoice int8
-      （``use_itn=True``）。
+ - 实时：``OnlineRecognizer.from_transducer`` + X-ASR chunk-480ms
+ ；
+ - 长录音：``OfflineRecognizer.from_sense_voice`` + SenseVoice int8
+ 。
 
-    ★ ``model_type="zipformer2"`` 不是可省参数：官方 ``sherpa_streaming_infer.py``
-    就是这么调的；漏了它 zipformer2 加载路径取不到 ``encoder_dims`` 元数据会直接失败。
-    """
+ ``model_type="zipformer2"`` 不是可省参数：官方 ``sherpa_streaming_infer.py``
+ 就是这么调的；漏了它 zipformer2 加载路径取不到 ``encoder_dims`` 元数据会直接失败。
+ """
 
     name = "sherpa"
     streaming_supported = True
@@ -239,17 +238,17 @@ class SherpaOnnxProvider(ASRProvider):
 
     def __init__(self, config: dict, *, sherpa=None):
         super().__init__(config)
-        self._sherpa = sherpa            # 注入点（测试用假模块）；None ⇒ load 时 import
+        self._sherpa = sherpa            # 注入点；None ⇒ load 时 import
         self._online = None
         self._offline = None
         self._vad: VadModule | None = None
         self._ready = False
         self._reason = ""
-        # ★ 配置项**不在构造时快照**成实例属性：服务门面（``ASRService``）与本 provider
-        #   共享同一个 config dict，容器热重载改配置时若这里已快照，改动会被**静默忽略**
-        #   （曾实测踩到：改 model_root 无效、模型仍从旧路径加载）。故一律**读取时取值**。
+        # 配置项不在构造时快照成实例属性：服务门面与本 provider
+        # 共享同一个 config dict，容器热重载改配置时若这里已快照，改动会被静默忽略
+        # 故一律读取时取值。
 
-    # ---- 配置读取（读取时取值，见 __init__ 的说明） ----
+    # ---- 配置读取 ----
 
     @property
     def _sample_rate(self) -> int:
@@ -282,7 +281,7 @@ class SherpaOnnxProvider(ASRProvider):
     # ------------------------------------------------------------------ 加载
 
     def load(self) -> None:
-        """加载引擎 + 模型（幂等）。缺包/缺模型 ⇒ ``EngineUnavailable``。"""
+        """加载引擎 + 模型。缺包/缺模型 ⇒ ``EngineUnavailable``。"""
         if self._ready:
             return
         if self._sherpa is None:
@@ -334,9 +333,8 @@ class SherpaOnnxProvider(ASRProvider):
         spec = spec_for("vad", str(self._vad_cfg.get("model") or ""))
         ensure_ready("vad", self._model_root, spec.dir_name,
                      allow_download=self._auto_download)
-        # ★ 必须把 ``self._sherpa`` 透传给 VadModule：否则它会自己去 import 真
-        #   sherpa_onnx，导致注入失效（测试里表现为"切出 0 段"：真 VAD 对全零音频
-        #   判定为无语音）。注入链断在这里会同时毁掉可测性与"引擎降级"语义。
+        # 必须把 ``self._sherpa`` 透传给 VadModule：否则它会自己去 import 真
+        # sherpa_onnx，导致注入失效。注入链断在这里会同时毁掉可测性与"引擎降级"语义。
         self._vad = VadModule(
             spec.paths(self._model_root)["model"],
             sample_rate=self._sample_rate,
@@ -357,7 +355,7 @@ class SherpaOnnxProvider(ASRProvider):
         return self._reason
 
     def describe(self) -> dict:
-        """能力自述（``status()``/端点消费）。**如实**报告缺口。"""
+        """能力自述。如实报告缺口。"""
         return {
             "name": self.name,
             "streaming": bool(self.streaming_supported),

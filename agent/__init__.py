@@ -1,7 +1,7 @@
-"""Agent —— slim Cordis 运行时（通用型 · everything-is-a-plugin）。
+"""Agent —— slim Cordis 运行时。
 
 独立性：本包只 `from agent.api import …`；零外部引擎、零 Node、零三方重依赖；
-离线夹具可自举（`python -m agent.run.chat --fixture` 跑通对话闭环 = 独立性硬证明）。
+离线夹具可自举。
 """
 
 __version__ = "0.1.0"

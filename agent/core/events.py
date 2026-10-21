@@ -1,14 +1,12 @@
-"""agent.core.events —— 事件总线（双模式：emit 广播遥测 + waterfall 能力闸门）。
+"""agent.core.events —— 事件总线。
 
-payload 一律纯数据（可 JSON 化）——「事件=扩展点，payload 只带数据」（anti 跨作用域泄漏）。
-模式语义（契约级）：
-    emit      不 await；同步按注册序、async 并发 fire（fire-and-forget）；错误隔离；只承载遥测/审计。
+payload 一律纯数据——「事件=扩展点，payload 只带数据」。
+模式语义：
+    emit      不 await；同步按注册序、async 并发 fire；错误隔离；只承载遥测/审计。
     waterfall await；监听收 (…原参数, next) 续接组合；「不调用 next() 即否决」；错误传播。
 
-监听器绑定注册它的 ctx：分发时 ctx 已关闭（插件已卸载）→ 跳过并剪除（防死引用）。
-在途的 fire-and-forget 异步任务由总线追踪，aclose() 时取消并等待，避免 teardown 后残留。
-
-（注：parallel / serial / bail 三模式已移除——无生产消费方，属 YAGNI，详见内核优化方案 K-5。）
+监听器绑定注册它的 ctx：分发时 ctx 已关闭→ 跳过并剪除。
+在途的 fire-and-forget 异步任务由总线追踪，aclose() 时取消并等待，避免 teardown 后残留。，注：parallel / serial / bail 三模式已移除——无生产消费方，属 YAGNI，详见内核优化方案 K-5。
 """
 
 from __future__ import annotations
@@ -52,7 +50,7 @@ def _assert_pure_data(args: tuple[Any, ...], what: str) -> None:
 
 
 class _Listener:
-    """一条监听器记录：绑定注册它的 ctx + 执行序 + once + 是否 async（注册期缓存）。"""
+    """一条监听器记录：绑定注册它的 ctx、执行序、once 与是否 async。"""
 
     __slots__ = ("ctx", "handler", "once", "order", "is_async")
 
@@ -65,11 +63,9 @@ class _Listener:
 
 
 class EventBus:
-    """ctx.events —— 事件总线。注册走 ctx.on（挂 ctx 作用域）；分发走 ctx.events.<mode>。"""
+    """事件总线：注册走 ctx.on，分发走 emit / waterfall。"""
 
-    #: fire-and-forget 在途任务上限。**超出即丢弃并计数**（2026-10-04）。
-    #: 默认 256：当前生产监听器数量远低于此 ⇒ 正常态**永不触发**，
-    #: 只在"高频事件 × 大量异步监听器"这种异常形态下兜住内存增长。
+    # : fire-and-forget 在途任务上限；超出即丢弃并计数。
     DEFAULT_MAX_INFLIGHT = 256
 
     def __init__(self, strict_payload: bool = True, required_seams: set | None = None,
@@ -78,21 +74,21 @@ class EventBus:
         self._seq = 0
         self.strict_payload = strict_payload
         self._required_seams: set = set(required_seams or ())
-        self._tasks: set[asyncio.Task] = set()   # 在途 fire-and-forget 任务（K4a 追踪）
+        self._tasks: set[asyncio.Task] = set()   # 在途 fire-and-forget 任务
         self._max_inflight = int(max_inflight or self.DEFAULT_MAX_INFLIGHT)
-        #: 因超过上限而被**丢弃**的监听器次数（非 0 即说明出现过事件洪峰）
+        # : 因超过上限被丢弃的监听器次数
         self.dropped = 0
 
     @property
     def inflight(self) -> int:
-        """当前在途 fire-and-forget 任务数（诊断用）。"""
+        """当前在途 fire-and-forget 任务数。"""
         return len(self._tasks)
 
     # ---------- 注册 ----------
 
     def on(self, ctx: "Context", name: str, handler: Callable,
            *, prepend: bool = False, once: bool = False) -> Callable[[], bool]:
-        """注册监听器；返回 disposer（移除并返回是否仍注册）。上下文 = 注册 ctx。"""
+        """注册监听器，返回 disposer。"""
         self._seq += 1
         is_async = inspect.iscoroutinefunction(handler)
         entry = _Listener(ctx, handler, once, self._seq, is_async)
@@ -114,23 +110,23 @@ class EventBus:
         return dispose
 
     def listeners(self, name: str) -> list[str]:
-        """调试：某事件的 (ctx.name, once) 列表（自动剔除已关闭作用域）。"""
+        """调试：某事件的 (ctx.name, once) 列表。"""
         return [(e.ctx.name, e.once) for e in self._listeners.get(name, ())]
 
     # ---------- 分发：双模式 ----------
 
     async def emit(self, name: str, *args: Any) -> None:
-        """遥测/审计：同步按注册序、async 并发 fire（fire-and-forget）；错误互不影响。
+        """遥测/审计：同步按注册序、async 并发 fire；错误互不影响。
 
-        ★ 在途任务有**上限**（2026-10-04）：此前只登记不设 cap ⇒ 高频事件遇到慢的
-        异步监听器时会无界堆积。超限时**丢弃该监听器并计数**——
-        刻意**不排队、不阻塞**：``emit`` 的契约就是"不 await"，
-        阻塞会把遥测发射变成背压点，反过来拖慢业务主链路。
-        ★ 丢弃是**不诚实的**（那一帧遥测/审计就没了），所以必须可见：
-        ``dropped`` 计数 + ``agent_events_dropped_total`` 指标。
-        ⚠️ **不影响 waterfall**：闸门链是 ``await`` 的、有 ``required_seams`` 兜底，
-        不经过这条路径 ⇒ 限流永远不会"悄悄打开闸门"。
-        """
+                在途任务有上限：此前只登记不设 cap ⇒ 高频事件遇到慢的
+                异步监听器时会无界堆积。超限时丢弃该监听器并计数——
+                刻意不排队、不阻塞：``emit`` 的契约就是"不 await"，
+                阻塞会把遥测发射变成背压点，反过来拖慢业务主链路。
+                丢弃是不诚实的，所以必须可见：
+                ``dropped`` 计数 + ``agent_events_dropped_total`` 指标。
+                ⚠️ 不影响 waterfall：闸门链是 ``await`` 的、有 ``required_seams`` 兜底，
+                不经过这条路径 ⇒ 限流永远不会"悄悄打开闸门"。
+                """
         if self.strict_payload:
             _assert_pure_data(args, f"emit({name!r})")
         for entry in self._snapshot(name):
@@ -157,9 +153,9 @@ class EventBus:
     async def waterfall(self, name: str, *args: Any) -> Any:
         """中间件组合：监听收 (…原参数, next)；next() 续接，不调用即否决。
 
-        链底 = 原参数（中间件原地改写即生效）；任一监听不调 next() 直接返回 ⇒ 其返回值即最终决策。
-        返回最外层值；错误传播。
-        """
+         链底 = 原参数；任一监听不调 next() 直接返回 ⇒ 其返回值即最终决策。
+         返回最外层值；错误传播。
+         """
         if self.strict_payload:
             _assert_pure_data(args, f"waterfall({name!r})")
         chain = self._snapshot(name)
@@ -173,7 +169,7 @@ class EventBus:
 
         async def next_from(index: int) -> Any:
             if index >= len(chain):
-                return origin                      # 链底：原参数（多参数元组 / 单参数本身）
+                return origin                      # 链底：原参数
             entry = chain[index]
             if entry.ctx.closed:
                 return await next_from(index + 1)
@@ -192,7 +188,7 @@ class EventBus:
     # ---------- 内部 ----------
 
     async def aclose(self) -> None:
-        """取消并等待所有在途 fire-and-forget 监听器任务（teardown 时调用，避免残留）。"""
+        """取消并等待所有在途 fire-and-forget 监听器任务，teardown 时调用，避免残留。"""
         pending = list(self._tasks)
         for t in pending:
             t.cancel()
@@ -204,19 +200,17 @@ class EventBus:
         self._tasks.clear()
 
     async def idle(self) -> None:
-        """等待全部在途 fire-and-forget 任务**自然结束**（不取消）。
+        """等待全部在途 fire-and-forget 任务自然结束。
 
-        与 ``aclose`` 的分工：``aclose`` 取消并等待（teardown 用），本方法只等待
-        （收尾前的"记账/审计落地后再断言"、测试确定性、优雅停止用）。
+                与 ``aclose`` 的分工：``aclose`` 取消并等待，本方法只等待。
 
-        ★ 为什么需要它：``emit`` 的 async 监听器是 fire-and-forget，绑定 DB 之后
-        其落地时刻取决于**事件循环轮次 + 线程池往返**（``storage`` 经 ``to_thread``
-        卸载）。用 ``await asyncio.sleep(0)`` × N 等待是**碰运气**——线程往返一慢就漏。
-        本方法轮询到 ``_tasks`` 为空，是确定性等待。
+                为什么需要它：``emit`` 的 async 监听器是 fire-and-forget，绑定 DB 之后
+                其落地时刻取决于事件循环轮次 + 线程池往返。用 ``await asyncio.sleep(0)`` × N 等待是碰运气——线程往返一慢就漏。
+                本方法轮询到 ``_tasks`` 为空，是确定性等待。
 
-        ★ 循环而非单次 ``gather``：在途监听器自身可能再 ``emit``（派生新任务），
-        单次 gather 会漏掉派生出来的那批。
-        """
+                循环而非单次 ``gather``：在途监听器自身可能再 ``emit``，
+                单次 gather 会漏掉派生出来的那批。
+                """
         while self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
 
@@ -245,7 +239,7 @@ class EventBus:
                         self._listeners.pop(name, None)
 
     async def _guarded(self, entry: _Listener, name: str, args: tuple[Any, ...]) -> None:
-        """fire-and-forget 的 async 监听器守卫：错误只记日志（异常不向外传播）。"""
+        """fire-and-forget 的 async 监听器守卫：错误只记日志。"""
         try:
             if not entry.ctx.closed:
                 await self._invoke_one(entry, args, name)

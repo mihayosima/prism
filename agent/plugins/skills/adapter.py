@@ -1,31 +1,27 @@
-"""agent.plugins.skills.adapter —— 技能 MCP 服务器（stdlib stdio JSON-RPC；只读 + 可选执行）。
+"""agent.plugins.skills.adapter —— 技能 MCP 服务器。
 
 把本仓 ``Services.SKILLS`` 的技能目录以 MCP 工具形式对外暴露，供子 agent / 外部 MCP
-客户端消费。设计要点（均经真实代码核实）：
+客户端消费。设计要点：
 
-- **只读 + 可选执行**：常驻暴露 ``skill_list`` / ``skill_view`` 两个只读工具；配置
-  ``SKILLS_ALLOW_EXEC=1``（桥默认开，策略 A）时**额外**暴露 Follow 三件套
-  （``skill_bash`` / ``skill_file_create`` / ``skill_str_replace``），在宿主环境
-  直接操作电脑（受 120s 超时、20k 截断、可选命令黑名单约束）。执行**不经**内核 ``Skill.run``。
-- **零第三方依赖**：``core/mcp_client.py`` 是 stdlib 的 JSON-RPC stdio 客户端，本模块是
-  它的**对端**——同样用 stdlib 手写服务端。实测本机 ``fastmcp`` / ``mcp`` 均未安装且无 uv，
-  故不走框架路线（方案 §7-5 的「手写 stdio 桥」选项）。
-- **子进程无 ctx**：以 ``python -m agent.plugins.skills.adapter`` 独立进程运行，
+- 只读 + 可选执行：常驻暴露 ``skill_list`` / ``skill_view`` 两个只读工具；配置
+  ``SKILLS_ALLOW_EXEC=1``，桥默认开，策略 A时额外暴露 Follow 三件套，在宿主环境
+  直接操作电脑。执行不经内核 ``Skill.run``。
+- 零第三方依赖：``core/mcp_client.py`` 是 stdlib 的 JSON-RPC stdio 客户端，本模块是
+  它的对端——同样用 stdlib 手写服务端。实测本机 ``fastmcp`` / ``mcp`` 均未安装且无 uv，
+  故不走框架路线。
+- 子进程无 ctx：以 ``python -m agent.plugins.skills.adapter`` 独立进程运行，
   拿不到 ``ctx``；改为从环境变量 ``SKILLS_DATA_DIR`` 取数据目录，用 ``load_from_disk()``
-  从磁盘**重建**目录——与内核读同一份 ``<data_dir>/skills/*.md``，口径一致（参照
-  ``plugins/skills._resolve_data_dir``：数据目录 = ``db_path`` 的父目录）。
-- **零耦合**：经**包内相对导入**取 ``SkillsCatalog``；不 import ``sys.tasks`` /
-  ``plugins.react``（由 ``test_services_contract`` 的 AST 守卫）。
+  从磁盘重建目录——与内核读同一份 ``<data_dir>/skills/*.md``，口径一致。
+- 零耦合：经包内相对导入取 ``SkillsCatalog``；不 import ``sys.tasks`` /
+  ``plugins.react``。
 
-★ 2026-10-14 两连迁，终局落在本包：
+两连迁，终局落在本包：
   ① 从 ``agent/run`` 先迁 ``plugins/skills_mcp``——随即被 ``test_plugin_decoupling``
-     的**插件横向耦合**守卫拦下（``plugins.skills_mcp.adapter → plugins.skills.catalog``
-     是跨包 import，插件间禁止横向依赖）；
-  ② 改迁本包（``plugins/skills/adapter.py``）——适配器消费技能目录，与目录同包 ⇒
-     intra-package 相对导入合法；``plugins/skills_mcp`` 桥只经 **spawn 路径字符串**
-     （``-m agent.plugins.skills.adapter``）引用它，字符串不是 import，不构成耦合。
-  根因回顾：适配器栖身 run/ 本是为了 import ``agent.api`` 导出的 SkillsCatalog
-  （该类当年被误沉 core）——放置错误引发迁移，归位后 api 不再导出任何技能符号。
+     的插件横向耦合守卫拦下；
+  ② 改迁本包——适配器消费技能目录，与目录同包 ⇒
+     intra-package 相对导入合法；``plugins/skills_mcp`` 桥只经 spawn 路径字符串
+     引用它，字符串不是 import，不构成耦合。
+  根因回顾：适配器栖身 run/ 本是为了 import ``agent.api`` 导出的 SkillsCatalog，该类当年被误沉 core——放置错误引发迁移，归位后 api 不再导出任何技能符号。
 """
 
 from __future__ import annotations
@@ -42,23 +38,23 @@ from .catalog import SkillsCatalog
 
 logger = logging.getLogger("agent.plugins.skills.adapter")
 
-#: 与 ``core/mcp_client.py`` 的 ``_MCP_VERSION`` 一致。
+# : 与 ``core/mcp_client.py`` 的 ``_MCP_VERSION`` 一致。
 _PROTOCOL = "2024-11-05"
 
-#: 数据目录环境变量（由 ``plugins/skills_mcp`` 桥插件注入）。
+# : 数据目录环境变量。
 _ENV_DATA_DIR = "SKILLS_DATA_DIR"
 
 
 # --------------------------------------------------------------------------- #
-# 目录重建（子进程侧，无 ctx）
+# 目录重建
 # --------------------------------------------------------------------------- #
 
 def _build_catalog() -> SkillsCatalog:
     """从磁盘重建技能目录。
 
-    **每次调用都重建**：技能体量小（几十个 markdown），读盘便宜，且免去长驻缓存的
-    失效问题——管理面（``/api/skills``）改了磁盘文件，下一次调用即可见。
-    """
+     每次调用都重建：技能体量小，读盘便宜，且免去长驻缓存的
+     失效问题——管理面改了磁盘文件，下一次调用即可见。
+     """
     data_dir = Path(os.environ.get(_ENV_DATA_DIR) or "data")
     cat = SkillsCatalog(data_dir)
     cat.load_from_disk()
@@ -66,22 +62,22 @@ def _build_catalog() -> SkillsCatalog:
 
 
 def _slim_card(row: dict) -> dict:
-    """把 ``catalog()`` 的卡片压成索引条目：**剔除 content**（正文由 skill_view 给）。
+    """把 ``catalog()`` 的卡片压成索引条目：剔除 content。
 
-    ``SkillsCatalog._card`` 实际含 ``content``，若直接透传，一次 ``skill_list``
-    就把全部技能正文灌进上下文——正是要避免的 token 膨胀。
-    """
+     ``SkillsCatalog._card`` 实际含 ``content``，若直接透传，一次 ``skill_list``
+     就把全部技能正文灌进上下文——正是要避免的 token 膨胀。
+     """
     return {"name": row.get("name"), "description": row.get("description"),
             "risk": row.get("risk"), "source": row.get("source"),
             "enabled": row.get("enabled")}
 
 
 # --------------------------------------------------------------------------- #
-# 工具实现（只读）
+# 工具实现
 # --------------------------------------------------------------------------- #
 
 def _tool_list(args: dict) -> tuple[str, bool]:
-    """``skill_list``：列出技能索引（不含正文）。"""
+    """``skill_list``：列出技能索引。"""
     q = str(args.get("q") or "").strip()
     cat = _build_catalog()
     rows = cat.search(q) if q else cat.catalog()
@@ -92,7 +88,7 @@ def _tool_list(args: dict) -> tuple[str, bool]:
 
 
 def _tool_view(args: dict) -> tuple[str, bool]:
-    """``skill_view``：读取单个技能的完整正文（``{baseDir}`` 已替换）；可选 ``view_range`` 行切片。"""
+    """``skill_view``：读取单个技能的完整正文；可选 ``view_range`` 行切片。"""
     name = str(args.get("name") or "").strip()
     if not name:
         return "参数 name 必填", True
@@ -124,14 +120,14 @@ def _tool_view(args: dict) -> tuple[str, bool]:
 
 
 # --------------------------------------------------------------------------- #
-# 执行类工具（Follow 三件套，B2：受 SKILLS_ALLOW_EXEC 门控）
+# 执行类工具
 # --------------------------------------------------------------------------- #
 
 _TRUNCATE_CHARS = 20000
 
 
 def _allow_exec() -> bool:
-    """门控：allow_exec=false 时执行类工具整体不可见（fail-closed）。"""
+    """门控：allow_exec=false 时执行类工具整体不可见。"""
     return os.environ.get("SKILLS_ALLOW_EXEC", "0") == "1"
 
 
@@ -143,7 +139,7 @@ def _exec_timeout() -> float:
 
 
 def _bash_deny() -> list[str]:
-    """命令黑名单（默认空 ⇒ 无拦截，完全权限）。可经 SKILLS_BASH_DENY 配置。"""
+    """命令黑名单。可经 SKILLS_BASH_DENY 配置。"""
     raw = os.environ.get("SKILLS_BASH_DENY", "") or ""
     return [x.strip().lower() for x in raw.split(",") if x.strip()]
 
@@ -155,7 +151,7 @@ def _truncate(text: str) -> str:
 
 
 def _tool_bash(args: dict) -> tuple[str, bool]:
-    """``skill_bash``：在宿主环境执行 shell 命令（完全权限，直接操作电脑）。"""
+    """``skill_bash``：在宿主环境执行 shell 命令。"""
     cmd = str(args.get("command") or "").strip()
     if not cmd:
         return "参数 command 必填", True
@@ -177,7 +173,7 @@ def _tool_bash(args: dict) -> tuple[str, bool]:
 
 
 def _tool_file_create(args: dict) -> tuple[str, bool]:
-    """``skill_file_create``：写/创建文件（不静默覆盖；存在且非 force 则报错）。"""
+    """``skill_file_create``：写/创建文件。"""
     path = str(args.get("path") or "").strip()
     content = str(args.get("content") or "")
     force = bool(args.get("force", False))
@@ -195,7 +191,7 @@ def _tool_file_create(args: dict) -> tuple[str, bool]:
 
 
 def _tool_str_replace(args: dict) -> tuple[str, bool]:
-    """``skill_str_replace``：文件内唯一匹配替换（不匹配/多匹配均报错）。"""
+    """``skill_str_replace``：文件内唯一匹配替换。"""
     path = str(args.get("path") or "").strip()
     old = str(args.get("old_string") or "")
     new = str(args.get("new_string") or "")
@@ -232,11 +228,11 @@ _HANDLERS = {
 
 
 def _tools() -> list[dict]:
-    """MCP ``tools/list`` 返回的工具清单（含 inputSchema，供 ``build_task_schema`` 转换）。
+    """MCP ``tools/list`` 返回的工具清单。
 
-    ★ B2（2026-10-14）：执行类工具（Follow 三件套）受 ``SKILLS_ALLOW_EXEC`` 门控——
-    关闭时**根本不返回**，fail-closed（不可见即不可调用，不靠 guard 拦）。
-    """
+     B2：执行类工具受 ``SKILLS_ALLOW_EXEC`` 门控——
+     关闭时根本不返回，fail-closed。
+     """
     tools = [
         {
             "name": "skill_list",
@@ -320,8 +316,8 @@ def _tools() -> list[dict]:
 def _dispatch(req: dict) -> dict | None:
     """处理单条 JSON-RPC 请求。
 
-    通知类（无 ``id``，或 method 以 ``notifications/`` 开头）返回 ``None`` ⇒ 不回包。
-    """
+     通知类返回 ``None`` ⇒ 不回包。
+     """
     mid = req.get("id")
     method = str(req.get("method") or "")
     params = req.get("params") if isinstance(req.get("params"), dict) else {}
@@ -352,18 +348,18 @@ def _dispatch(req: dict) -> dict | None:
         try:
             text, is_error = handler(args)
         except Exception as exc:                       # noqa: BLE001
-            # 目录重建失败（如同名冲突）也要以 isError 回给调用方，不能让进程静默崩
+            # 目录重建失败也要以 isError 回给调用方，不能让进程静默崩
             text, is_error = f"{type(exc).__name__}: {exc}", True
         return _ok({"content": [{"type": "text", "text": text}], "isError": is_error})
     return _err(f"未知方法 {method!r}")
 
 
 def main() -> int:
-    """stdio 主循环：逐行读请求、逐行写回（写完立即 flush）。
+    """stdio 主循环：逐行读请求、逐行写回。
 
-    用**二进制**流而非文本流：避免 Windows 下 stdin/stdout 的默认编码（GBK/CP1252）
-    把 UTF-8 的技能正文解错。
-    """
+     用二进制流而非文本流：避免 Windows 下 stdin/stdout 的默认编码
+     把 UTF-8 的技能正文解错。
+     """
     out = sys.stdout.buffer
     for raw in sys.stdin.buffer:
         line = raw.strip()

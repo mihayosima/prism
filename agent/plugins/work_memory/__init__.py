@@ -1,20 +1,18 @@
-"""插件包：work_memory —— 工作记忆（第 3 层：任务级进度缓存）。
+"""插件包：work_memory —— 工作记忆。
 
-目录插件（agent/plugins/work_memory），与短期记忆 ``plugins.short_term``、
+目录插件，与短期记忆 ``plugins.short_term``、
 系统记忆 ``plugins.system_memory``、长期记忆 ``plugins.memory`` 平级；
 经「插件」页可启用 / 停用 / 卸载。
 
-设计（用户敲定）：
-- 存储后端：**Redis**（外部服务）；Redis 不可用 / 未配置 / 导入失败 → **降级为进程内 dict**
-  （``InMemoryWorkMemory``，接口一致），功能不崩、不破解耦。
-- 寿命：任务级——``run()`` 开始 ``begin``、结束 ``finish``（DEL）；兜底 TTL 防泄漏。
-- 边界：只存任务进度态（step / tool_trace / checkpoints / status），**不存对话全文**
-  （对话历史属短期记忆 ``agent_messages``，跨会话知识属长期记忆 ``plugins.memory``）。
+设计：
+- 存储后端：Redis；Redis 不可用 / 未配置 / 导入失败 → 降级为进程内 dict，功能不崩、不破解耦。
+- 寿命：任务级——``run()`` 开始 ``begin``、结束 ``finish``；兜底 TTL 防泄漏。
+- 边界：只存任务进度态，不存对话全文。
 
 解耦纪律：
-- 消费面（react）经 ``ctx.get(Services.WORK_MEMORY)`` 接缝获取，不 import 具体实现；
-- 委托调用内部吞异常（仅告警），工作记忆异常绝不拖累主链路；
-- 第三方 Redis 客户端在此**延迟导入**（try 内），插件未启用时零开销。
+- 消费面经 ``ctx.get(Services.WORK_MEMORY)`` 接缝获取，不 import 具体实现；
+- 委托调用内部吞异常，工作记忆异常绝不拖累主链路；
+- 第三方 Redis 客户端在此延迟导入，插件未启用时零开销。
 """
 
 from __future__ import annotations
@@ -31,13 +29,13 @@ logger = logging.getLogger("agent.plugins.work_memory")
 
 
 def resolve_redis_url(cfg: dict | None = None) -> str:
-    """Redis 连接串解析（纯函数，便于单测）：显式配置 > 环境变量 > 默认。
+    """Redis 连接串解析：显式配置 > 环境变量 > 默认。
 
-    为什么需要 ``PRISM_REDIS_URL`` 通道：容器/编排部署下**无法预置**
-    ``data/agent_plugin_config.json``（data/ 是挂载卷、且被 gitignore），
-    而 compose 网络内服务间必须用服务名（``redis:6379``）而非 ``localhost``。
-    与 ``DEEPSEEK_API_KEY``、``PRISM_METRICS_SESSION_LABELS`` 同属运维侧 env 约定。
-    """
+     为什么需要 ``PRISM_REDIS_URL`` 通道：容器/编排部署下无法预置
+     ``data/agent_plugin_config.json``，
+     而 compose 网络内服务间必须用服务名而非 ``localhost``。
+     与 ``DEEPSEEK_API_KEY``、``PRISM_METRICS_SESSION_LABELS`` 同属运维侧 env 约定。
+     """
     cfg = cfg or {}
     return (str(cfg.get("url") or "").strip()
             or os.environ.get("PRISM_REDIS_URL", "").strip()
@@ -45,14 +43,14 @@ def resolve_redis_url(cfg: dict | None = None) -> str:
 
 
 def resolve_required(cfg: dict | None = None) -> bool:
-    """Redis 是否为**硬依赖**：显式配置 > ``PRISM_REDIS_REQUIRED`` > False。
+    """Redis 是否为硬依赖：显式配置 > ``PRISM_REDIS_REQUIRED`` > False。
 
-    语义：True 时 Redis 不可用 → 装配期 raise（启动失败，fail-fast）；
-    False（默认）→ 降级 InMemoryWorkMemory + WARNING。
+     语义：True 时 Redis 不可用 → 装配期 raise；
+     False→ 降级 InMemoryWorkMemory + WARNING。
 
-    为什么生产编排该置 True：降级会让**断点续传静默失效**（代码在位、能力不生效），
-    比启动失败更难发现 —— 这正是「批次 C」要消灭的那类落差。
-    """
+     为什么生产编排该置 True：降级会让断点续传静默失效，
+     比启动失败更难发现 —— 这正是「批次 C」要消灭的那类落差。
+     """
     cfg = cfg or {}
     if "required" in cfg:
         return bool(cfg["required"])
@@ -64,9 +62,8 @@ def resolve_required(cfg: dict | None = None) -> bool:
 class WorkMemory:
     """ctx.work_memory —— 任务级进度缓存；Redis 不可用自动降级内存版。
 
-    委托给 ``self._impl``；委托调用内部吞掉异常（仅告警），保证工作记忆异常绝不拖累主链路
-    （react 即便不包 try/except 也安全）。
-    """
+         委托给 ``self._impl``；委托调用内部吞掉异常，保证工作记忆异常绝不拖累主链路。
+         """
 
     name = "plugins.work_memory"
     version = "0.1.0"
@@ -84,9 +81,8 @@ class WorkMemory:
         ttl = int(cfg.get("ttl", 3600))
         prefix = cfg.get("prefix", "wm:")
         snapshot_ttl = int(cfg.get("snapshot_ttl_s", 86400))
-        # 阶段 2（D10）：required=True → Redis 是**硬依赖**，不可用即**启动失败**（装配期 raise，
-        # 容器 fail-fast，见 core/container.py:280-287 apply 异常向上传播）；
-        # False（默认，保 dev 兼容）→ 不可用则降级 InMemory + 启动 WARNING。
+        # 阶段 2：required=True → Redis 是硬依赖，不可用即启动失败；
+        # False→ 不可用则降级 InMemory + 启动 WARNING。
         required = resolve_required(cfg)
         if not cfg.get("enabled", True):
             if required:
@@ -98,7 +94,7 @@ class WorkMemory:
             ctx.provide(Services.WORK_MEMORY, self)
             return
         try:
-            import redis.asyncio as aioredis                 # 延迟导入（第三方）
+            import redis.asyncio as aioredis                 # 延迟导入
             url = resolve_redis_url(cfg)
             client = aioredis.from_url(url, decode_responses=True, socket_connect_timeout=2)
             await client.ping()
@@ -117,11 +113,11 @@ class WorkMemory:
         ctx.provide(Services.WORK_MEMORY, self)
 
     async def status(self, ctx) -> dict:
-        """运行态：**后端是不是 Redis**（降级到 InMemory 时跨进程续接不保证，必须可见）。
+        """运行态：后端是不是 Redis。
 
-        这是本插件最该被看见的一件事——降级只在**启动日志**里出现一次，
-        插件页若不报，运维看到"一切正常"却以为断点续传在工作。
-        """
+         这是本插件最该被看见的一件事——降级只在启动日志里出现一次，
+         插件页若不报，运维看到"一切正常"却以为断点续传在工作。
+         """
         backend = "in-memory"
         degraded = True
         if self._impl is not None:
@@ -129,12 +125,12 @@ class WorkMemory:
             degraded = not isinstance(self._impl, RedisWorkMemory)
         return {
             "backend": backend,
-            # ★ True = 降级中：断点续接/跨会话链**不保证**（跨进程会丢）
+            # True = 降级中：断点续接/跨会话链不保证
             "degraded": degraded,
             "cross_process_resume": not degraded,
         }
 
-    # ---- 委托（吞异常，主链路不崩） ----
+    # ---- 委托 ----
     async def begin(self, task_id: str, meta: dict) -> None:
         try:
             if self._impl:
@@ -177,9 +173,9 @@ class WorkMemory:
             logger.warning("work_memory.list_active failed: %s", exc)
             return []
 
-    # ---- 跨进程 run 快照（阶段 2）----
-    # 纪律：save/load/list 走"吞异常仅告警"（同工作记忆主链路——快照失败绝不拖累 run）；
-    #      mark_finished **例外**（D16）——"收尾置位失败会被误判为崩溃"，故单独走重试+确认键路径。
+    # ---- 跨进程 run 快照----
+    # 纪律：save/load/list 走"吞异常仅告警"；
+    # mark_finished 例外——"收尾置位失败会被误判为崩溃"，故单独走重试+确认键路径。
 
     async def snapshot_save(self, tenant: str, task_id: str, data: dict,
                             ttl: int | None = None) -> None:
@@ -197,7 +193,7 @@ class WorkMemory:
             return None
 
     async def snapshot_list(self, tenant: str, prefix: str | None = None) -> list[dict]:
-        """列出未完成/已完成快照。**务必传 ``prefix``**（会话级），否则退化为全租户扫描（H1）。"""
+        """列出未完成/已完成快照。务必传 ``prefix``，否则退化为全租户扫描。"""
         try:
             return await self._impl.snapshot_list(tenant, prefix) if self._impl else []
         except Exception as exc:                             # noqa: BLE001
@@ -205,11 +201,11 @@ class WorkMemory:
             return []
 
     async def snapshot_mark_finished(self, tenant: str, task_id: str) -> None:
-        """D16：**不走**吞异常路径。
+        """D16：不走吞异常路径。
 
-        收尾置位失败会导致下次启动误判为"崩溃残留"→ 错误自动续接，故：置位 → 失败重试一次
-        → 仍失败则 ERROR + 写独立确认键 ``run_snapshot_finished:*``（短 TTL）兜底防误判。
-        """
+         收尾置位失败会导致下次启动误判为"崩溃残留"→ 错误自动续接，故：置位 → 失败重试一次
+         → 仍失败则 ERROR + 写独立确认键 ``run_snapshot_finished:*`` 兜底防误判。
+         """
         if not self._impl:
             return
         try:
@@ -227,17 +223,17 @@ class WorkMemory:
             logger.error("work_memory.snapshot_flag_finished failed: %s", exc2)
 
     async def snapshot_mark_abandoned(self, tenant: str, task_id: str) -> None:
-        """H1（2026-10-04）：取消/异常路径把快照标 ``cancelled``（H1 的修复落点）。
+        """H1：取消/异常路径把快照标 ``cancelled``。
 
-        与 ``snapshot_mark_finished`` 同款"不走吞异常路径"：置位失败 ⇒ 快照停在
-        ``running`` ⇒ 下次被当崩溃残留**自动续接**。但**兜底不写完成确认键**——
-        那个键的语义是"已完成"，用它兜底等于把取消谎报成完成。
-        失败只记 ERROR（调用方在取消上下文里，拿不到更好的处置）。
-        """
+         与 ``snapshot_mark_finished`` 同款"不走吞异常路径"：置位失败 ⇒ 快照停在
+         ``running`` ⇒ 下次被当崩溃残留自动续接。但兜底不写完成确认键——
+         那个键的语义是"已完成"，用它兜底等于把取消谎报成完成。
+         失败只记 ERROR。
+         """
         if not self._impl:
             return
         fn = getattr(self._impl, "snapshot_mark_abandoned", None)
-        if fn is None:                       # 旧/裸实现没有该方法 ⇒ 跳过（不劣化）
+        if fn is None:                       # 旧/裸实现没有该方法 ⇒ 跳过
             return
         try:
             await fn(tenant, task_id)

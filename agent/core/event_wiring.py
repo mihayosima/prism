@@ -1,11 +1,4 @@
-"""agent.core.event_wiring —— capability 接缝接线校验（装配期 fail-fast）。
-
-与 ``EventBus.required_seams``（运行期 waterfall 守卫）**同源**：两者都从
-``Container._wiring_required()`` 取值，杜绝"装配跳过校验、运行期 waterfall 才崩"的最坏情形。
-
-职责：在每个 required seam 上确认"实时监听数 ≥ 1"（即 capability 闸门确实挂上），
-否则在装配期即抛 ``EventWiringError``——fail-fast 既告知"何时崩"也告知"怎么修"。
-"""
+"""装配期校验 capability 接缝接线：每个 required seam 必须有实时监听，否则抛 ``EventWiringError``。"""
 
 from __future__ import annotations
 
@@ -14,7 +7,7 @@ from .events_catalog import Events, REQUIRED_SUBSCRIBER_EVENTS, SEAM_SUBSCRIBERS
 
 
 def _const_name(value: str) -> str:
-    """事件值反查常量名（用于报错信息，便于对照 Events.X）。"""
+    """事件值反查常量名。"""
     for k, v in vars(Events).items():
         if not k.startswith("_") and v == value:
             return k
@@ -22,10 +15,7 @@ def _const_name(value: str) -> str:
 
 
 def _verify_event_wiring(container, bus) -> None:
-    """装配末尾校验：每个 required seam 必须有 ≥ 1 个实时监听。
-
-    报错带齐三要素：哪个 seam、期望谁挂（SEAM_SUBSCRIBERS）、当前挂了谁（bus.listeners）。
-    """
+    """检查每个 required seam 的监听数，为 0 则抛 ``EventWiringError``。"""
     for seam in REQUIRED_SUBSCRIBER_EVENTS:
         current = bus.listeners(seam)
         if not current:

@@ -1,16 +1,16 @@
-"""插件包：playwright_mcp —— 把 microsoft/playwright-mcp（MCP stdio）封装为 agent 工具插件。
+"""插件包：playwright_mcp —— 把 microsoft/playwright-mcp 封装为 agent 工具插件。
 
-管理：本包位于 agent/plugins/，经「插件」页可停用 / 启用 / 卸载（引擎式 desired/actual/delta）。
-默认未启用——在插件页点「启用」（或 state 文件 enabled 加入本插件 id），工具即出现在 agent 工具目录。
+管理：本包位于 agent/plugins/，经「插件」页可停用 / 启用 / 卸载。
+默认未启用——在插件页点「启用」，工具即出现在 agent 工具目录。
 
-- 启动一个 MCP stdio 子进程（@playwright/mcp，如 npx 入口），
-  其工具（browser_navigate / browser_click / …）自动注册到 agent 工具目录，供 chat tool_call 调用。
-- 默认 headless + chromium（后台服务无显示器）；仅核心自动化（不挂 --caps，走无障碍树，无需视觉模型）。
+- 启动一个 MCP stdio 子进程，
+ 其工具自动注册到 agent 工具目录，供 chat tool_call 调用。
+- 默认 headless + chromium；仅核心自动化。
 - 生命周期对称：apply 起子进程 → effect 关子进程；guard 矩阵照常管辖 tool 调用。
-- 诚实边界：未配置 command → 装配时报告未就绪（不假挂）；进程启动失败 → 报告原因。
+- 诚实边界：未配置 command → 装配时报告未就绪；进程启动失败 → 报告原因。
 
-S4 加固（与 windows_mcp 同款）：stderr 经 ``on_stderr`` 打到 warning（死因可见）；
-handler 调用前探活、已死就地重启（自愈，免重启后端）；``status()`` 增 ``alive`` 实时字段。
+S4 加固：stderr 经 ``on_stderr`` 打到 warning；
+handler 调用前探活、已死就地重启；``status()`` 增 ``alive`` 实时字段。
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ _BRIDGE = "playwright_mcp"
 
 
 def _on_stderr(text: str) -> None:
-    """子进程 stderr → warning（S4：这是「死因」的唯一通路，绝不能降级丢弃）。"""
+    """子进程 stderr → warning。"""
     if text.strip():
         logger.warning("[%s] %s", _BRIDGE, text)
 
@@ -46,7 +46,7 @@ def _env_args(raw: str | None) -> list[str]:
 
 
 def resolve(cfg: dict, environ: dict | None = None) -> tuple[str, list[str], float]:
-    """解析启动命令（纯函数，便于离线测试）：config > env > 默认 npx + headless chromium。"""
+    """解析启动命令：config > env > 默认 npx + headless chromium。"""
     environ = environ or {}
     command = cfg.get("command") or environ.get("PLAYWRIGHT_MCP_COMMAND") or "npx"
     # Windows 上 npx 是 .cmd 包装；asyncio.create_subprocess_exec 直接 exec 时不会自动补
@@ -59,14 +59,14 @@ def resolve(cfg: dict, environ: dict | None = None) -> tuple[str, list[str], flo
     args = list(cfg.get("args") or _env_args(environ.get("PLAYWRIGHT_MCP_ARGS")))
     if not args:
         args = ["-y", "@playwright/mcp@latest"]
-    # 默认 headless（后台服务无显示器）；可配置 headless=false 走有头（需 DISPLAY）
+    # 默认 headless；可配置 headless=false 走有头
     if cfg.get("headless", True):
         args.append("--headless")
     browser = cfg.get("browser") or environ.get("PLAYWRIGHT_MCP_BROWSER") or "chromium"
     args += ["--browser", browser]
     if cfg.get("isolated"):
         args.append("--isolated")
-    caps = cfg.get("caps")  # 默认不开：仅核心自动化（无障碍树，无需视觉模型）
+    caps = cfg.get("caps")  # 默认不开：仅核心自动化
     if caps:
         args += ["--caps", caps if isinstance(caps, str) else ",".join(caps)]
     timeout = float(cfg.get("timeout_s", 120.0))
@@ -75,7 +75,7 @@ def resolve(cfg: dict, environ: dict | None = None) -> tuple[str, list[str], flo
 
 @plugin
 class PlaywrightMcp:
-    """把 playwright-mcp 的工具挂进 agent 工具目录（可管理插件）。"""
+    """把 playwright-mcp 的工具挂进 agent 工具目录。"""
 
     name = "plugins.playwright_mcp"
     version = "0.1.0"
@@ -93,7 +93,7 @@ class PlaywrightMcp:
         self._lock = asyncio.Lock()
 
     def _spawn(self, cfg: dict) -> McpStdioClient:
-        """按配置造一个客户端（含 S4 stderr 接线 + 可选落点收拢）。"""
+        """按配置造一个客户端。"""
         command, args, timeout = resolve(cfg, os.environ)
         env = dict(cfg.get("env") or {})
         cwd = self._workspace()
@@ -104,15 +104,15 @@ class PlaywrightMcp:
                               on_stderr=_on_stderr, cwd=(cwd or {}).get("cwd"))
 
     def _workspace(self) -> dict | None:
-        """取沙箱落点接缝（2026-10-04）：声明了档位 ⇒ 把子进程挪出项目根。
+        """取沙箱落点接缝：声明了档位 ⇒ 把子进程挪出项目根。
 
-        沙箱未装配 / ``mode=none`` ⇒ ``None`` ⇒ 行为与今天完全一致（opt-in，不劣化）。
-        接缝故障**不得拖垮桥启动**（沙箱是增强维度，不是硬前提）。
-        """
+         沙箱未装配 / ``mode=none`` ⇒ ``None`` ⇒ 行为与今天完全一致。
+         接缝故障不得拖垮桥启动，沙箱是增强维度，不是硬前提。
+         """
         if self._ctx is None:
             return None
-        # ★ 用 getattr 取而不是直接 ``self._ctx.get(...)``：部分装配/测试桩的 ctx 未必
-        # 实现 ``get``。沙箱是**增强维度**，缺了就退回无落点，绝不能把桥启动搞崩。
+        # 用 getattr 取而不是直接 ``self._ctx.get(...)``：部分装配/测试桩的 ctx 未必
+        # 实现 ``get``。沙箱是增强维度，缺了就退回无落点，绝不能把桥启动搞崩。
         getter = getattr(self._ctx, "get", None)
         if not callable(getter):
             return None
@@ -123,8 +123,7 @@ class PlaywrightMcp:
         if not callable(fn):
             return None
         try:
-            # ★ P8：传桥 id，供沙箱侧按桥判定可移植性（见 core/sandbox_backend 的
-            # ``BRIDGE_PORTABILITY``）。不传也能跑（单参 provider 兼容），传了才能按桥降级。
+            # 传桥 id，供沙箱侧按桥判定可移植性。不传也能跑，传了才能按桥降级。
             return call_spawn_provider(fn, current_session_key(self._ctx), _BRIDGE)
         except Exception:                       # noqa: BLE001 —— 沙箱故障 ⇒ 退回无落点
             logger.warning("playwright_mcp 取沙箱落点失败 ⇒ 沿用宿主 cwd")
@@ -140,7 +139,7 @@ class PlaywrightMcp:
             tools = await client.list_tools()
         except Exception as exc:  # noqa: BLE001 —— 起不来诚实报，不拖垮装配
             logger.warning("playwright_mcp 启动失败: %s", exc)
-            # S4：起不来的子进程同样要收干净，否则 npx→node 会变孤儿长期驻留
+            # 起不来的子进程同样要收干净，否则 npx→node 会变孤儿长期驻留
             try:
                 await client.close()
             except Exception:  # noqa: BLE001
@@ -154,7 +153,7 @@ class PlaywrightMcp:
         ctx.state[StateKeys.MCP_TOOLS.format(bridge=_BRIDGE)] = self._tools
         ctx.state[StateKeys.MCP_ERROR.format(bridge=_BRIDGE)] = None
         for t in tools:
-            # S6/P2：保真转换（enum / anyOf / default / 属性描述一并带出）
+            # S6/P2：保真转换
             task_schema = build_task_schema(t.get("inputSchema"))
             ctx.tasks.register(ctx, f"mcp.playwright.{t.get('name')}", schema=task_schema,
                                handler=self._make_handler(t.get("name")),
@@ -170,7 +169,7 @@ class PlaywrightMcp:
         return _call
 
     async def _ensure_client(self) -> McpStdioClient:
-        """探活 + 自愈：活着直接用；死了就地重启（免去重启整个后端）。"""
+        """探活 + 自愈：活着直接用；死了就地重启。"""
         c = self._client
         if c is not None and c.is_alive:
             return c
@@ -221,7 +220,7 @@ class PlaywrightMcp:
         c = self._client
         return {"tools": ctx.state.get(StateKeys.MCP_TOOLS.format(bridge=_BRIDGE), []),
                 "error": ctx.state.get(StateKeys.MCP_ERROR.format(bridge=_BRIDGE)),
-                # S4：实时存活（由 _wait_loop 维护），避免"假健康"
+                # 实时存活，避免"假健康"
                 "alive": bool(c is not None and c.is_alive)}
 
 

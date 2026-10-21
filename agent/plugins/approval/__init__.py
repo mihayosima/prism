@@ -1,25 +1,21 @@
-"""插件包：approval —— 人在环中（审批）与权限模式（设计稿 v1.2 第 1/2 期）。
+"""插件包：approval —— 人在环中与权限模式。
 
-职责三分（互不混同，见设计稿 §2）：
-- **mode**（会话档位 default/plan/auto/bypass）：本插件持有，写
-  ``ctx.state["permission_mode"]`` —— R1 补（2026-10-02）起值是 **``dict[会话键, mode]``**
-  （此前为单值 str ⇒ 「会话级语义、容器级存储」，A 会话切 bypass 会放行 B 会话在跑 run
-  的审批闸）。读写一律经内核助手 ``current_permission_mode()`` / ``set_permission_mode()``。
-- **policy**（三态 allow/deny/ask + fnmatch）：``policy.py`` 纯函数；
-- **provider**（怎么问人）：``providers.py`` 可换接缝（非交互 auto-deny/auto-allow、
-  交互式 web 经 ``pending.py`` + SSE 弹窗信号 + 入站应答接口）。
+职责三分：
+- mode：本插件持有，写
+ ``ctx.state["permission_mode"]`` —— R1 补起值是 ``dict[会话键, mode]``。读写一律经内核助手 ``current_permission_mode()`` / ``set_permission_mode()``。
+- policy：``policy.py`` 纯函数；
+- provider：``providers.py`` 可换接缝。
 
-挂点与优先级（v1.2 复核确认，**不改 guard 一行**）：
-    默认 append 挂 ``agent/tasks/pre-execute`` ⇒ 排 guard（prepend）之后。
-    guard 硬否决短路 ⇒ approval 不被调用（AC-7 天然成立）；
-    guard 放行 ⇒ 调 ``next()`` ⇒ approval 按自身名单 + 模式判定。
-    ask 的来源是**本插件名单与模式**；guard 的 ``permissions.risk.*="ask"``
-    是无本插件时的 fail-safe 兜底配置，两者不应同时使用。
+挂点与优先级：
+ 默认 append 挂 ``agent/tasks/pre-execute`` ⇒ 排 guard 之后。
+ guard 硬否决短路 ⇒ approval 不被调用；
+ guard 放行 ⇒ 调 ``next()`` ⇒ approval 按自身名单 + 模式判定。
+ ask 的来源是本插件名单与模式；guard 的 ``permissions.risk.*="ask"``
+ 是无本插件时的 fail-safe 兜底配置，两者不应同时使用。
 
-fail-safe 铁律：ask 无人应答 / 超时 / provider 异常 / 插件停用 ⇒ **一律默认拒绝**。
+fail-safe 铁律：ask 无人应答 / 超时 / provider 异常 / 插件停用 ⇒ 一律默认拒绝。
 
-默认配置（``config["agent"]["approval"]``）下行为与无本插件时**完全一致**
-（``allow=["*"]``、``ask=[]`` ⇒ 纯透明放行），便于灰度。
+默认配置下行为与无本插件时完全一致，便于灰度。
 """
 
 from __future__ import annotations
@@ -36,8 +32,8 @@ from .pending import PendingTable
 from .policy import MODES, decide
 from .providers import build_provider
 
-# 插件自管默认（与 profiles.BASE_AGENT_CONFIG 的 approval 节保持一致）：
-# allow=["*"] ⇒ 默认全放行（行为与现状一致）；default="deny" ⇒ 收窄后未命中即拒。
+# 插件自管默认：
+# allow=["*"] ⇒ 默认全放行；default="deny" ⇒ 收窄后未命中即拒。
 DEFAULT_CONFIG: dict = {
     "provider": "auto-deny",
     "allow": ["*"],
@@ -47,20 +43,20 @@ DEFAULT_CONFIG: dict = {
     "default": "deny",
 }
 
-#: 会话级名单的**会话数**上限（每会话内的工具集合本身有界于注册表，无需单独限）。
-#: 只防长期运行下「会话数 × 名单」无限增长；淘汰最久未用者（dict 保序）。
+# : 会话级名单的会话数上限。
+# : 只防长期运行下「会话数 × 名单」无限增长；淘汰最久未用者。
 _SESSION_BUCKET_LIMIT = 512
 
 
 def _remember(bucket: dict, session: str, task: str) -> None:
-    """把 ``task`` 记入 ``session`` 的名单桶（「本会话总是允许/拒绝」），并限总量。"""
+    """把 ``task`` 记入 ``session`` 的名单桶，并限总量。"""
     bucket.setdefault(session, set()).add(task)
     while len(bucket) > _SESSION_BUCKET_LIMIT:
         bucket.pop(next(iter(bucket)), None)      # dict 保序：最早插入的会话先淘汰
 
 
 def _picked(ans: dict) -> list[str]:
-    """把应答里的单选 ``choice`` / 多选 ``choices`` 统一成取值列表（保序去空去重）。"""
+    """把应答里的单选 ``choice`` / 多选 ``choices`` 统一成取值列表。"""
     raw = ans.get("choices")
     if raw is None:
         raw = ans.get("choice")
@@ -75,16 +71,16 @@ def _picked(ans: dict) -> list[str]:
 
 @plugin
 class Approval:
-    """ctx.approval —— 人在环中审批 + 权限模式（会话档位持有者）。"""
+    """ctx.approval —— 人在环中审批 + 权限模式。"""
 
     name = "plugins.approval"
     version = "0.4.0"
     layer = "system"
     provides = [Services.APPROVAL]
-    # ★ 2026-10-04 补 ``Services.TASKS``：``apply`` / ``_sync_submit_plan`` 里注册钩子用
-    # ``ctx.tasks.register(...)``，此前**读了却没声明** ⇒ 装配顺序只是"碰巧对"
-    # （sys 插件先装），不是契约保证。``tasks`` 由 ``SYS_PLUGINS`` 常驻提供，
-    # 声明它**不会**破坏 opt-in（规则 2：内核服务可声明，只有别的插件提供的才不可）。
+    # 补 ``Services.TASKS``：``apply``/``_sync_submit_plan`` 里注册钩子用
+    # ``ctx.tasks.register(...)``，此前读了却没声明 ⇒ 装配顺序只是"碰巧对"
+    # 不是契约保证。``tasks`` 由 ``SYS_PLUGINS`` 常驻提供，
+    # 声明它不会破坏 opt-in。
     inject = [Services.EVENTS, Services.DB, Services.TASKS]
     tables = ()                     # 审计走现成 agent_events，不自建表 ⇒ 卸载零残留
 
@@ -94,22 +90,22 @@ class Approval:
         self._ctx = ctx
         self._pending = PendingTable(self._cfg.get("timeout_s", DEFAULT_CONFIG["timeout_s"]))
         self._provider = build_provider(self._cfg.get("provider"), table=self._pending)
-        # 第 3 期：会话级批量确认（内存态，重启即清；bypass/模式不涉及，无持久化风险）
-        # 2.2（H2）：**按会话分桶** —— 此前是全局单 set，A 的「始终允许」会泄漏给 B。
+        # 第 3 期：会话级批量确认
+        # 2.2：按会话分桶 —— 此前是全局单 set，A 的「始终允许」会泄漏给 B。
         self._session_allow: dict[str, set[str]] = {}
         self._session_deny: dict[str, set[str]] = {}
-        self._plan_dispose = None          # submit_plan 动态注册句柄（见 _sync_submit_plan）
-        # R1 补：档位已按会话分桶 ⇒ 工具注册状态也必须按会话计数（否则 A 离开 plan
-        # 会把 B 的终态工具注销）。真正的越权防线是 _submit_plan 的硬兜底自拒。
+        self._plan_dispose = None          # submit_plan 动态注册句柄
+        # R1 补：档位已按会话分桶 ⇒ 工具注册状态也必须按会话计数，否则 A 离开 plan
+        # 会把 B 的终态工具注销。真正的越权防线是 _submit_plan 的硬兜底自拒。
         self._plan_sessions: set[str] = set()
-        # 默认 append（不 prepend）：排 guard 之后——硬规则先裁、问人后行（设计稿 §16.3）
+        # 默认 append：排 guard 之后——硬规则先裁、问人后行
         ctx.on(Events.TASKS_PRE_EXECUTE, self._pre_task)
         ctx.effect(self._pending.aclose)
         ctx.provide(Services.APPROVAL, self)
-        # 容器级默认桶（空 ⇒ 各会话取 default）；旧单值形态仍被 current_permission_mode() 认作默认
+        # 容器级默认桶；旧单值形态仍被 current_permission_mode() 认作默认
         ctx.state.setdefault(StateKeys.PERMISSION_MODE, {})
-        # 澄清问询工具（常驻、read 级 ⇒ plan 模式亦可见）：模型不确定用户意图时
-        # 主动发卡片（选项 + 自由文本）等人指示——人机交互不止于「批准/拒绝」二元。
+        # 澄清问询工具：模型不确定用户意图时
+        # 主动发卡片等人指示——人机交互不止于「批准/拒绝」二元。
         self._ask_dispose = ctx.tasks.register(
             ctx, "approval.ask_user",
             schema={
@@ -137,12 +133,12 @@ class Approval:
                          "超时未答将收到未应答通知，届时按最合理假设继续并说明假设"),
             risk="read")
 
-    # ---------- 能力闸（waterfall 监听） ----------
+    # ---------- 能力闸 ----------
 
     async def _pre_task(self, payload: dict, next) -> dict:
         ctx = self._ctx
         mode = self.mode()
-        if mode == "bypass":                        # bypass：不打扰（guard 硬规则仍生效）
+        if mode == "bypass":                        # bypass：不打扰
             return await next()
         task = str(payload.get("task", ""))
         risk = str(payload.get("risk", ""))
@@ -159,8 +155,8 @@ class Approval:
                 "call_id": call_id, "tool": task, "approved": False,
                 "by": "policy:deny", "waited_ms": 0})
             return self._denied(task, call_id, reason, denied_by="approval")
-        # ---- ask：会话级批量确认（第 3 期）→ 问人 ----
-        # 2.2：名单按当前会话取桶（跨会话不共享）
+        # ---- ask：会话级批量确认→ 问人 ----
+        # 2.2：名单按当前会话取桶
         session = self._skey()
         if task in self._session_deny.get(session, ()):
             await self._audit(Events.APPROVAL_ANSWERED, {
@@ -178,7 +174,7 @@ class Approval:
                "session": session, "kwargs": payload.get("kwargs") or {}}
         await self._audit(Events.APPROVAL_ASKED,
                           {"call_id": call_id, "tool": task, "risk": risk, "mode": mode})
-        # 仅交互式 provider 发弹窗信号（非交互问不等人，信号只会造成假弹窗）
+        # 仅交互式 provider 发弹窗信号
         interactive = bool(getattr(self._provider, "interactive", False))
         if interactive:
             try:
@@ -192,11 +188,11 @@ class Approval:
         waited_ms = int((time.monotonic() - started) * 1000)
         approved = bool(ans.get("approved"))
         by = str(ans.get("by", "unknown"))
-        # 批量确认（第 3 期）：应答带 always ⇒ 记入会话级名单（此后同类请求不再问）
-        # 2.2：写回**本会话**的桶（不再写全局）
+        # 批量确认：应答带 always ⇒ 记入会话级名单
+        # 2.2：写回本会话的桶
         if by == "user" and ans.get("always"):
             bucket = (self._session_allow if approved else self._session_deny)
-            _remember(bucket, session, task)      # 记入本会话名单（含总量上限，防无界增长）
+            _remember(bucket, session, task)      # 记入本会话名单，含总量上限，防无界增长
         if by == "timeout":
             await self._audit(Events.APPROVAL_TIMEOUT,
                               {"call_id": call_id, "tool": task, "waited_ms": waited_ms})
@@ -213,45 +209,42 @@ class Approval:
             return self._denied(task, call_id,
                                 f"approval: 任务 {task!r} 未获批准（by={by}）",
                                 denied_by="user" if by == "user" else "approval")
-        # updated_input（设计稿 §9-1）：人修订了参数 ⇒ 回读给 invoke（须替换 dict）
+        # updated_input：人修订了参数 ⇒ 回读给 invoke
         rw = ans.get("kwargs")
         if isinstance(rw, dict) and rw != (payload.get("kwargs") or {}):
             return {"kwargs": rw, "denied": False,
                     "reason": "approval: 参数已经人修订", "denied_by": "approval"}
         return await next()
 
-    # ---------- 会话归属（2.2） ----------
+    # ---------- 会话归属 ----------
 
     def _skey(self) -> str:
-        """当前会话键（``{user}:{session}``）。
+        """当前会话键。
 
-        R1（2026-10-02）：读取通道是 ``current_session_key()`` —— **ContextVar（按 asyncio
-        task 隔离 ⇒ 每请求独立）优先，未绑定才回退容器级 ``ctx.state``**；未解析到时退
-        ``"default"``（单会话 / 离线调用方行为不变）。真正的会话隔离靠待答表与名单的分桶
-        （H2），此键回答「此刻是哪个会话」。
+                 R1：读取通道是 ``current_session_key()`` —— ContextVar 优先，未绑定才回退容器级 ``ctx.state``；未解析到时退
+                 ``"default"``。真正的会话隔离靠待答表与名单的分桶，此键回答「此刻是哪个会话」。
 
-        本读取点**没有 ctx 入参**（waterfall 监听只收 ``(payload, next)``，且事件参数必须是
-        纯数据——见 ``core/events.py`` 的 ``_assert_pure_data``）⇒ 请求作用域通道是唯一
-        可达方案；此前读容器级 state 会被并发请求的后写覆盖（可能替别人批准工具执行）。
-        """
+                 本读取点没有 ctx 入参⇒ 请求作用域通道是唯一
+                 可达方案；此前读容器级 state 会被并发请求的后写覆盖。
+                 """
         return current_session_key(self._ctx) or "default"
 
-    # ---------- 会话模式（mode 的唯一持有者） ----------
+    # ---------- 会话模式 ----------
 
     def mode(self) -> str:
-        """**当前会话**档位（缺省 default；重启即回 default——不持久化）。
+        """当前会话档位。
 
-        R1 补（2026-10-02）：经内核助手读 ``dict[会话键, mode]`` 桶中**本会话**的值；
-        此前读容器级单值 ⇒ 档位跨会话互相覆盖（A 切 bypass 会放行 B 在跑 run 的闸）。
-        """
+         R1 补：经内核助手读 ``dict[会话键, mode]`` 桶中本会话的值；
+         此前读容器级单值 ⇒ 档位跨会话互相覆盖。
+         """
         return current_permission_mode(self._ctx)
 
     async def set_mode(self, ctx, mode: str, *, by: str = "user") -> None:
-        """切换**当前会话**档位并落审计。OPEN-5：切 bypass 的二次确认属第 2 期交互。
+        """切换当前会话档位并落审计。OPEN-5：切 bypass 的二次确认属第 2 期交互。
 
-        会话归属来自请求作用域通道（ContextVar，由请求入口绑定）；未绑定（如单测直调）
-        时退容器键 ``"default"`` ⇒ 行为与单会话时期一致。
-        """
+         会话归属来自请求作用域通道；未绑定
+         时退容器键 ``"default"`` ⇒ 行为与单会话时期一致。
+         """
         if mode not in MODES:
             raise AgentError(f"mode 须 ∈ {MODES}，得到 {mode!r}")
         old = self.mode()
@@ -261,19 +254,17 @@ class Approval:
                           {"from": old, "to": mode, "by": by,
                            "session": self._skey()})
 
-    # ---------- plan 终态工具（设计稿 §6.2/§6.3；第 3 期） ----------
+    # ---------- plan 终态工具 ----------
 
     def _sync_submit_plan(self, ctx, mode: str) -> None:
-        """终态工具 ``submit_plan`` 的可达性：**有会话在 plan** 即注册，全都离开才注销。
-
-        §6.2「仅 plan 可见」在**容器级注册表**里的最近似实现（react 零改动、零感知）。
-        R1 补（2026-10-02）：档位按会话分桶后，注册状态按会话计数——否则 A 切回 default
-        会把正在 plan 的 B 的终态工具一并注销。
-        **残留（诚实登记）**：只要有会话在 plan，该工具对**其它会话也可见**（注册表是容器级）。
-        越权面已被 ``_submit_plan`` 的硬兜底关死（非 plan 会话调用即自拒），可见性只是
-        多一个会自拒的只读工具；要彻底按会话隔离可见性，须给注册表加"按会话可见"维度，
-        属新能力，不在本批。
-        """
+        """终态工具 ``submit_plan`` 的可达性：有会话在 plan 即注册，全都离开才注销。「仅 plan 可见」在容器级注册表里的最近似实现。
+         R1 补：档位按会话分桶后，注册状态按会话计数——否则 A 切回 default
+         会把正在 plan 的 B 的终态工具一并注销。
+         残留：只要有会话在 plan，该工具对其它会话也可见。
+         越权面已被 ``_submit_plan`` 的硬兜底关死，可见性只是
+         多一个会自拒的只读工具；要彻底按会话隔离可见性，须给注册表加"按会话可见"维度，
+         属新能力，不在本批。
+         """
         sk = self._skey()
         if mode == "plan":
             self._plan_sessions.add(sk)
@@ -293,8 +284,8 @@ class Approval:
             self._plan_dispose = None
 
     async def _submit_plan(self, plan: str = "", **_) -> dict:
-        """模型提交计划 → 问人批准：同意 ⇒ 切 auto（§6.3）；拒绝 ⇒ 留 plan 回灌意见。
-        问人复用 provider/待答表通道（web 弹窗/cli 终端），超时按 fail-safe 拒绝。"""
+        """模型提交计划 → 问人批准：同意 ⇒ 切 auto；拒绝 ⇒ 留 plan 回灌意见。
+         问人复用 provider/待答表通道，超时按 fail-safe 拒绝。"""
         ctx = self._ctx
         if self.mode() != "plan":
             return {"approved": False, "hint": "当前不在 plan 模式，无需提交计划"}
@@ -336,19 +327,19 @@ class Approval:
         return {"approved": True, "mode": "auto",
                 "hint": "计划已批准，模式已切至 auto；请输出最终答复（执行将在后续请求中进行）"}
 
-    # ---------- 澄清问询（ask_user：不止二元审批，人可点选/输入文字指示） ----------
+    # ---------- 澄清问询 ----------
 
     async def _ask_user(self, question: str = "", options: str = "",
                         multi: bool = False, allow_free_text: bool = True, **_) -> dict:
-        """模型主动问用户：发交互卡片（选择规格 + 自由文本），等答复后回灌。
+        """模型主动问用户：发交互卡片，等答复后回灌。
 
-        ``options`` 经 ``normalize_options`` 归一为选择规格（label/value/desc/group），
-        卡片据此渲染形态匹配的选择栏（单选/多选、带说明、分区），而非把所有候选
-        压进同一个扁平选择栏；``multi=True`` 时用户可勾选多项，回灌 ``choices`` 列表。
+         ``options`` 经 ``normalize_options`` 归一为选择规格，
+         卡片据此渲染形态匹配的选择栏，而非把所有候选
+         压进同一个扁平选择栏；``multi=True`` 时用户可勾选多项，回灌 ``choices`` 列表。
 
-        fail-safe：非交互通道（问不等人）⇒ 立即告知模型自行假设；
-        超时/未应答 ⇒ 返回 ``answered=False`` 并附假设提示，模型可继续推进。
-        """
+         fail-safe：非交互通道⇒ 立即告知模型自行假设；
+         超时/未应答 ⇒ 返回 ``answered=False`` 并附假设提示，模型可继续推进。
+         """
         ctx = self._ctx
         interactive = bool(getattr(self._provider, "interactive", False))
         if not interactive:
@@ -406,7 +397,7 @@ class Approval:
                        else "用户同时选了多项，请一并满足；相互冲突时以先列出者为主")
         return out
 
-    # ---------- 待答表（交互式 provider 基座；本期测试覆盖） ----------
+    # ---------- 待答表 ----------
 
     @property
     def pending(self) -> PendingTable:
@@ -419,7 +410,7 @@ class Approval:
                 "ask_rules": len(self._cfg.get("ask") or []),
                 "deny_rules": len(self._cfg.get("deny") or []),
                 "pending": self._pending.size(),
-                # 2.2：名单按会话分桶 ⇒ 展示**当前会话**的条目数
+                # 2.2：名单按会话分桶 ⇒ 展示当前会话的条目数
                 "session_allow": len(self._session_allow.get(self._skey(), ())),
                 "session_deny": len(self._session_deny.get(self._skey(), ())),
                 "plan_tool": self._plan_dispose is not None}
@@ -428,8 +419,8 @@ class Approval:
 
     @staticmethod
     def _denied(task: str, call_id: str, reason: str, *, denied_by: str = "approval") -> dict:
-        """拒绝决策。``denied_by``：``"user"``=用户本轮主动拒（react 不计连拒）、
-        ``"approval"``=策略拒绝（名单/plan/超时/会话名单，重试无益）。"""
+        """拒绝决策。``denied_by``：``"user"``=用户本轮主动拒、
+         ``"approval"``=策略拒绝。"""
         return {"denied": True, "reason": reason, "denied_by": denied_by,
                 "approval": {"call_id": call_id, "tool": task}}
 

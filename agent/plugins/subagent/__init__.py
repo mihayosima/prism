@@ -1,14 +1,13 @@
-"""插件包：subagent —— 子 Agent 委派（MVP；设计稿 v0.3 §3 / §5）。
+"""插件包：subagent —— 子 Agent 委派。
 
-职责（最小可用）：
-- 注册 ``agent.delegate`` 工具：父循环委派一个**受限、独立上下文**的子循环完成任务，
-  返回结构化结果 ``{status, answer, evidence, request_id}``。
-- 经 ``REACT_FACTORY`` 服务契约构造子循环（**绝不 import react.loop 实现**）；工具面经
-  「三层交集」收窄（visible_tools ∩ role.tools ∩ 请求 tools）；深度经 ContextVar 护栏
-  （默认最多 1 层）。
+职责：
+- 注册 ``agent.delegate`` 工具：父循环委派一个受限、独立上下文的子循环完成任务，
+ 返回结构化结果 ``{status, answer, evidence, request_id}``。
+- 经 ``REACT_FACTORY`` 服务契约构造子循环；工具面经
+ 「三层交集」收窄；深度经 ContextVar 护栏。
 - 子循环在独立 asyncio task 运行 ⇒ ContextVar 天然隔离；共享 ``ctx.state[REACT_RUN_ID]``
-  在收尾被清空 ⇒ handler 负责 save/restore 父的账单键（见 runner.py）。
-- ``REACT_FACTORY`` 缺席（react 被停用）⇒ 不注册工具（优雅降级）。
+ 在收尾被清空 ⇒ handler 负责 save/restore 父的账单键。
+- ``REACT_FACTORY`` 缺席⇒ 不注册工具。
 """
 
 from __future__ import annotations
@@ -26,12 +25,12 @@ from .runner import (MAX_DELEGATIONS_PER_RUN, MAX_PENDING_PER_RUN,
 
 logger = logging.getLogger("agent.subagent")
 
-MAX_SUBAGENT_DEPTH = 1     # MVP：主循环(0) → 子(1)；子不可再委派（阶段 3 可放宽）
+MAX_SUBAGENT_DEPTH = 1     # MVP：主循环(0) → 子(1)；子不可再委派
 
 
 @plugin
 class SubAgent:
-    """ctx.subagent —— 子 Agent 委派（目录插件；opt-in）。"""
+    """ctx.subagent —— 子 Agent 委派。"""
 
     name = "plugins.subagent"
     version = "0.1.0"
@@ -43,13 +42,13 @@ class SubAgent:
 
     async def apply(self, ctx) -> None:
         self._ctx = ctx
-        # REACT_FACTORY 缺席（react 停用）⇒ 不注册工具（优雅降级）。
+        # REACT_FACTORY 缺席⇒ 不注册工具。
         # react 经目录插件加载且字典序先于本插件装配 ⇒ apply 时必然已就绪；
         # 此处仍做软校验，避免任何装配顺序变化导致静默注册一个跑不起来的工具。
         if not ctx.has(Services.REACT_FACTORY):
             logger.warning("REACT_FACTORY 未就绪，agent.delegate 不注册（子 Agent 不可用）")
             return
-        # 阶段 3：异步委派有在飞任务 ⇒ 卸载时必须回收（否则后台子循环脱离容器继续跑）
+        # 阶段 3：异步委派有在飞任务 ⇒ 卸载时必须回收，否则后台子循环脱离容器继续跑
         ctx.effect(self._dispose)
         ctx.tasks.register(
             ctx, "agent.delegate",
@@ -86,14 +85,14 @@ class SubAgent:
             },
             handler=self._delegate,
             owner="plugins.subagent",
-            # ★ 描述即「何时委派」的判据载体（2026-10-10 基线驱动）：实测真模型
-            #   委派触发率仅 2.7%（298 run 仅 8 次委派），根因不是能力缺失而是
-            #   **模型无法自我判断该不该委派**——旧描述只给抽象标准（"需要隔离上下文"），
-            #   没有可操作的门��。此处改为「三问命中任一 → 委派；三条皆否 → 自己做」+ 反例。
+            # 描述即「何时委派」的判据载体：实测真模型
+            # 委派触发率仅 2.7%，根因不是能力缺失而是
+            # 模型无法自我判断该不该委派——旧描述只给抽象标准，
+            # 没有可操作的门��。此处改为「三问命中任一 → 委派；三条皆否 → 自己做」+ 反例。
             description=(
-                # ★ 首行是**唯一一定被模型看到**的部分，且被硬截在 120 字符
-                #   （实测：原始 346 字 → 模型只看到前 120 字）。故三条判据
-                #   必须**全部压进首行 120 字内**，否则第③条会被砍掉（已实测验证）。
+                # 首行是唯一一定被模型看到的部分，且被硬截在 120 字符
+                #。故三条判据
+                #   必须全部压进首行 120 字内，否则第③条会被砍掉。
                 "委派判据（命中任一即委派，否则自己做）：①要翻很多文件/多轮检索、"
                 "但结论只需一句；②有2个以上互不依赖的子任务；③子任务有明确交付物、"
                 "不依赖你已写的中间状态。\n"
@@ -103,11 +102,11 @@ class SubAgent:
                 "返回 {status, answer, evidence}。子 Agent 是叶子节点不能再委派；"
                 "被反复打回重派达上限会被拒绝（防死循环），届时接受结果或换思路。"
             ),
-            risk="read",      # plan 模式仍可见（只读语义；写操作仍受 guard/approval 硬兜底）
+            risk="read",      # plan 模式仍可见
         )
 
     async def _dispose(self) -> bool:
-        """回收在飞的异步委派（插件卸载对称；否则后台子循环脱离容器继续跑）。"""
+        """回收在飞的异步委派，插件卸载对称；否则后台子循环脱离容器继续跑。"""
         try:
             await cancel_all("teardown")
         except Exception as exc:                      # 卸载路径不因清理失败而中断
@@ -122,14 +121,14 @@ class SubAgent:
         timeout_s = float(wait_timeout_s or 0)
         handle = str(handle or "").strip()
 
-        # ---- 阶段 3：取回异步结果（handle 优先；'*'/'all' = 一次性 join 全部） ----
+        # ---- 阶段 3：取回异步结果 ----
         if handle:
             if handle in ("*", "all"):
                 return await collect_pending(ctx, timeout_s)
             return await await_subagent(ctx, handle, timeout_s)
 
         batch = [t for t in (tasks or []) if str(t or "").strip()]
-        if batch:                                     # 并行路径（阶段 2）
+        if batch:                                     # 并行路径
             if wait is False:                         # 阶段 3：并行 + 异步 ⇒ 逐个 spawn
                 spawned = [await start_subagent(
                     ctx, task=t, role=role, param_tools=tools or [],
@@ -153,7 +152,7 @@ class SubAgent:
             ctx, task=task, role=role, param_tools=tools or [],
             max_depth=MAX_SUBAGENT_DEPTH)
 
-    # ---- 状态钩子（插件页摘要，如实上报） ----
+    # ---- 状态钩子 ----
 
     async def status(self, ctx) -> dict:
         enabled = ctx.has(Services.REACT_FACTORY)

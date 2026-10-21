@@ -1,19 +1,19 @@
-"""agent.run.config_store —— 插件配置覆盖的持久化（v1 平铺 → v2 分 scope）。
+"""agent.run.config_store —— 插件配置覆盖的持久化。
 
-为什么独立成模块：覆盖文件是**适配层资产**（``data/agent_plugin_config.json``），
-而合并/淘汰规则是**内核纯函数**（``core.scope_config``）——IO 与规则分离，便于单测。
+为什么独立成模块：覆盖文件是适配层资产，
+而合并/淘汰规则是内核纯函数——IO 与规则分离，便于单测。
 
-v1（现状）：``{ "plugins.context": {...}, "plugins.budget": {...} }``
-v2（本次）：``{version: 2, container: {<v1 形状>}, sessions: {<sk>: {<v1 形状>}}}``
+v1：``{ "plugins.context": {...}, "plugins.budget": {...} }``
+v2：``{version: 2, container: {<v1 形状>}, sessions: {<sk>: {<v1 形状>}}}``
 
-迁移七条纪律（与方案 §S0 一致，代码逐条对应）：
- 1. 读 v1 **兼容且不写回**（只有真正发生写操作时才升级）；
- 2. 首次写 v2 前备份 ``*.v1.bak``（已备份则不覆盖）；
- 3. 版本守卫：未知 version（既非 1 也非 2）→ 按 v1 **只读**解析，避免把脏数据当 v2 落盘；
- 4. 禁止双写平铺副本（v2 下不再出现顶层 ``plugins.*``）；
- 5. scope 只收窄不猜测（会话缺键 = 继承容器，见 ``core.scope_config.merge_overrides``）；
- 6. sessions 上限 + LRU（缺省 200）；淘汰只删覆盖，不动会话数据；
- 7. 损坏文件按空处理（不裸崩，与既有 ``_load_overrides`` 同纪律）。
+迁移七条纪律：
+ 1. 读 v1 兼容且不写回；
+ 2. 首次写 v2 前备份 ``*.v1.bak``；
+ 3. 版本守卫：未知 version→ 按 v1 只读解析，避免把脏数据当 v2 落盘；
+ 4. 禁止双写平铺副本，v2 下不再出现顶层 ``plugins.*``；
+ 5. scope 只收窄不猜测；
+ 6. sessions 上限 + LRU，缺省 200；淘汰只删覆盖，不动会话数据；
+ 7. 损坏文件按空处理。
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ DEFAULT_PATH = Path("data/agent_plugin_config.json")
 
 
 class ConfigStore:
-    """覆盖文件的读写门面（内存态 + 落盘；进程内唯一真源）。"""
+    """覆盖文件的读写门面。"""
 
     def __init__(self, path: Path | None = None,
                  session_limit: int = DEFAULT_SESSION_LIMIT) -> None:
@@ -49,7 +49,7 @@ class ConfigStore:
             return {"version": V2, "container": {}, "sessions": {}}
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8")) or {}
-        except Exception as exc:                # noqa: BLE001 —— 损坏按空处理（但须留证）
+        except Exception as exc:                # noqa: BLE001 —— 损坏按空处理
             self._quarantine(f"JSON 解析失败: {exc}")
             return {"version": V2, "container": {}, "sessions": {}}
         if not isinstance(raw, dict):
@@ -60,20 +60,19 @@ class ConfigStore:
             return {"version": V2,
                     "container": dict(raw.get("container") or {}),
                     "sessions": dict(raw.get("sessions") or {})}
-        # v1 平铺（或未知结构）：只认 plugins.* 顶层节，按容器覆盖读，**不写回**
+        # v1 或未知结构：只读顶层 plugins.* 作容器覆盖，不写回
         container = {k: dict(v) for k, v in raw.items()
                      if isinstance(k, str) and k.startswith("plugins.")
                      and isinstance(v, dict)}
         return {"version": V1, "container": container, "sessions": {}}
 
     def _quarantine(self, reason: str) -> None:
-        """损坏隔离（R2 修复）：告警 + 备份为 ``*.corrupt``，绝不静默丢数据。
+        """损坏隔离：告警 + 备份为 ``*.corrupt``，绝不静默丢数据。
 
-        为什么必须做：损坏时按空配置处理，而 ``_save`` 的备份只覆盖 v1 分支——
-        文件是 v2 时 ``is_v1`` 为 False ⇒ **不备份就被空数据覆盖**，用户全部
-        会话级覆盖不可恢复。本方法与 ``plugin_manager._read_state`` 的 S7 口径对齐
-        （同一类风险，同一套处置：告警 + 坏文件转存 + 不阻断启动）。
-        """
+                为什么必须做：损坏时按空配置处理，而 ``_save`` 的备份只覆盖 v1 分支——
+                文件是 v2 时 ``is_v1`` 为 False ⇒ 不备份就被空数据覆盖，用户全部
+                会话级覆盖不可恢复。本方法与 ``plugin_manager._read_state`` 的 S7 口径对齐。
+                """
         backup = self.path.with_suffix(".corrupt")
         logger.error("配置覆盖文件 %s 损坏（%s）；已转存为 %s，本次按空配置处理",
                      self.path, reason, backup.name)
@@ -104,28 +103,24 @@ class ConfigStore:
     # ---- 读 ----
 
     def container(self) -> dict:
-        """容器级覆盖（v1 形状 ``{plugins.X: {...}}``）。"""
+        """容器级覆盖。"""
         return dict(self._data.get("container") or {})
 
     def session(self, sk: str) -> dict:
-        """某个会话的覆盖（v1 形状；无则空 dict）。"""
+        """该会话的覆盖。"""
         return dict((self._data.get("sessions") or {}).get(sk) or {})
 
     def sessions(self) -> dict:
         return dict(self._data.get("sessions") or {})
 
     def view(self, section: str, sk: str | None = None) -> dict:
-        """**会话配置视图**：容器 ∪ 本会话 → 该插件节的生效键值（返回副本）。
-
-        这就是挂到 ctx 上的 ``session.cfg_view`` 接缝所调用的形态。
-        ``sk`` 为空 ⇒ 等价于纯容器视图（无会话覆盖）。
-        """
+        """返回容器 ∪ 本会话合并后、指定插件节的生效键值；``sk`` 为空即纯容器视图。"""
         sess = self.session(sk) if sk else {}
         merged = merge_overrides(self.container(), sess)
         return section_of(merged, section)
 
     def effective(self, sk: str | None = None) -> dict:
-        """容器 ∪ 会话 的全量生效覆盖（v1 形状，给设置页回显用）。"""
+        """容器 ∪ 会话 的全量生效覆盖。"""
         return merge_overrides(self.container(), self.session(sk) if sk else {})
 
     # ---- 写 ----
@@ -137,7 +132,7 @@ class ConfigStore:
         return evict_lru(sessions, keep=sk, limit=self.session_limit)
 
     def patch_container(self, buckets: dict[str, dict]) -> None:
-        """按插件节写入容器级覆盖（``buckets`` = ``{plugins.X: {k: v}}``）。"""
+        """按插件节写入容器级覆盖。"""
         node = self._data.setdefault("container", {})
         for pid, patch in (buckets or {}).items():
             if not isinstance(patch, dict):
@@ -148,13 +143,13 @@ class ConfigStore:
         self._save()
 
     def replace_container(self, data: dict) -> None:
-        """整份替换容器覆盖（既有 ``_save_overrides`` 语义：整体覆盖，非合并）。"""
+        """整份替换容器覆盖。"""
         self._data["container"] = {k: dict(v) for k, v in (data or {}).items()
                                    if isinstance(k, str) and isinstance(v, dict)}
         self._save()
 
     def patch_session(self, sk: str, buckets: dict[str, dict]) -> None:
-        """按插件节写入会话级覆盖（同时刷新 LRU 并淘汰）。"""
+        """按插件节写入会话级覆盖。"""
         if not sk:
             return
         node = self._data.setdefault("sessions", {}).setdefault(sk, {})
@@ -168,7 +163,7 @@ class ConfigStore:
         self._save()
 
     def clear_session(self, sk: str) -> bool:
-        """清空某会话的全部覆盖（「重置为继承容器」）；返回是否确有删除。"""
+        """清空某会话覆盖；返回是否确有删除。"""
         sessions = self._data.get("sessions") or {}
         existed = sk in sessions
         if existed:
@@ -177,7 +172,7 @@ class ConfigStore:
         return existed
 
     def reset_container(self, pids: list[str] | tuple[str, ...]) -> None:
-        """恢复默认：删除这些插件节的**容器级**覆盖（既有 reset 语义，不变）。"""
+        """删除这些插件节的容器级覆盖。"""
         node = self._data.setdefault("container", {})
         for pid in pids or ():
             node.pop(pid, None)

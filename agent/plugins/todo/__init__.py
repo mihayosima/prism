@@ -1,13 +1,11 @@
-"""插件包：todo —— 结构化待办/规划（P2-1，TodoWrite 式）。
+"""插件包：todo —— 结构化待办/规划。
 
 把 P0-2 的「纯文本规划纪律」升级为真实机制：模型经工具 ``todo.write`` / ``todo.list``
 维护结构化待办，``TodoStore`` 持有状态，mutation 后 emit ``Events.TODO_PROGRESS``
 供前端进度条消费。
 
-设计立场：``loop.py`` 零改动；工具经 ``ctx.tasks.register`` 暴露（与 approval/subagent
-同构）；进度帧经 ``sys/progress`` 帧桥流入 SSE。``risk="read"``：本插件只改 agent 自身的
-内存计划态、无外部副作用，且必须在 plan 权限模式下可见（``loop.py:245`` 的 plan 过滤只
-放行 ``risk=="read"`` —— 反向印证 plan 软可见性过滤过粗：隐藏 write 工具对规划无安全价值）。
+设计立场：``loop.py`` 零改动；工具经 ``ctx.tasks.register`` 暴露；进度帧经 ``sys/progress`` 帧桥流入 SSE。``risk="read"``：本插件只改 agent 自身的
+内存计划态、无外部副作用，且必须在 plan 权限模式下可见。
 """
 
 from __future__ import annotations
@@ -79,15 +77,15 @@ class TodoWrite:
         sk = current_session_key(self._ctx) or "default"
         return {"todos": self._store.list(sk), **self._store.summary(sk)}
 
-    # ---------- 查询接缝（供 react / 测试读取） ----------
+    # ---------- 查询接缝 ----------
 
     async def list_tasks(self, ctx) -> dict:
-        """按当前会话读待办 + 完成度（react 与测试共用）。"""
+        """按当前会话读待办 + 完成度。"""
         sk = current_session_key(ctx) or "default"
         return {"todos": self._store.list(sk), **self._store.summary(sk)}
 
     async def status(self, ctx) -> dict:
-        """插件页可观测（仿 approval.status）。"""
+        """插件页可观测。"""
         sk = current_session_key(ctx) or "default"
         return {"session": sk, **self._store.summary(sk)}
 

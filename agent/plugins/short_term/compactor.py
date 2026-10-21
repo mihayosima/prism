@@ -1,15 +1,14 @@
-"""agent.plugins.short_term.compactor —— 短期记忆内容层压缩编排（HistoryCompactor）。
+"""agent.plugins.short_term.compactor —— 短期记忆内容层压缩编排。
 
-职责（内容层，归短期记忆插件所有）：
-- **对自己内容的压缩**：本地截短（第一层，窗口内可逆）+ LLM 摘要（第二层，软上限兜底）；
-- **覆盖范围对齐**：摘要覆盖「所有不在 kept 里、且未被旧摘要覆盖」的历史（covers_up_to_seq），
-  避免窗口滑动丢数据；
-- **失败处理**：递增退避（§8）+ 按原因分类 + 恢复探测（探测失败只续期）+ 降级路径
-  （LLM 失败→仅本地截短；本地截短失败→不截短喂原文；插件/治理器停用→HISTORY_LIMIT 硬裁）。
+职责：
+- 对自己内容的压缩：本地截短+ LLM 摘要；
+- 覆盖范围对齐：摘要覆盖「所有不在 kept 里、且未被旧摘要覆盖」的历史，
+ 避免窗口滑动丢数据；
+- 失败处理：递增退避+ 按原因分类 + 恢复探测+ 降级路径。
 
 本模块只决定"被丢弃的历史怎么凝练成前情"。收窗机制已移除，本模块不再咨询治理器
-``pick_history``；压缩候选直接取全部未摘要历史（seq > covers），压缩时机由 ``_threshold()``
-（``compact_trigger_tokens``，可配）单独决定。
+``pick_history``；压缩候选直接取全部未摘要历史，压缩时机由 ``_threshold()``
+单独决定。
 """
 
 from __future__ import annotations
@@ -44,20 +43,18 @@ class HistoryCompactor:
         self._store = store
         self._cfg = cfg or {}
         self._backoff = backoff or BackoffState()
-        self._warmup = 0           # 恢复后连续成功计数（§8.5 渐暖）
+        self._warmup = 0           # 恢复后连续成功计数
 
     # ---- 配置 ----
 
     def _threshold(self, ctx: Any = None, session_id: str | None = None) -> int:
-        """压缩触发门槛（token）：未摘要历史（本地截短后）达到此值即压缩。
+        """压缩触发门槛：未摘要历史达到此值即压缩。
 
-        收窗机制已移除，压缩时机完全由本阈值决定。对用户开放可调：
-        ``agent.short_term.compact_trigger_tokens``（默认 12000，与旧收窗预算同量级，
-        远小于模型上下文窗口，确保未摘要历史一增长即压缩，上下文紧致、成本低）。
+         收窗机制已移除，压缩时机完全由本阈值决定。对用户开放可调：
+         ``agent.short_term.compact_trigger_tokens``。
 
-        G2（会话级）：可经 ``session.cfg_view`` 接缝按**会话**取值（不同会话可有不同
-        阈值）。接缝缺失/无会话/取用失败 ⇒ **回落容器值**（不劣化，与改造前逐值等价）。
-        """
+         G2：可经 ``session.cfg_view`` 接缝按会话取值。接缝缺失/无会话/取用失败 ⇒ 回落容器值。
+         """
         base = int(self._cfg.get("compact_trigger_tokens", 12000))
         if ctx is None or not session_id:
             return base
@@ -85,13 +82,13 @@ class HistoryCompactor:
     def _min_messages(self) -> int:
         return int(self._cfg.get("min_messages_to_summarize", 4))
 
-    # ---- 对外：压缩（带顶层失败粒度保护） ----
+    # ---- 对外：压缩 ----
 
     async def maybe_compress(self, ctx: Any, session_id: str) -> None:
-        """异步触发压缩。仅**执行异常**算失败（记入退避）；无内容可摘要/未触发不计。"""
+        """异步触发压缩。仅执行异常算失败；无内容可摘要/未触发不计。"""
         try:
             await self._try_compress(ctx, session_id)
-        except Exception as exc:                 # execution 异常（DB/意外）→ 按原因分类退避
+        except Exception as exc:                 # execution 异常→ 按原因分类退避
             reason = self._classify(exc)
             tier = self._backoff.record_failure(reason)
             logger.warning("short_term compress error (%s): %s; backoff tier=%sm", reason, exc, tier)
@@ -111,13 +108,13 @@ class HistoryCompactor:
         meta = await self._store.get_summary_meta(ctx, session_id)
         covers = int(meta["covers_up_to_seq"]) if meta else 0
 
-        # 收窗机制已移除：压缩时机完全由 _threshold() 决定（compact_trigger_tokens，可配）。
-        # 压缩候选 = 全部未摘要历史（seq > covers，即上一轮摘要尚未覆盖的部分）。
+        # 收窗机制已移除：压缩时机完全由 _threshold() 决定。
+        # 压缩候选 = 全部未摘要历史。
         to_sum = [m for m in raw if m["seq"] > covers]
         if len(to_sum) < self._min_messages():
             return                                     # 没多少可压：不算失败
 
-        # 第一层：本地截短（内容层凝练，窗口内可逆；对 to_sum 估算 + LLM 输入凝练）
+        # 第一层：本地截短
         to_sum_view = truncate_messages(
             to_sum,
             recent_rounds=0,                            # to_sum 全为老内容，全部可截
@@ -128,11 +125,11 @@ class HistoryCompactor:
         if view_tokens < self._threshold(ctx, session_id):
             return                                     # 本地截短后很小：无需 LLM，不算失败
 
-        # 第二层：LLM 摘要（受退避保护；暂停期先轻量探测）
+        # 第二层：LLM 摘要
         old_summary = await self._store.latest_summary(ctx, session_id)
         llm_text = await self._maybe_llm_summary(ctx, old_summary, to_sum_view)
         if llm_text is None:
-            return                                     # LLM 不可用/失败 → 降级（仅本地截短已生效），不算失败
+            return                                     # LLM 不可用/失败 → 降级，仅本地截短已生效，不算失败
 
         # 优先级预算兜底压缩
         new_summary = compress_summary_to_budget(llm_text, self._budgets(),
@@ -141,7 +138,7 @@ class HistoryCompactor:
         up_to = max(m["seq"] for m in to_sum)
         version = (int(meta["version"]) if meta else 0) + 1
 
-        # 原子写：摘要 + 标记 compressed_into（同一事务，避免"标记了但没摘要"）
+        # 原子写：摘要 + 标记 compressed_into，同一事务，避免"标记了但没摘要"
         async with ctx.db.transaction(ctx):
             await self._store.upsert_summary(
                 ctx, session_id, summary=new_summary, version=version,
@@ -158,7 +155,7 @@ class HistoryCompactor:
         if ctx.get(Services.LLM) is None:
             return None                                 # 无 LLM → 降级
         if not self._backoff.should_attempt("llm_error"):
-            # 暂停期：轻量探测（合成最小负载），成功→清零继续；失败→续期并降级
+            # 暂停期：轻量探测，成功→清零继续；失败→续期并降级
             if not await self._probe_llm(ctx):
                 self._backoff.record_probe_failure("llm_error")
                 return None
@@ -189,10 +186,10 @@ class HistoryCompactor:
         except Exception:                                # noqa: BLE001
             return False
 
-    # ---- 对外：窗口内本地截短（prior 构造时调用，内容层） ----
+    # ---- 对外：窗口内本地截短 ----
 
     def truncate_view(self, messages: list[dict]) -> list[dict]:
-        """prior 构造时对 kept 里的老内容做窗口内本地截短（可逆，不改原文）。"""
+        """prior 构造时对 kept 里的老内容做窗口内本地截短。"""
         return truncate_messages(
             messages,
             recent_rounds=int(self._cfg.get("truncate_recent_rounds", 3)),
@@ -200,7 +197,7 @@ class HistoryCompactor:
             file_threshold=int(self._cfg.get("file_content_max_tokens", 12000)),
         )
 
-    # ---- 内容层读接口（委托 store，供 chat 构造 prior / 回溯） ----
+    # ---- 内容层读接口 ----
 
     async def get_history(self, ctx: Any, session_id: str) -> list[dict]:
         return await self._store.get_history(ctx, session_id)
@@ -216,7 +213,7 @@ class HistoryCompactor:
 
     @property
     def backoff(self) -> BackoffState:
-        """退避状态机（可观测：诊断 / 测试可查暂停与计数）。"""
+        """退避状态机。"""
         return self._backoff
 
     def stats(self) -> dict:

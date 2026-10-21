@@ -1,35 +1,34 @@
-"""agent.sys.budget —— 成本护栏（挂在模型接缝，非管线内嵌）。
+"""agent.sys.budget —— 成本护栏。
 
-- ``agent/llm/pre-call``（waterfall）：已花 + 本次估算 > 上限 → 否决（return 不带 next()）。
-  方案A：``finalize_reserve_tokens``（默认 24000，配置化）为收尾调用预留末段额度——
-  正常调用上限是 ``max-reserve``，带 ``finalize=True`` 的收尾调用仍可用至 ``max``。
-- D1：``warning_ratio``（默认 0.8，<=0 关闭）——花费预估跨 ``ratio*max`` 阈值时置
-  ``StateKeys.BUDGET_WARNING`` 旗标 + durable/live ``agent/budget/warning`` 事件（各一次）。
-  消费方（react）按需读状态键注入「尽快收束」提示——**状态键前向契约，双方零直连**。
-- F1：``cost_calibration``（默认 True）——post-call 用「真实 tokens_in ÷ 当次裸估算」
-  维护按模型分桶的 EWMA 校准因子（``StateKeys.LLM_COST_RATIO``），pre-call 估算乘因子
-  后再判定/预借；治理器装配经 ``api.cost_factor`` 读同一因子（彻底作用，双消费点）。
-  样本 <5 或因子越界 [0.5,3] 时诚实退裸估算/夹紧。
-  ★ 校准因子**保持全局**（不随会话拆分）：口径是模型属性，拆到会话会让每个会话样本
-  数不足而退化成裸估算，精度反而变差（方案 §3.2）。
-- F2/F3/P3：``run_id``（react 经 ``StateKeys.REACT_RUN_ID`` 提供，尽力归组）与
-  ``cache_hit``（DeepSeek 前缀缓存命中，P3 计量）随账落 ``agent_budget_log``
-  （缺列幂等迁移）；估算↔真实偏差 >25% 发 durable ``agent/llm/cost-drift``（F3）。
-- ``agent/llm/post-call``（emit）：真实 token 入账，落 agent_budget_log。
+- ``agent/llm/pre-call``：已花 + 本次估算 > 上限 → 否决。
+ 方案 A：``finalize_reserve_tokens`` 为收尾调用预留末段额度——
+ 正常调用上限是 ``max-reserve``，带 ``finalize=True`` 的收尾调用仍可用至 ``max``。
+- D1：``warning_ratio``——花费预估跨 ``ratio*max`` 阈值时置
+ ``StateKeys.BUDGET_WARNING`` 旗标 + durable/live ``agent/budget/warning`` 事件。
+ 消费方按需读状态键注入「尽快收束」提示——状态键前向契约，双方零直连。
+- F1：``cost_calibration``——post-call 用「真实 tokens_in ÷ 当次裸估算」
+ 维护按模型分桶的 EWMA 校准因子，pre-call 估算乘因子
+ 后再判定/预借；治理器装配经 ``api.cost_factor`` 读同一因子。
+ 样本 <5 或因子越界 [0.5,3] 时诚实退裸估算/夹紧。
+ 校准因子保持全局：口径是模型属性，拆到会话会让每个会话样本
+ 数不足而退化成裸估算，精度反而变差。
+- F2/F3/P3：``run_id`` 与
+ ``cache_hit`` 随账落 ``agent_budget_log``
+ ；估算↔真实偏差 >25% 发 durable ``agent/llm/cost-drift``。
+- ``agent/llm/post-call``：真实 token 入账，落 agent_budget_log。
 
-G2（会话级，本次改造）：
-- 额度（``max_tokens_per_run`` / ``finalize_reserve_tokens`` / ``warning_ratio``）与
-  **状态**（``BUDGET_SPENT`` / ``BUDGET_WARNING`` / ``BUDGET_PENDING_EST``）一律
-  **按会话分桶** ⇒ 会话 A 的消耗不再顶掉 B 的额度；
-- ``CHAT_RESET`` 只清**本会话**（此前是清整个容器——多会话下 A 清历史会让 B 的
-  预算凭空回满，属 P0 缺陷）；
-- 账单 ``agent_budget_log`` 增 ``session`` 列（幂等迁移），使「本会话花了多少」可回答；
-- 无会话覆盖时全部回落到容器值 ⇒ **行为与改造前逐值等价**。
+G2：
+- 额度与
+ 状态一律
+ 按会话分桶 ⇒ 会话 A 的消耗不再顶掉 B 的额度；
+- ``CHAT_RESET`` 只清本会话；
+- 账单 ``agent_budget_log`` 增 ``session`` 列，使「本会话花了多少」可回答；
+- 无会话覆盖时全部回落到容器值 ⇒ 行为与改造前逐值等价。
 
-状态形状（本次变更，注意兼容）：
-  ``BUDGET_SPENT``        : ``dict[session_key, int]``（旧为 int；旧形状自动迁移）
-  ``BUDGET_WARNING``      : ``dict[session_key, warn]``（消费方须按会话取，见 react/loop）
-  ``BUDGET_PENDING_EST``  : ``dict[session_key, dict[caller, entry]]``（旧为 dict[caller, entry]）
+状态形状，本次变更，注意兼容：
+ ``BUDGET_SPENT`` : ``dict[session_key, int]``
+ ``BUDGET_WARNING`` : ``dict[session_key, warn]``
+ ``BUDGET_PENDING_EST`` : ``dict[session_key, dict[caller, entry]]``
 """
 
 from __future__ import annotations
@@ -39,52 +38,51 @@ import logging
 from agent.api import (Events, Services, SESSION_CFG_VIEW, StateKeys, cost_factor,
                        current_run_id, current_session_key, durable,
                        estimate_request_cost, inc_counter, now_iso, plugin)
-# 账单表的补列定义归口 agent/tables.py（表结构真相源），此处只负责**执行**。
-# 沿用 sys → agent.tables 的既有导入方向（先例：sys/storage.py 导入 MIGRATIONS）。
+# 账单表的补列定义归口 agent/tables.py，此处只负责执行。
+# 沿用 sys → agent.tables 的既有导入方向。
 from agent.tables import BUDGET_LOG_FIELDS
 
 logger = logging.getLogger("agent.budget")
 
-# 状态分桶上限（与配置覆盖的 sessions 上限**独立**）：只防内存无限增长，
+# 状态分桶上限：只防内存无限增长，
 # 淘汰最久未用的桶；淘汰只丢「累计值」，不影响任何已落账的账单。
 _STATE_SESSION_LIMIT = 512
 
 
-# ---- 会话级辅助（纯函数/小工具，无业务语义） --------------------------------
+# ---- 会话级辅助 --------------------------------
 
 def _session_key(ctx) -> str:
-    """当前会话键（空串 = 容器级/未知）。
+    """当前会话键。
 
-    R1（2026-10-02）：走 ``current_session_key()``——**ContextVar（按 asyncio task 隔离
-    ⇒ 每请求独立）优先，未绑定才回退 ``ctx.state``**。此前只读容器级 state：并发请求
-    交错时后写覆盖先写，会把 A 的账记进 B 的桶。
-    """
+ R1：走 ``current_session_key()``——ContextVar 优先，未绑定才回退 ``ctx.state``。此前只读容器级 state：并发请求
+ 交错时后写覆盖先写，会把 A 的账记进 B 的桶。
+ """
     return current_session_key(ctx)
 
 
 def _run_id(ctx) -> str:
-    """当前 run 的账单归组键（= react 的 ``task_id``；空串 = 未知）。
+    """当前 run 的账单归组键。
 
-    与 ``_session_key`` 同款通道与理由（``current_run_id``）：此前读容器级 state，
-    并发下会把别人的 run 写进本行的 ``agent_budget_log.run_id``。独立成函数便于
-    单测直击真实读取点。
-    """
+ 与 ``_session_key`` 同款通道与理由：此前读容器级 state，
+ 并发下会把别人的 run 写进本行的 ``agent_budget_log.run_id``。独立成函数便于
+ 单测直击真实读取点。
+ """
     return current_run_id(ctx)
 
 
 def _pending_key(payload: dict) -> str:
-    """预借槽的**唯一关联键**：优先 ``call_id``，缺省回退 ``caller``（兼容旧调用方）。
+    """预借槽的唯一关联键：优先 ``call_id``，缺省回退 ``caller``。
 
-    ★ 为什么从 ``caller`` 改为 ``call_id``：``LLM_POST_CALL`` 是 fire-and-forget，
-    预借槽按 caller 关联时，**同 caller 的连续/并发调用会互相覆盖**——先到的 post
-    弹出后到的预借，使真实 token 记错账、校准样本丢失（实测触发挂红）。``call_id``
-    由 ``sys/llm.py::complete`` 每次调用生成并贯穿 pre/post/failed 三 payload，关联无歧义。
-    """
+ 为什么从 ``caller`` 改为 ``call_id``：``LLM_POST_CALL`` 是 fire-and-forget，
+ 预借槽按 caller 关联时，同 caller 的连续/并发调用会互相覆盖——先到的 post
+ 弹出后到的预借，使真实 token 记错账、校准样本丢失。``call_id``
+ 由 ``sys/llm.py::complete`` 每次调用生成并贯穿 pre/post/failed 三 payload，关联无歧义。
+ """
     return str(payload.get("call_id") or payload.get("caller") or "unknown")
 
 
 def _cfg_view(ctx):
-    """取会话配置视图接缝（软取；缺失即 None ⇒ 回落容器配置）。"""
+    """取会话配置视图接缝。"""
     try:
         return ctx.get(SESSION_CFG_VIEW)
     except Exception:                        # noqa: BLE001
@@ -122,7 +120,7 @@ def _limits(ctx, base_raw: tuple[int, int, float]) -> tuple[int, int, float]:
 
 
 def _spent_map(ctx) -> dict:
-    """``dict[sk, int]``（旧 int 形状自动迁移为单桶）。"""
+    """``dict[sk, int]``。"""
     m = ctx.state.get(StateKeys.BUDGET_SPENT)
     if not isinstance(m, dict):
         m = {}
@@ -142,11 +140,11 @@ def _set_spent(ctx, sk: str, value: int) -> None:
 
 
 def _warn_map(ctx) -> dict:
-    """``dict[sk, warn]``（旧单值记录自动迁移到容器桶 ``""``）。
+    """``dict[sk, warn]``。
 
-    旧形状本身也是 dict（``{at, spent, limit, ratio}``），不能只按类型判断——
-    以「是否含记录字段 ``limit``」区分「记录」与「分桶」。
-    """
+ 旧形状本身也是 dict，不能只按类型判断——
+ 以「是否含记录字段 ``limit``」区分「记录」与「分桶」。
+ """
     m = ctx.state.get(StateKeys.BUDGET_WARNING)
     if isinstance(m, dict) and "limit" in m:
         m = {"": m}                          # 旧单值记录 → 容器桶
@@ -158,12 +156,12 @@ def _warn_map(ctx) -> dict:
 
 
 def _pending_map(ctx, sk: str) -> dict:
-    """``dict[sk, dict[caller, entry]]``（旧 ``dict[caller, entry]`` 自动迁移）。"""
+    """``dict[sk, dict[caller, entry]]``。"""
     m = ctx.state.get(StateKeys.BUDGET_PENDING_EST)
     if not isinstance(m, dict):
         m = {}
         ctx.state[StateKeys.BUDGET_PENDING_EST] = m
-    # 旧形状识别：值不是 dict ⇒ 视为旧的单层 caller 槽，整体重置（进程内，最多丢一次预借）
+    # 旧形状识别：值不是 dict ⇒ 视为旧的单层 caller 槽，整体重置
     if any(not isinstance(v, dict) for v in m.values()):
         m.clear()
     slot = m.get(sk)
@@ -181,7 +179,7 @@ def _trim_pending(ctx) -> None:
 
 @plugin
 class Budget:
-    """ctx.budget —— 预算护栏。guard 用 prepend 先裁决；budget 后裁决（权限先、成本后）。"""
+    """ctx.budget —— 预算护栏。guard 用 prepend 先裁决；budget 后裁决。"""
 
     name = "agent.budget"
     layer = "system"
@@ -191,20 +189,20 @@ class Budget:
     async def apply(self, ctx) -> None:
         cfg = ((ctx.config or {}).get("agent") or {}).get("budget") or {}
         max_tokens = int(cfg.get("max_tokens_per_run", 10000))
-        # 方案A：收尾预留额度（语义与钳制见 _clamp_limits）
+        # 方案 A：收尾预留额度
         raw_reserve = int(cfg.get("finalize_reserve_tokens", 0))
         raw_ratio = float(cfg.get("warning_ratio", 0.8))
-        # F1：口径自校准总开关（G1 容器级：校准是模型属性，不随会话拆）
+        # 口径自校准总开关
         calib = bool(cfg.get("cost_calibration", True))
         model = ((ctx.config or {}).get("agent") or {}).get("llm", {}).get("model", "fixture")
         base_raw = (max_tokens, raw_reserve, raw_ratio)
-        _spent_map(ctx)                      # 初始化（并把旧 int 形状迁移为分桶）
-        # F2/P3：账单明细列**幂等补列**——定义见 agent/tables.py::BUDGET_LOG_FIELDS
-        # （表结构真相源归口于该文件；此处不写死列名，避免"看表结构要翻两处"）。
+        _spent_map(ctx)                      # 初始化
+        # F2/P3：账单明细列幂等补列——定义见 agent/tables.py::BUDGET_LOG_FIELDS
+        # 表结构真相源归口于该文件；此处不写死列名，避免"看表结构要翻两处"。
         # 容错是刻意的：存量库这些列早已存在，ALTER 必然报 duplicate column。
-        # ★ **真失败必须可见**（2026-10-04 补，与 sys/storage.py 同款）：原实现全静默，
+        # 真失败必须可见：原实现全静默，
         # 补不上时表现为"账单明细列莫名其妙是空的"，日志零线索、只能手工 PRAGMA 才发现。
-        # ``duplicate column`` 属**正常**幂等路径，不计失败（否则每次启动都误报）。
+        # ``duplicate column`` 属正常幂等路径，不计失败，否则每次启动都误报。
         for col, decl in BUDGET_LOG_FIELDS:
             try:
                 await ctx.db.execute(
@@ -215,9 +213,8 @@ class Budget:
                     logger.warning("agent_budget_log 补列 %s 失败 ⇒ 该列将缺失: %s", col, exc)
 
         async def _pre(payload: dict, next) -> dict:
-            # est 覆盖 messages + tools 目录（native 形态）+ schema；
+            # est 覆盖 messages + tools 目录+ schema；
             # 经 core 估算器按 wire 同构计量，根治此前按「工具名列表」估算 26% 系统性低估
-            # （详见 docs/context/token口径对账-问题记录.md）。
             raw_est = estimate_request_cost(
                 payload.get("messages", []),
                 payload.get("tools") or None,
@@ -225,7 +222,7 @@ class Budget:
             )
             sk = _session_key(ctx)
             max_tokens, reserve, ratio = _limits(ctx, base_raw)
-            # F1：估算 × 校准因子（真实 ≈ 估算 × factor）后再判定——判定时刻贴近真实计费
+            # 估算 × 校准因子后再判定——判定时刻贴近真实计费
             est = int(raw_est * cost_factor(ctx)) if calib else int(raw_est)
             est = max(0, est)
             spent = _spent_of(ctx, sk)
@@ -235,7 +232,7 @@ class Budget:
                 if spent + est > limit:
                     return {"denied": True,
                             "reason": f"预算超限 spent={spent}+est={est}>{limit}"}
-                # D1：跨预警阈值（只看正常额度线；收尾调用不触发）。只发一次：
+                # 跨预警阈值。只发一次：
                 # 旗标已在位即跳过，避免每步重复事件刷屏。
                 warn_map = _warn_map(ctx)
                 if (not is_finalize and ratio > 0
@@ -246,34 +243,32 @@ class Budget:
                     warn_map[sk] = warn
                     await durable(ctx, Events.BUDGET_WARNING, dict(warn))
                     await ctx.events.emit(Events.BUDGET_WARNING, dict(warn))
-            # 预借记账（确定性：与 post 竞态无关）；pending 槽键 = **唯一 call_id**
-            # （D3：react 与 memory 并发调 LLM 时互不覆盖；G2：会话间亦互不覆盖；
-            #  F0：同 caller 连续调用也不再互相覆盖——见 ``_pending_key``）。
+            # 预借记账；pending 槽键 = 唯一 call_id
             _set_spent(ctx, sk, spent + est)
             _pending_map(ctx, sk)[_pending_key(payload)] = {
                 "est": est, "raw": int(raw_est),
-                # R1：归组键同走请求作用域通道（此前读容器级 state，并发下会取到别人的 run）
+                # R1：归组键同走请求作用域通道
                 "run_id": _run_id(ctx)}
             _trim_pending(ctx)
             return await next()
 
         async def _post(payload: dict) -> None:
-            # S1 对账：用实际入账替换预借（spent = spent - est + actual），
-            # 账面精确等于 Σ实际。F1：真实/裸估算比喂 EWMA（校准因子）；F3：偏差审计。
+            # S1 对账：用实际入账替换预借，
+            # 账面精确等于 Σ实际。F1：真实/裸估算比喂 EWMA；F3：偏差审计。
             sk = _session_key(ctx)
             ti = int(payload.get("tokens_in", 0))
             to = int(payload.get("tokens_out", 0))
             caller = str(payload.get("caller") or "unknown")
             pending = _pending_map(ctx, sk)
             entry = pending.pop(_pending_key(payload), None) or {}
-            if isinstance(entry, int):       # 兼容旧形状（纯数字预借）
+            if isinstance(entry, int):       # 兼容旧形状
                 entry = {"est": entry, "raw": entry, "run_id": ""}
             est = int(entry.get("est") or 0)
             raw = int(entry.get("raw") or 0)
             run_id = str(entry.get("run_id") or "")
             cache_hit = payload.get("cache_hit")
             cache_hit = int(cache_hit) if cache_hit is not None else None
-            # G2.0（P0）：思考 token 明细（provider 未提供 → NULL；口径与 tokens_out 同源）
+            # 思考 token 明细
             _rt = payload.get("reasoning_tokens")
             reasoning_tokens = int(_rt) if _rt is not None else None
             spent = _spent_of(ctx, sk)
@@ -286,13 +281,13 @@ class Budget:
                 (model, ti, to, est or None, run_id or None, cache_hit,
                  reasoning_tokens, sk or None, now_iso()),
             )
-            # F3：口径漂移审计（与校准开关无关——漂移本身永远值得留证）
+            # 口径漂移审计
             if raw > 0 and abs(ti - raw) / raw > 0.25:
                 await durable(ctx, Events.LLM_COST_DRIFT, {
                     "caller": caller, "model": model, "raw_est": raw, "real_in": ti,
                     "drift": round((ti - raw) / raw, 3), "at": now_iso()})
-            # F1：EWMA 维护（样本数达标后 cost_factor 才生效——见 api.cost_factor）
-            # ★ 全局单份：不按会话拆分（拆了会让每会话样本不足而退裸估算）。
+            # EWMA 维护
+            # 全局单份：不按会话拆分。
             if calib and raw > 0 and ti > 0:
                 stats = dict(ctx.state.get(StateKeys.LLM_COST_RATIO) or {})
                 m = dict(stats.get(model) or {})
@@ -304,7 +299,7 @@ class Budget:
                 ctx.state[StateKeys.LLM_COST_RATIO] = stats
 
         def _call_failed(payload: dict) -> None:
-            # S1：调用失败 → 全额退还本次预借（同步监听器，emit 内联执行立即生效）。
+            # 调用失败 → 全额退还本次预借。
             sk = _session_key(ctx)
             pending = _pending_map(ctx, sk)
             entry = pending.pop(_pending_key(payload), None) or {}
@@ -319,7 +314,7 @@ class Budget:
         ctx.on(Events.LLM_CALL_FAILED, _call_failed)
         if cfg.get("reset_on_new_session", True):
             def _reset_session(payload: dict) -> None:      # 同步：emit 内联执行，立即生效
-                # G2（P0 修复）：**只清本会话**。事件已带 session_id（sys/chat.py 发出）；
+                # 只清本会话。事件已带 session_id；
                 # 不带则退回「清全部」以兼容既有调用方，并显式留痕——多会话下误清全局
                 # 会让别人的预算凭空回满，是本次要消灭的缺陷。
                 sid = str((payload or {}).get("session_id") or "")

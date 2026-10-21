@@ -1,7 +1,7 @@
-"""agent.sys.storage —— agent.db（独立库）+ 迁移注册器（namespace=agent）。
+"""agent.sys.storage —— agent.db+ 迁移注册器。
 
 只提供 execute/query/transaction/迁移执行，不承载任何业务语义；业务词只允许出现在
-agent.tables（DDL）。换后端 = 换本插件 provider（现 sqlite 实装，dialect 映射留位）。
+agent.tables。换后端 = 换本插件 provider。
 """
 
 from __future__ import annotations
@@ -15,17 +15,17 @@ from agent.tables import EVENTS_EXTRA_COLUMNS, EVENTS_REQUEST_INDEX, MIGRATIONS
 
 logger = logging.getLogger("agent.storage")
 
-#: 迁移前自动备份的保留份数（槽位轮转，覆盖而非删除）
+# : 迁移前自动备份的保留份数
 BACKUP_KEEP = 5
 
 
 def _backup_slot(path: str, keep: int = BACKUP_KEEP) -> str:
-    """挑一个备份槽位：``keep`` 个槽中最老的那个（有空槽则用空槽）。
+    """挑一个备份槽位：``keep`` 个槽中最老的那个。
 
-    ★ 刻意用**固定槽位覆盖**而不是「新建 + 删最老」：本项目的宿主环境对文件删除
-    挂了守卫（safe-delete），``os.remove`` / ``Path.unlink`` 会直接抛异常（已实测踩到）。
-    覆盖写**不需要删除**，且磁盘占用恒定为 ``keep`` 份，行为更可预测。
-    """
+     刻意用固定槽位覆盖而不是「新建 + 删最老」：本项目的宿主环境对文件删除
+     挂了守卫，``os.remove`` / ``Path.unlink`` 会直接抛异常。
+     覆盖写不需要删除，且磁盘占用恒定为 ``keep`` 份，行为更可预测。
+     """
     import os
 
     slots = [f"{path}.bak.{i}" for i in range(1, max(1, keep) + 1)]
@@ -36,17 +36,15 @@ def _backup_slot(path: str, keep: int = BACKUP_KEEP) -> str:
 
 
 class SqliteDb:
-    """通用数据访问（stdlib sqlite3 实装）：execute/query + dict 行。
+    """通用数据访问：execute/query + dict 行。
 
-    同步 sqlite3 调用统一经 ``asyncio.to_thread`` 卸载到后台线程，**不再阻塞事件循环**
-    （此前直接在协程内同步执行 —— 任意一次 DB 调用（尤其 ``busy_timeout=5000`` 下锁等待）
-    都会冻结整个进程的全部并发请求，即「假异步」）。
+     同步 sqlite3 调用统一经 ``asyncio.to_thread`` 卸载到后台线程，不再阻塞事件循环；
+     否则 await 期间的锁等待与长事务会冻结整个进程的全部并发请求，即「假异步」。
 
-    单连接 + 双重锁：
-    - ``_lock``（asyncio）：协程级串行化，保证一回合 DB 操作不被其它协程的提交插空；
-    - ``_tlock``（threading）：线程级串行化，**真正**保护 sqlite 连接（``to_thread`` 会把
-      同一连接交到线程池执行，sqlite3 连接非线程安全）。``check_same_thread=False`` 因此必须开启。
-    """
+     单连接 + 双重锁：
+     - ``_lock``：协程级串行化，保证一回合 DB 操作不被其它协程的提交插空；
+     - ``_tlock``：线程级串行化，真正保护 sqlite 连接。``check_same_thread=False`` 因此必须开启。
+     """
 
     def __init__(self, path: str):
         import sqlite3
@@ -106,13 +104,13 @@ class SqliteDb:
             return await asyncio.to_thread(self._query, sql, params)
 
     async def executemany(self, ctx, sql: str, seq: list[tuple]) -> int:
-        """批量执行同一条语句，返回受影响行数（``execute`` 的 N 次版，合成 1 次往返）。
+        """批量执行同一条语句，返回受影响行数。
 
-        2026-10-04 为记忆召回的 ``touch`` 补的：改前 top-8 逐条 UPDATE（8 次写），
-        改后 1 次。**不需要拼 ``IN (...)``** ⇒ 无字符串注入面，也不撞 SQLite 变量上限。
+                 为记忆召回的 ``touch`` 补的：改前 top-8 逐条 UPDATE，
+                 改后 1 次。不需要拼 ``IN (...)`` ⇒ 无字符串注入面，也不撞 SQLite 变量上限。
 
-        事务语义与 :meth:`execute` 完全一致（块内由 ``transaction`` 统一提交）。
-        """
+                 事务语义与 :meth:`execute` 完全一致。
+                 """
         rows = list(seq or ())
         if not rows:
             return 0
@@ -122,24 +120,23 @@ class SqliteDb:
             return await asyncio.to_thread(self._executemany, sql, rows)
 
     def transaction(self, ctx):
-        """S4：显式事务（异步上下文管理器；普通方法，返回 cm 而非协程）。
+        """S4：显式事务。
 
-        ``async with db.transaction(ctx): ...``——块内多条语句同生共死：
-        任一异常 → ROLLBACK，正常退出 → COMMIT。块内持锁，迁移等原子性依赖此原语。
-        """
+         ``async with db.transaction(ctx): ...``——块内多条语句同生共死：
+         任一异常 → ROLLBACK，正常退出 → COMMIT。块内持锁，迁移等原子性依赖此原语。
+         """
         db = self
 
         class _Tx:
             async def __aenter__(self):
-                # ★ 嵌套保护（2026-10-04）：``_lock`` 是 asyncio.Lock，**不可重入**。
-                # 事务块内再开一个事务 ⇒ 协程等自己持有的锁 ⇒ **永久静默死锁**
-                # （无异常、无日志、无超时，表现为请求挂死）。此处主动识别并 fail-fast。
-                #
-                # ★★ 两个易错点（首版都踩了）：
-                #   1) 检查必须在 ``acquire()`` **之前**——死锁就发生在 acquire 那一句，
-                #      放在它后面永远走不到（首版实测：加了保护仍然超时）；
-                #   2) 判定必须用 **task 归属**而非"锁是否被占"——后者会把"另一个协程
-                #      正在事务中、本协程正常排队"误判成嵌套而报错。
+                # 嵌套保护：``_lock`` 是 asyncio.Lock，不可重入。
+                # 事务块内再开一个事务 ⇒ 协程等自己持有的锁 ⇒ 永久静默死锁
+                # 此处主动识别并 fail-fast。
+                # 两个易错点：
+                # 1) 检查必须在 ``acquire()`` 之前——死锁就发生在 acquire 那一句，
+                # 放在它后面永远走不到；
+                # 2) 判定必须用 task 归属而非"锁是否被占"——后者会把"另一个协程
+                # 正在事务中、本协程正常排队"误判成嵌套而报错。
                 me = asyncio.current_task()
                 if db._tx_owner is me:
                     raise AgentError(
@@ -166,14 +163,13 @@ class SqliteDb:
         return _Tx()
 
     async def backup(self, dest: str) -> str:
-        """**在线**备份到 ``dest``（SQLite 官方 backup API）。
+        """在线备份到 ``dest``。
 
-        为什么用它而不是拷贝文件：WAL 模式下直接复制 ``.db`` 会拿到**不一致**的快照
-        （主库 + WAL 是两个文件，复制期间还有并发写）。``Connection.backup`` 在
-        SQLite 内部取一致性视图，**不需要停服**，也不依赖 WAL 是否已 checkpoint。
+                 为什么用它而不是拷贝文件：WAL 模式下直接复制 ``.db`` 会拿到不一致的快照。``Connection.backup`` 在
+                 SQLite 内部取一致性视图，不需要停服，也不依赖 WAL 是否已 checkpoint。
 
-        全程持 ``_tlock``：与业务读写串行化，备份期间连接不被别的线程触碰。
-        """
+                 全程持 ``_tlock``：与业务读写串行化，备份期间连接不被别的线程触碰。
+                 """
         def _do() -> None:
             if self._conn is None:
                 raise AgentError("数据库未启动，无法备份")
@@ -188,18 +184,17 @@ class SqliteDb:
         return dest
 
     async def backup_rotating(self, keep: int = BACKUP_KEEP) -> str:
-        """备份到轮转槽位（``<db>.bak.N``），返回实际写入的路径。
+        """备份到轮转槽位，返回实际写入的路径。
 
-        槽位策略见 :func:`_backup_slot` —— **只覆盖、从不删除**。
-        """
+         槽位策略见 :func:`_backup_slot` —— 只覆盖、从不删除。
+         """
         slot = await asyncio.to_thread(_backup_slot, self._path, keep)
         return await self.backup(slot)
 
     async def close(self) -> None:
-        # WAL 无需手工 checkpoint：sqlite3 在**最后一个连接关闭时**会自动 checkpoint
-        # 并删除 ``-wal`` 文件（2026-10-04 实测：写入 500 条后 WAL 2MB，``close()`` 后
-        # WAL 文件直接消失）。长驻进程运行期看到的大 WAL 是 ``wal_autocheckpoint``
-        # 的**稳态**（默认 1000 页），不是泄漏——故此处刻意不加 PRAGMA。
+        # WAL 无需手工 checkpoint：sqlite3 在最后一个连接关闭时会自动 checkpoint
+        # 并删除 ``-wal`` 文件。长驻进程运行期看到的大 WAL 是 ``wal_autocheckpoint``
+        # 的稳态，不是泄漏——故此处刻意不加 PRAGMA。
         conn = self._conn
         if conn is not None:
             self._conn = None
@@ -210,7 +205,7 @@ class SqliteDb:
 
 
 class MigrationRegistry:
-    """迁移注册器：路径内幂等应用 + 防脏武（已应用但代码已删 → 拒绝启动）。"""
+    """迁移注册器：路径内幂等应用 + 防脏武。"""
 
     def __init__(self, db: SqliteDb):
         self._db = db
@@ -228,15 +223,13 @@ class MigrationRegistry:
             raise AgentError(
                 f"迁移已应用但当前代码不含（防脏武，勿删旧迁移）: {stray}"
             )
-        # ★ 迁移前自动备份（2026-10-05）：**只在真有迁移要跑时**触发（平时零开销）。
-        #
+        # 迁移前自动备份：只在真有迁移要跑时触发。
         # 为什么用备份而不是实现 ``down``：
-        #   - down 迁移要为每个迁移手写反向 SQL，**写错就是数据损坏**，而它几乎从不被执行
-        #     ⇒ 收益极低、风险极高；
-        #   - 备份是**无条件正确**的回退手段（整库快照），且能覆盖 down 覆盖不到的情况
-        #     （迁移半途断电、误删数据、迁移以外的误操作）。
-        # 失败**不外泄**：备份只是保险，失败不应让服务起不来——
-        # 但要**可见**（计数 + warning），否则"以为有备份其实没有"。
+        # - down 迁移要为每个迁移手写反向 SQL，写错就是数据损坏，而它几乎从不被执行
+        # ⇒ 收益极低、风险极高；
+        # - 备份是无条件正确的回退手段，且能覆盖 down 覆盖不到的情况
+        # 失败不外泄：备份只是保险，失败不应让服务起不来——
+        # 但要可见，否则"以为有备份其实没有"。
         pending = [m[0] for m in migrations if m[0] not in applied]
         if pending:
             try:
@@ -251,8 +244,8 @@ class MigrationRegistry:
         for name, stmts, _desc in migrations:
             if name in applied:
                 continue
-            # S4：每组迁移的全部语句 + 名字登记包进单个事务——
-            # 中途失败 → 整组回滚（不留半套表、不留名字），下次启动可完整重放。
+            # 每组迁移的全部语句 + 名字登记包进单个事务——
+            # 中途失败 → 整组回滚，下次启动可完整重放。
             async with self._db.transaction(ctx):
                 for sql in stmts.get(dialect, ()):
                     await self._db.execute(ctx, sql)
@@ -266,7 +259,7 @@ class MigrationRegistry:
 
 @plugin
 class Storage:
-    """agent.db 独立库 + 迁移。装配即建全量表（namespace=agent）。"""
+    """agent.db 独立库 + 迁移。装配即建全量表。"""
 
     name = "agent.storage"
     layer = "system"
@@ -283,20 +276,18 @@ class Storage:
         await self._ensure_events_columns(ctx, db)
 
     async def _ensure_events_columns(self, ctx, db: "SqliteDb") -> None:
-        """#5 可观测性：给**存量库**的 ``agent_events`` 容错补三列并建索引。
+        """#5 可观测性：给存量库的 ``agent_events`` 容错补三列并建索引。
 
-        新建库由 ``_EVENTS`` 的 DDL 直接带上；存量库走这里。**刻意不用迁移**：
-        ``MigrationRegistry.apply`` 无容错、失败整组回滚，而这三列在"已补过的库"上
-        会报 duplicate column ⇒ 整组回滚 ⇒ **服务起不来**（详见 ``agent/tables.py``
-        中 ``EVENTS_EXTRA_COLUMNS`` 的说明）。逐列独立容错 ⇒ 单列失败不影响其余；
-        全失败也只意味着这批账本缺列（``durable`` 会记 warning，不崩主链路）。
+         新建库由 ``_EVENTS`` 的 DDL 直接带上；存量库走这里。刻意不用迁移：
+         ``MigrationRegistry.apply`` 无容错、失败整组回滚，而这三列在"已补过的库"上
+         会报 duplicate column ⇒ 整组回滚 ⇒ 服务起不来。逐列独立容错 ⇒ 单列失败不影响其余；
+         全失败也只意味着这批账本缺列。
 
-        ★ **失败必须可见**（2026-10-04 补）：原实现是 ``except: continue`` **全静默**，
-        补列失败时表现为"``durable`` 写的关联列莫名其妙是空的"，排查时**日志里什么都没有**，
-        只能靠手工 ``PRAGMA table_info`` 才发现（本项目在记忆会话化时踩过同一类坑：
-        补列失败 ⇒ 功能不生效但零线索）。故真失败记 ``warning`` + 计数；
-        ``duplicate column`` 属**正常**幂等路径，不算失败（否则每次启动都误报）。
-        """
+         失败必须可见：原实现是 ``except: continue`` 全静默，
+         补列失败时表现为"``durable`` 写的关联列莫名其妙是空的"，排查时日志里什么都没有，
+         只能靠手工 ``PRAGMA table_info`` 才发现。故真失败记 ``warning`` + 计数；
+         ``duplicate column`` 属正常幂等路径，不算失败，否则每次启动都误报。
+         """
         added, failed = 0, []
         for col, decl in EVENTS_EXTRA_COLUMNS:
             try:
@@ -310,7 +301,7 @@ class Storage:
             await db.execute(ctx, EVENTS_REQUEST_INDEX, ())
         except Exception as exc:                 # noqa: BLE001 —— 索引失败不影响记账
             logger.warning("agent_events request_id 索引创建失败（审计仍可写，查询会慢）: %s", exc)
-        # 6.5（2026-10-04）：会话/run 维度索引（存量库补建，新库已由 _EVENTS DDL 带上）。
+        # 6.5：会话/run 维度索引。
         for _idx in (
             "CREATE INDEX IF NOT EXISTS idx_agent_events_session ON agent_events(session)",
             "CREATE INDEX IF NOT EXISTS idx_agent_events_run ON agent_events(run_id)",

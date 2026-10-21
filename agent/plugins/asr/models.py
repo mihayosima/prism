@@ -1,38 +1,37 @@
-"""模型清单、本地路径解析与（缺失时）懒下载。
+"""模型清单、本地路径解析与懒下载。
 
 为什么单独一个模块
 ------------------
-引擎加载逻辑（``providers.py``）只该关心"模型文件在哪、齐不齐"，
-不该知道文件名、URL、目录布局——那是**部署形态**，会随镜像源变动。
+引擎加载逻辑只该关心"模型文件在哪、齐不齐"，
+不该知道文件名、URL、目录布局——那是部署形态，会随镜像源变动。
 故此处把三件事集中登记：
 
-1. **清单**：哪几个模型、各自有哪些文件、分别从哪个 URL 取；
-2. **解析**：配置里的模型名 → 本地绝对路径（角色 → 路径）；
-3. **就绪判定/下载**：缺文件时可选自动补（``auto_download``）。
+1. 清单：哪几个模型、各自有哪些文件、分别从哪个 URL 取；
+2. 解析：配置里的模型名 → 本地绝对路径；
+3. 就绪判定/下载：缺文件时可选自动补。
 
-三个模型（阶段 0 已实测加载，结论见 ``docs/plugins/asr/语音输入能力方案-2026-10-14.md``）
+三个模型
 ----------------------------------------------------------------------------
-======================  =====================  ==========================  ==========
-角色                     模型                    文件                          用途
-======================  =====================  ==========================  ==========
-``streaming``            X-ASR chunk-480ms     encoder/decoder/joiner/tokens实时流式（模式 R）
-``file``                 SenseVoice int8model.int8.onnx/tokens  长录音离线（模式 F）
-``vad``                  silero_vad.onnx       单文件                      两通道共用切段
-======================  =====================  ==========================  ==========
+====================== ===================== ========================== ==========
+角色 模型 文件 用途
+====================== ===================== ========================== ==========
+``streaming`` X-ASR chunk-480ms encoder/decoder/joiner/tokens 实时流式
+``file`` SenseVoice int8model.int8.onnx/tokens 长录音离线
+``vad`` silero_vad.onnx 单文件 两通道共用切段
+====================== ===================== ========================== ==========
 
-★ **不要改用 k2-fsa releases 的 ``sherpa-onnx-x-asr-...-int8-2026-06-03``**：
-  其编码器 ONNX **缺 ``encoder_dims`` 等结构元数据**，
-  ``OnlineRecognizer.from_transducer`` 直接报
-  ``'encoder_dims' does not exist in the metadata`` 无法加载（fp32 同缺，根因在导出阶段）。
-  当前用的是上游官方**流式导出** ``chunk-480ms-model``（带完整元数据，cjkchar 分词）。
+不要改用 k2-fsa releases 的 ``sherpa-onnx-x-asr-...-int8-``：
+ 其编码器 ONNX 缺 ``encoder_dims`` 等结构元数据，
+ ``OnlineRecognizer.from_transducer`` 直接报
+ ``'encoder_dims' does not exist in the metadata`` 无法加载。
+ 当前用的是上游官方流式导出 ``chunk-480ms-model``。
 
-★ **默认下载源是 ``hf-mirror.com``**：实测 GitHub 直连仅 ~40–60KB/s（SenseVoice 的
-  fp32 包约 1GB，需 4h+），而 hf-mirror 峰值 ~2–3.7MB/s；``ghproxy.com`` 不可达、
-  ModelScope 的 k2-fsa 路径为空。``SENSE_VOICE`` 的 ``int8`` 量化版（239MB）
-  而非 fp32——精度对 ASR 足够、加载更快。
+默认下载源是 ``hf-mirror.com``：实测 GitHub 直连仅 ~40–60KB/s，而 hf-mirror 峰值 ~2–3.7MB/s；``ghproxy.com`` 不可达、
+ ModelScope 的 k2-fsa 路径为空。``SENSE_VOICE`` 的 ``int8`` 量化版
+ 而非 fp32——精度对 ASR 足够、加载更快。
 
-本模块**零 sherpa 依赖**（只用 stdlib），故配置解析与就绪判定在没装引擎的
-解释器上也能跑（端点据此给出"引擎不可用"而非崩服务）。
+本模块零 sherpa 依赖，故配置解析与就绪判定在没装引擎的
+解释器上也能跑。
 """
 
 from __future__ import annotations
@@ -48,13 +47,13 @@ from pathlib import Path
 
 logger = logging.getLogger("agent.plugins.asr.models")
 
-#: 模型根目录（相对项目根；与 ``run/chat.py`` 的 ``data/agent_chat.db`` 同一落点口径）。
+# : 模型根目录。
 DEFAULT_MODEL_ROOT = "data/asr_models"
 
-#: 切片识别时的目标采样率（sherpa 的 X-ASR / SenseVoice / silero VAD 均按 16k 训练）。
+# : 切片识别时的目标采样率。
 TARGET_SAMPLE_RATE = 16000
 
-#: 缺文件时单次下载尝试上限与单次 socket 超时（秒）。
+# : 缺文件时单次下载尝试上限与单次 socket 超时。
 _DOWNLOAD_TIMEOUT_S = 60
 _DOWNLOAD_RETRIES = 3
 
@@ -71,7 +70,7 @@ class ModelSpec:
     files: dict[str, str] = field(default_factory=dict)
 
     def paths(self, root: str | os.PathLike[str] = DEFAULT_MODEL_ROOT) -> dict[str, str]:
-        """角色 → 本地绝对路径（**不判断存在性**，存在性由 ``missing`` 判定）。"""
+        """角色 → 本地绝对路径。"""
         base = Path(root) / self.dir_name
         return {role: str(base / name) for role, name in self._local_names().items()}
 
@@ -79,13 +78,13 @@ class ModelSpec:
         return {role: os.path.basename(url.split("?", 1)[0]) for role, url in self.files.items()}
 
     def missing(self, root: str | os.PathLike[str] = DEFAULT_MODEL_ROOT) -> list[str]:
-        """缺失文件的角色列表（**空列表 = 就绪**）。"""
+        """缺失文件的角色列表。"""
         paths = self.paths(root)
         return [role for role, p in paths.items()
                 if not (Path(p).is_file() and Path(p).stat().st_size > 0)]
 
 
-#: 流式模型：上游官方 ``chunk-480ms-model``（hf-mirror 镜像的 GilgameshWind/X-ASR-zh-en）。
+# : 流式模型：上游官方 ``chunk-480ms-model``。
 STREAMING = ModelSpec(
     key="streaming",
     dir_name="sherpa-onnx-x-asr-zh-en-chunk-480ms",
@@ -97,7 +96,7 @@ STREAMING = ModelSpec(
     },
 )
 
-#: 长录音离线模型：SenseVoice **int8 量化**版（csukuangfj 镜像的散文件，非 .tar.bz2）。
+# : 长录音离线模型：SenseVoice int8 量化版。
 FILE_OFFLINE = ModelSpec(
     key="file",
     dir_name="sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
@@ -107,22 +106,22 @@ FILE_OFFLINE = ModelSpec(
     },
 )
 
-#: VAD：silero_vad.onnx（GitHub releases 直链即可，文件仅 ~0.6MB）。
-#: ★ ``dir_name=""`` ⇒ 文件**直落模型根目录**（``data/asr_models/silero_vad.onnx``），
-#:   不套子目录：``pathlib`` 忽略空串路径段，故 ``paths()`` 天然成立。
+# : VAD：silero_vad.onnx。
+# : ``dir_name=""`` ⇒ 文件直落模型根目录，
+# : 不套子目录：``pathlib`` 忽略空串路径段，故 ``paths()`` 天然成立。
 VAD = ModelSpec(key="vad", dir_name="",
                 files={"model": f"{_GH}/silero_vad.onnx"})
 
-#: 角色 → 清单。``streaming``/``file`` 的模型名可被配置覆盖（``model_root`` 下别的目录）。
+# : 角色 → 清单。``streaming``/``file`` 的模型名可被配置覆盖。
 SPECS: dict[str, ModelSpec] = {s.key: s for s in (STREAMING, FILE_OFFLINE, VAD)}
 
 
 def spec_for(key: str, model_name: str = "") -> ModelSpec:
-    """按角色取清单；``model_name`` 给了就用它当目录名（支持换用别的导出目录）。
+    """按角色取清单；``model_name`` 给了就用它当目录名。
 
-    ★ 这里刻意**不做版本兼容判断**：目录名即版本，同名目录被替换属于运维动作，
-    插件信任落盘内容（与 ``plugins.skills`` 信任 skill.md 目录同一姿态）。
-    """
+     这里刻意不做版本兼容判断：目录名即版本，同名目录被替换属于运维动作，
+     插件信任落盘内容。
+     """
     base = SPECS.get(key)
     if base is None:
         raise KeyError(f"未知的模型角色：{key!r}")
@@ -133,10 +132,10 @@ def spec_for(key: str, model_name: str = "") -> ModelSpec:
 
 def status(root: str | os.PathLike[str] = DEFAULT_MODEL_ROOT,
            overrides: dict[str, str] | None = None) -> dict:
-    """三个模型的落地状况（纯查询，**不触网、不加载**）⇒ status()/端点据此如实回报。
+    """三个模型的落地状况⇒ status()/端点据此如实回报。
 
-    返回 ``{角色: {"dir":..., "present": bool, "missing": [...]}}``。
-    """
+     返回 ``{角色: {"dir":..., "present": bool, "missing": [...]}}``。
+     """
     out: dict[str, dict] = {}
     for key, spec in SPECS.items():
         name = (overrides or {}).get(key) or ""
@@ -157,11 +156,10 @@ def ensure_ready(key: str, root: str | os.PathLike[str] = DEFAULT_MODEL_ROOT,
                  progress=None) -> None:
     """确保某角色的模型文件齐备；缺则按需下载。
 
-    - ``allow_download=False`` ⇒ 缺文件直接抛 ``FileNotFoundError``（离线部署语义）；
-    - ``progress`` 可选可调用对象（下载完成后收到一条描述，用于 WS ``loading`` 帧）；
-    - **下载落盘用临时文件 + 原子改名**：中途断网/被杀不会留下"看着像完整"的半截模型
-      （阶段 0 曾被半成品 tar.bz2 咬过一次：文件在、大小不对，加载才炸）。
-    """
+         - ``allow_download=False`` ⇒ 缺文件直接抛 ``FileNotFoundError``；
+         - ``progress`` 可选可调用对象；
+         - 下载落盘用临时文件 + 原子改名：中途断网/被杀不会留下"看着像完整"的半截模型。
+         """
     spec = spec_for(key, model_name)
     missing = spec.missing(root)
     if not missing:
@@ -191,11 +189,11 @@ def ensure_ready(key: str, root: str | os.PathLike[str] = DEFAULT_MODEL_ROOT,
 
 
 def _download(url: str, dest: Path, *, retries: int = _DOWNLOAD_RETRIES) -> None:
-    """单个模型文件下载（``Range`` 断点续传 + 临时文件原子落盘）。
+    """单个模型文件下载。
 
-    续传的意义来自实测：GitHub 直连 ~40–60KB/s，一个 500MB 文件中途断链是常态，
-    从零重下的代价远高于多试几次 ``Range``。
-    """
+     续传的意义来自实测：GitHub 直连 ~40–60KB/s，一个 500MB 文件中途断链是常态，
+     从零重下的代价远高于多试几次 ``Range``。
+     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     last_exc: Exception | None = None
     for attempt in range(1, retries + 1):
@@ -205,7 +203,7 @@ def _download(url: str, dest: Path, *, retries: int = _DOWNLOAD_RETRIES) -> None
             req.add_header("Range", f"bytes={have}-")
         try:
             with urllib.request.urlopen(req, timeout=_DOWNLOAD_TIMEOUT_S) as resp:
-                # 服务端不支持 Range 时会回 200（而非 206）⇒ 必须从头写，否则会拼出坏文件
+                # 服务端不支持 Range 时会回 200⇒ 必须从头写，否则会拼出坏文件
                 appending = have > 0 and getattr(resp, "status", 200) == 206
                 mode = "ab" if appending else "wb"
                 with open(dest, mode) as fh:
@@ -220,11 +218,11 @@ def _download(url: str, dest: Path, *, retries: int = _DOWNLOAD_RETRIES) -> None
 def read_audio(path: str | os.PathLike[str], target_sr: int = TARGET_SAMPLE_RATE):
     """读音频 → ``(单声道 float32 [-1,1], 原始采样率, 时长秒)``；必要时重采样。
 
-    ★ **格式支持以 libsndfile 为准**（``soundfile`` 的后端）：wav/flac/ogg/mp3 等；
-    **m4a/aac/wma 不支持**——不静默失败，端点据异常明确回报"不支持的格式"，
-    也不假装能读（曾有语音组件把解不动���格式当空音频返回，那是错的）。
-    多声道取各声道均值降为单声道（ASR 模型一律单声道输入）。
-    """
+     格式支持以 libsndfile 为准：wav/flac/ogg/mp3 等；
+     m4a/aac/wma 不支持——不静默失败，端点据异常明确回报"不支持的格式"，
+     也不假装能读。
+     多声道取各声道均值降为单声道。
+     """
     import numpy as np
     import soundfile as sf
 
@@ -238,13 +236,13 @@ def read_audio(path: str | os.PathLike[str], target_sr: int = TARGET_SAMPLE_RATE
 
 
 def resample(samples, src_sr: int, dst_sr: int):
-    """线性插值重采样（``numpy`` 实现，float32 in/out）。
+    """线性插值重采样。
 
-    ★ **诚实边界**：这是线性插值，**非带限重采样**，对 16k 目标而言在语音频段
-    误差可接受；但它不是 ``soxr``/``resampy`` 那种专业重采样。
-    需要更高保真（如把 44.1k 音乐性录音当素材）时属第二版替换点——**换实现即可，
-    调用点签名不变**。不做这件事就会在"采样率对齐"上悄悄引入混叠。
-    """
+     诚实边界：这是线性插值，非带限重采样，对 16k 目标而言在语音频段
+     误差可接受；但它不是 ``soxr``/``resampy`` 那种专业重采样。
+     需要更高保真时属第二版替换点——换实现即可，
+     调用点签名不变。不做这件事就会在"采样率对齐"上悄悄引入混叠。
+     """
     import numpy as np
 
     src = np.asarray(samples, dtype=np.float32)

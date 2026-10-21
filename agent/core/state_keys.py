@@ -1,50 +1,43 @@
-"""agent.core.state_keys —— ``ctx.state`` 跨插件共享键 SSOT（D3）。
+"""agent.core.state_keys —— ``ctx.state`` 跨插件共享键 SSOT。
 
-``ctx.state`` 是跨插件隐形共享面：键名裸字符串默契一旦改名即**静默失效**。
+``ctx.state`` 是跨插件隐形共享面：键名裸字符串默契一旦改名即静默失效。
 本模块把全部跨模块消费的键常量化——写方与读方一律 ``from agent.api import StateKeys``。
-守卫测试（tests/test_decouple_guards）断言这些值字面量只出现在本文件。
+守卫测试断言这些值字面量只出现在本文件。
 
 键目录：
-- ``BUDGET_SPENT``       budget 写、run/chat 状态栏读（容器生命周期累计已花 token）
-- ``BUDGET_PENDING_EST`` budget 写读（预借 est 按 caller 分槽：``dict[caller, est]``）
-- ``BUDGET_WARNING``     D1：budget 写、react 读（预算预警旗标 ``dict[at,spent,limit]``；
-                         与 PERMISSION_MODE 同款「状态键前向契约」——双方零直连）
-- ``LLM_COST_RATIO``     F1：budget 写、api.cost_factor/治理器消费方读（估算↔真实口径
-                         EWMA 校准因子 ``dict[model, dict[ratio, samples]]``）
-- ``REACT_RUN_ID``       F2：react 写、budget 读（当前 run 的归组键，落 agent_budget_log）。
-                         **R1（2026-10-02）起主读通道是 ContextVar**（``current_run_id()``，
-                         按 asyncio task 隔离 ⇒ 每请求独立）；本键仍照写，仅为兼容直接读
-                         state 的调用点。2.2 起值为 **task_id**（``{user}:{session}:{run}``）
-- ``SESSION_KEY``        2.2：run/chat 解析身份后写、approval 等读（当前会话 ``{user}:{session}``）。
-                         **R1（2026-10-02）起主读通道是 ContextVar**（``current_session_key()``，
-                         按请求隔离）；本键仍照写，仅为兼容直接读 state 的既有测试与调用点。
-                         它是**无参数线程化时**（waterfall 监听只收纯数据 payload，拿不到 ctx）
-                         判定「这次请求属于哪个会话」的唯一依据
-- ``REACT_LAST``         react 写、react.status 读（最近一次 run 摘要）
-- ``PERMISSION_MODE``    approval 写、react 读（档位 default/plan/auto/bypass）。
-                         **值是 ``dict[会话键, mode]``**（R1 补 2026-10-02 起分桶，与
-                         ``BUDGET_SPENT`` 同款）——此前是单值 str（会话级语义 + 容器级存储
-                         ⇒ A 切 bypass 会放行 B 在跑 run 的审批闸）。读写**一律**经内核助手
-                         ``permission_mode()`` / ``set_permission_mode()``（形状 SSOT，且
-                         容错识别遗留的 str 单值）
-- ``LOOP_RUNNING``       sys/loop 写读（在跑任务集合）
-- ``MCP_TOOLS/ERROR``    MCP 桥模板键：``.format(bridge="windows_mcp")`` 等
+- ``BUDGET_SPENT`` budget 写、run/chat 状态栏读
+- ``BUDGET_PENDING_EST`` budget 写读
+- ``BUDGET_WARNING`` D1：budget 写、react 读
+- ``LLM_COST_RATIO`` F1：budget 写、api.cost_factor/治理器消费方读
+- ``REACT_RUN_ID`` F2：react 写、budget 读。
+ R1 起主读通道是 ContextVar；本键仍照写，仅为兼容直接读
+ state 的调用点。2.2 起值为 task_id
+- ``SESSION_KEY`` 2.2：run/chat 解析身份后写、approval 等读。
+ R1 起主读通道是 ContextVar；本键仍照写，仅为兼容直接读 state 的既有测试与调用点。
+ 它是无参数线程化时
+ 判定「这次请求属于哪个会话」的唯一依据
+- ``REACT_LAST`` react 写、react.status 读
+- ``PERMISSION_MODE`` approval 写、react 读。
+ 值是 ``dict[会话键, mode]``——此前是单值 str。读写一律经内核助手
+ ``permission_mode()`` / ``set_permission_mode()``
+- ``LOOP_RUNNING`` sys/loop 写读
+- ``MCP_TOOLS/ERROR`` MCP 桥模板键：``.format(bridge="windows_mcp")`` 等
 """
 
 from __future__ import annotations
 
 
 class StateKeys:
-    """ctx.state 共享键（仅常量，禁止实例化）。"""
+    """ctx.state 共享键。"""
 
     BUDGET_SPENT = "budget_spent"
     BUDGET_PENDING_EST = "budget_pending_est"
-    BUDGET_WARNING = "budget_warning"        # D1：budget 写 / react 读（预警旗标，非直连）
-    LLM_COST_RATIO = "llm_cost_ratio"        # F1：budget 写 / cost_factor 读（口径校准 EWMA）
-    REACT_RUN_ID = "react_run_id"            # F2：react 写 / budget 读（归组键=task_id；R1 起读优先 ContextVar）
-    SESSION_KEY = "session_key"              # 2.2：run/chat 写 / approval 等读（R1 起读优先 ContextVar）
+    BUDGET_WARNING = "budget_warning"        # budget 写 / react 读
+    LLM_COST_RATIO = "llm_cost_ratio"        # budget 写 / cost_factor 读
+    REACT_RUN_ID = "react_run_id"            # react 写 / budget 读
+    SESSION_KEY = "session_key"              # 2.2：run/chat 写 / approval 等读
     REACT_LAST = "react_last"
-    PERMISSION_MODE = "permission_mode"      # approval 写 / react 读；值 = dict[会话键, mode]（R1 补：分桶）
+    PERMISSION_MODE = "permission_mode"      # approval 写 / react 读；值 = dict[会话键, mode]
     LOOP_RUNNING = "loop_running"
     MCP_TOOLS = "{bridge}_tools"             # 模板键：.format(bridge="windows_mcp") 等
     MCP_ERROR = "{bridge}_error"

@@ -1,14 +1,14 @@
-"""agent.core.context —— 服务仓 Context（slim Cordis）。
+"""agent.core.context —— 服务仓 Context。
 
 - 服务注册：``ctx.provide(key, value) -> detach``；D-3 同作用域重复注册抛冲突。
-- 服务读取：``ctx.<key>`` ≡ ``ctx.get(key, default)``；缺失属性读抛 ServiceNotFoundError（附可用键清单）。
-- 可逆副作用：``ctx.effect(disposer)``；作用域 teardown 逆序执行（对称卸载）。
+- 服务读取：``ctx.<key>`` ≡ ``ctx.get(key, default)``；缺失属性读抛 ServiceNotFoundError。
+- 可逆副作用：``ctx.effect(disposer)``；作用域 teardown 逆序执行。
 - 事件监听：``ctx.on / ctx.once``，依赖 ``events`` 服务；teardown 对称移除。
-- 子作用域：``ctx.child / ctx.scope``（GC 单元）。**当前生产代码仅 ``sys/progress.py`` 一处
-  在用**（SSE 订阅作用域），其余是预留能力——注意子 ctx 的 ``state`` **不继承父级**（见 ``child()``）。
+- 子作用域：``ctx.child / ctx.scope``。当前生产代码仅 ``sys/progress.py`` 一处
+  在用，其余是预留能力——注意子 ctx 的 ``state`` 不继承父级。
   插件级 ``capture/release`` 供容器对称回收。
 
-零业务词（test_agent_purity 守卫）。
+零业务词。
 """
 
 from __future__ import annotations
@@ -30,20 +30,19 @@ from .services_catalog import Services
 _MISSING: Any = object()
 
 # 当前插件 id：容器在装配/启动窗口内注入，监听 ctx 当前作用域。
-# 用 ContextVar 而非 ctx 上的普通属性——并发安全（多轮可并行互不串扰），
-# 且不再需要容器写私有属性（K5）。
+# 用 ContextVar 而非普通属性——并发安全，无需容器写私有属性。
 CURRENT_PLUGIN: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "agent_current_plugin", default=None
 )
 
 
 def current_plugin() -> str | None:
-    """当前插件 id（容器装配/启动窗口内有效）。"""
+    """当前插件 id。"""
     return CURRENT_PLUGIN.get()
 
 
 class State:
-    """作用域变量容器（``ctx.state``）：属性读写 + dict 语义二选一。"""
+    """作用域变量容器：属性读写 + dict 语义二选一。"""
 
     def __init__(self, data: Mapping[str, Any] | None = None):
         self.__dict__.update(data or {})
@@ -96,7 +95,7 @@ class _Effect:
 
 
 class Context:
-    """服务容器 + 作用域（根 ctx 无 parent；child/scope 沿父链解析服务）。"""
+    """服务容器 + 作用域。"""
 
     def __init__(self, parent: Context | None = None, name: str | None = None):
         self._parent = parent
@@ -130,7 +129,7 @@ class Context:
     # ---------- 服务容器 ----------
 
     def provide(self, key: str, value: Any) -> Callable[[], bool]:
-        """注册服务，返回 detach。D-3：同作用域重复注册抛 ServiceConflictError。"""
+        """注册服务，返回 detach；同作用域重复注册抛 ServiceConflictError。"""
         self._assert_open()
         if key in self._services:
             raise ServiceConflictError(key, self._name)
@@ -145,7 +144,7 @@ class Context:
         return detach
 
     def get(self, key: str, default: Any = None) -> Any:
-        """读取服务：自身 → 父链；关闭后只放行 default（防跨作用域泄漏）。"""
+        """读取服务：自身 → 父链；关闭后只放行 default。"""
         if self._closed:
             return default
         node: Context | None = self
@@ -159,7 +158,7 @@ class Context:
         return self.get(key, _MISSING) is not _MISSING
 
     def set(self, key: str, value: Any) -> None:
-        """覆盖已提供服务（就近沿父链）；未提供报错。"""
+        """覆盖已提供服务；未提供报错。"""
         self._assert_open()
         node: Context | None = self
         while node is not None:
@@ -170,7 +169,7 @@ class Context:
         raise ServiceNotFoundError(key, self._name, action="set（仅可覆盖已提供的服务）")
 
     def keys(self) -> list[str]:
-        """当前可见服务键集（父链去重），供诊断/可用清单。"""
+        """当前可见服务键集，供诊断/可用清单。"""
         seen: set[str] = set()
         node: Context | None = self
         while node is not None:
@@ -192,12 +191,12 @@ class Context:
         if key.startswith("_"):
             object.__setattr__(self, key, value)
             return
-        self.set(key, value)  # 非下划线写 = 覆盖已提供服务（未提供报错）
+        self.set(key, value)  # 非下划线写 = 覆盖已提供服务，未提供报错
 
     # ---------- 可逆副作用 ----------
 
     def effect(self, disposer: Callable[[], Any]) -> Callable[[], bool]:
-        """注册 disposer（sync/async 均可）；作用域结束逆序执行。返回 detach。"""
+        """注册 disposer；作用域结束逆序执行。返回 detach。"""
         self._assert_open()
         entry = _Effect(disposer)
         self._effects.append(entry)
@@ -210,11 +209,11 @@ class Context:
 
         return detach
 
-    # ---------- 事件监听注册（依赖 events 服务） ----------
+    # ---------- 事件监听注册 ----------
 
     def on(self, name: str, handler: Callable, *,
            prepend: bool = False, once: bool = False) -> Callable[[], bool]:
-        """注册事件监听器，绑定当前作用域（teardown 对称移除）。"""
+        """注册事件监听器，绑定当前作用域。"""
         events = self.get(Services.EVENTS)
         if events is None or not hasattr(events, "on"):
             raise ServiceNotFoundError(Services.EVENTS, self._name,
@@ -257,7 +256,7 @@ class Context:
         if errors:
             raise TeardownError(self._name, errors)
 
-    # ---------- 插件作用域捕获 / 回收（容器装配用） ----------
+    # ---------- 插件作用域捕获 / 回收 ----------
 
     def capture(self) -> tuple[frozenset[str], int]:
         """快照当前服务键集 + effect 数 → 标记一个插件的增量区间边界。"""
@@ -265,7 +264,7 @@ class Context:
         return (frozenset(self._services), len(self._effects))
 
     async def release(self, cap: tuple[frozenset[str], int]) -> None:
-        """回收插件区间：逆序执行该区间 effect + 卸载其新增服务（对称）。"""
+        """回收插件区间：逆序执行该区间 effect + 卸载其新增服务。"""
         self._assert_open()
         svc_before, eff_before = cap
         errors: list[BaseException] = []

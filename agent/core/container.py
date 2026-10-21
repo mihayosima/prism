@@ -1,14 +1,14 @@
-"""agent.core.container —— 插件装配容器（无特权内核 · slim Cordis）。
+"""agent.core.container —— 插件装配容器。
 
-- ``@plugin`` 装饰（类或函数）：name/inject/provides/layer/version 元数据；apply(ctx)→start(ctx)；
-  teardown 经 ctx.effect 对称展开（注册即逆）。
-- 依赖解析 = inject 拓扑（Kahn）；缺失给缺失清单；环报错；服务键唯一（D-3）。
-- 装配/启动按拓扑序；卸载逆序回收每插件（capture/release + effect 逆序）。
-- inject 的作用是**排序**（拓扑保证提供者先 apply）；内核**不校验**「读某服务前是否声明了
-  inject」——未声明且提供者恰好排在后面时，读到的就是 default（或属性读抛 ServiceNotFoundError）。
-  故「读什么就声明什么」属**纪律，非强制**（当前无任何运行时检查）。
+- ``@plugin`` 装饰：name/inject/provides/layer/version 元数据；apply(ctx)→start(ctx)；
+  teardown 经 ctx.effect 对称展开。
+- 依赖解析 = inject 拓扑；缺失给缺失清单；环报错；服务键唯一。
+- 装配/启动按拓扑序；卸载逆序回收每插件。
+- inject 的作用是排序，拓扑保证提供者先 apply；内核不校验「读某服务前是否声明了
+  inject」——未声明且提供者恰好排在后面时，读到的就是 default。
+  故「读什么就声明什么」属纪律，非强制，当前无任何运行时检查。
 
-零业务词（test_agent_purity 守卫）。
+零业务词。
 """
 
 from __future__ import annotations
@@ -64,28 +64,28 @@ class Plugin:
 
     @property
     def tables(self) -> list[str]:
-        """业务自带表（类属性 `tables`，控制台/插件页聚合用；缺省空）。"""
+        """业务自带表，类属性 `tables`，控制台/插件页聚合用；缺省空。"""
         if isinstance(self._raw, type):
             return list(getattr(self._raw, "tables", ()) or ())
         return []
 
     @property
     def params_schema(self) -> dict:
-        """任务参数声明（类属性 `params_schema`，可选）。
+        """任务参数声明。
 
-        ★ **当前无消费方**（2026-10-04 复核）：只透传到 :meth:`plugin_manifest`，
-        没有任何执行路径读它。**刻意保留**而非删除——它是 ``Plugin`` 的公开元数据面，
-        外部插件与控制台可能依赖；直接删会破坏兼容。
-        保留的同时把状态写清楚，免得后来人误以为"已经在生效"。
+                当前无消费方：只透传到 :meth:`plugin_manifest`，
+                没有任何执行路径读它。刻意保留而非删除——它是 ``Plugin`` 的公开元数据面，
+                外部插件与控制台可能依赖；直接删会破坏兼容。
+                保留的同时把状态写清楚，免得后来人误以为"已经在生效"。
 
-        真正的参数校验走另一条已生效的路径：``tasks.register(schema=...)``
-        → ``sys/tasks.py::validate_kwargs``（那个是真在跑的）。
-        """
+                真正的参数校验走另一条已生效的路径：``tasks.register(schema=...)``
+                → ``sys/tasks.py::validate_kwargs``。
+                """
         f = getattr(self._raw, "params_schema", None)
         return dict(f) if isinstance(f, dict) else {}
 
     def _obj(self) -> Any:
-        """类插件按需实例化（容器管理单例）；函数插件即函数本身。"""
+        """类插件按需实例化；函数插件即函数本身。"""
         if not self._apply_is_class:
             return self._raw
         if self._instance is None:
@@ -121,7 +121,7 @@ def plugin(
     provides: Sequence[str] | None = None,
     start: Callable[[Context], Any] | None = None,
 ) -> Any:
-    """``@plugin`` 装饰器：类（class-level 属性声明）或函数（函数体即 apply）。"""
+    """``@plugin`` 装饰器：类或函数。"""
     if arg is None:
         return lambda obj: _wrap_plugin(
             obj, name=name, version=version, inject=inject, provides=provides, start=start
@@ -168,7 +168,7 @@ class Container:
         self._order: list[Plugin] = []
         self._caps: dict[str, tuple[frozenset[str], int]] = {}
         self._assembled = False
-        # P3：capability 接缝接线校验开关（默认开；裸/裁剪容器显式 False 豁免）。
+        # 接线校验开关。
         self._verify_wiring = verify_wiring
 
     @property
@@ -180,15 +180,13 @@ class Container:
         return self._assembled
 
     def _wiring_required(self) -> set[str]:
-        """单源：装配期校验 + 运行期 waterfall 守卫共用的 required seam 集合。
-        verify_wiring=False → 返回空集，两处同时关闭，杜绝漂移。
-        """
+        """装配期校验与运行期守卫共用的 required seam 集合；verify_wiring=False 返回空集。"""
         if not self._verify_wiring:
             return set()
         return set(REQUIRED_SUBSCRIBER_EVENTS)
 
     def plugin_manifest(self) -> list[dict]:
-        """已装配插件清单（通用 introspection；供元数据/诊断展示）。"""
+        """已装配插件清单。"""
         return [
             {"id": p.id, "layer": p.layer, "inject": list(p.inject), "provides": list(p.provides),
              "version": p.version, "description": p.description,
@@ -197,10 +195,7 @@ class Container:
         ]
 
     async def plugin_statuses(self) -> list[dict]:
-        """可选自述状态钩子：插件类实现 ``async status(ctx) -> dict`` ⇒ 收集运行态摘要。
-
-        未实现 status 返回 None（诚实：不给笼统假状态）；单插件异常标注 error，不拖垮整批。
-        """
+        """收集插件 status(ctx) 的运行态摘要；未实现返回 None，单插件异常标 error。"""
         out: list[dict] = []
         for p in self._plugins.values():
             obj = p._obj()
@@ -215,7 +210,7 @@ class Container:
         return out
 
     def add(self, *entries: Any) -> None:
-        """登记插件（Plugin 实例 / @plugin 产物 / dict 描述）。可叠加多次。"""
+        """登记插件。可叠加多次。"""
         if self._assembled:
             raise AgentError("container already assembled; cannot add plugins")
         for entry in entries:
@@ -224,7 +219,7 @@ class Container:
                 raise AgentError(f"duplicate plugin id {p.id!r} (D-3 注册唯一)")
             self._plugins[p.id] = p
 
-    # ---------- 依赖解析（inject 拓扑） ----------
+    # ---------- 依赖解析 ----------
 
     def _resolve_order(self) -> list[Plugin]:
         providers: dict[str, str] = {}  # service key -> plugin id
@@ -272,14 +267,10 @@ class Container:
             raise CyclicDependencyError(_find_cycle(self._plugins, providers, remaining))
         return order
 
-    # ---------- 装配 / 启动 / 卸载（对称） ----------
+    # ---------- 装配 / 启动 / 卸载 ----------
 
     async def assemble(self) -> None:
-        """拓扑序 apply 全部插件。
-
-        失败回滚：任一插件 apply 抛错 → 先释放该插件已注册的部分 effect/服务（对称收尾，
-        如未闭合的资源句柄），再逆序回收已完成插件，root 收尾后可安全重建。
-        """
+        """拓扑序 apply 全部插件；任一插件失败则逆序回收已完成区间与插件，随后原样抛出。"""
         if self._assembled:
             raise AgentError("container already assembled")
         order = self._resolve_order()
@@ -290,7 +281,7 @@ class Container:
                 try:
                     await p.apply(self._root)
                 except BaseException:
-                    # 该插件部分已注册（如服务/effect）→ 释放其区间，防资源悬挂
+                    # 该插件部分已注册→ 释放其区间，防资源悬挂
                     try:
                         await self._root.release(cap)
                     except BaseException:  # noqa: BLE001
@@ -301,8 +292,7 @@ class Container:
                 self._caps[p.id] = cap
             self._order = order
             self._assembled = True
-            # P3：capability 接缝接线校验（装配期 fail-fast）+
-            #     同源注入 bus.required_seams（运行期 waterfall 守卫）。
+            # 接线校验：装配期 fail-fast + 同源注入运行期守卫。
             bus = self._root.get(Services.EVENTS)
             if bus is not None:
                 bus.required_seams = self._wiring_required()
@@ -333,7 +323,7 @@ class Container:
                 CURRENT_PLUGIN.reset(token)
 
     async def teardown(self) -> None:
-        """对称卸载：逆拓扑序回收每插件（effect 逆序 + 服务回收），随后 root 收尾。"""
+        """对称卸载：逆拓扑序回收每插件，随后 root 收尾。"""
         if not self._assembled:
             return
         errors: list[BaseException] = []
@@ -375,7 +365,7 @@ def _from_dict(entry: Any) -> Plugin:
 
 def _find_cycle(plugins: Mapping[str, Plugin], providers: Mapping[str, str],
                 remaining: Sequence[str]) -> list[str]:
-    """在残余（环内）节点中 DFS 找出一个可读环路径。"""
+    """在残余节点中 DFS 找出一个可读环路径。"""
     adj: dict[str, list[str]] = {}
     for pid in remaining:
         adj.setdefault(pid, [])

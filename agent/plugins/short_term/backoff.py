@@ -1,13 +1,12 @@
-"""agent.plugins.short_term.backoff —— 压缩失败递增退避状态机（纯类，可单测）。
+"""agent.plugins.short_term.backoff —— 压缩失败递增退避状态机。
 
-落实方案 §8：递增退避 1m→10m→1h→24h + 失败粒度（仅 execution 异常）+ 作用域（per plugin、
-按原因分类）+ 恢复探测（探测失败只续期不升级）+ 分批补偿（由 compactor 调度）。
+落实方案：递增退避 1m→10m→1h→24h + 失败粒度+ 作用域+ 恢复探测+ 分批补偿。
 
 设计要点：
-- 每失败原因（llm_error / db_error / truncate_error / unknown）独立计数与暂停；
+- 每失败原因独立计数与暂停；
 - 连续失败 1/2/3/≥4 → 暂停 1/10/60/1440 分钟；
-- 某原因成功一次 → 清零（不退化为"永远惩罚"）；
-- 恢复探测失败时**只续期**当前暂停（不累加 count、不升级档位）。
+- 某原因成功一次 → 清零；
+- 恢复探测失败时只续期当前暂停。
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ import time
 from typing import Callable
 
 
-# 连续失败次数 → 暂停分钟数（索引 = 次数-1，封顶最后一档）
+# 连续失败次数 → 暂停分钟数
 DEFAULT_SCHEDULE = (1, 10, 60, 1440)
 
 
@@ -33,14 +32,14 @@ class BackoffState:
     # ---- 查询 ----
 
     def should_attempt(self, reason: str) -> bool:
-        """该原因当前是否可尝试（暂停期内返回 False）。"""
+        """该原因当前是否可尝试。"""
         st = self._state.get(reason)
         if st is None:
             return True
         return self._now() >= st["pause_until"]
 
     def current_tier_minutes(self, reason: str) -> int:
-        """该原因当前档位（分钟）；无状态返回 0。"""
+        """该原因当前档位；无状态返回 0。"""
         st = self._state.get(reason)
         if st is None:
             return 0
@@ -62,11 +61,11 @@ class BackoffState:
         return tier
 
     def record_success(self, reason: str) -> None:
-        """成功一次 → 清零该原因（退回 1m 档，不再惩罚）。"""
+        """成功一次 → 清零该原因。"""
         self._state.pop(reason, None)
 
     def record_probe_failure(self, reason: str) -> int:
-        """恢复探测失败 → **仅续期**当前暂停（不累加 count、不升级档位）。返回续期后档位。"""
+        """恢复探测失败 → 仅续期当前暂停。返回续期后档位。"""
         st = self._state.get(reason)
         if st is None:
             return 0

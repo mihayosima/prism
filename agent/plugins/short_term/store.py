@@ -1,11 +1,11 @@
-"""agent.plugins.short_term.store —— 短期记忆内容层存储（会话历史 + 滚动摘要）。
+"""agent.plugins.short_term.store —— 短期记忆内容层存储。
 
-职责（内容层，归短期记忆插件所有）：
-- 对话历史 ``agent_messages`` 的读取（seq ASC，含完整原文——**截短/摘要都不改写它**）；
-- 滚动摘要 ``agent_session_summaries`` 的读写（``covers_up_to_seq`` 标记覆盖到哪条）。
+职责：
+- 对话历史 ``agent_messages`` 的读取；
+- 滚动摘要 ``agent_session_summaries`` 的读写。
 
-零特权：只经注入的 ``ctx.db``（SqliteDb），不碰内核内部、不依赖其它记忆层。
-``token_count`` 写入时预估（chat 写入）；读时若为 NULL（旧消息）即时退回 ``estimate_tokens``，
+零特权：只经注入的 ``ctx.db``，不碰内核内部、不依赖其它记忆层。
+``token_count`` 写入时预估；读时若为 NULL 即时退回 ``estimate_tokens``，
 保证预算计算始终有值。
 """
 
@@ -17,33 +17,33 @@ from agent.api import estimate_tokens, now_iso
 
 
 class SessionSummaryStore:
-    """短期记忆内容存储：历史 + 摘要（均按 session_id 隔离）。
+    """短期记忆内容存储：历史 + 摘要。
 
-    **本类是 ``agent_messages`` / ``agent_session_summaries`` 两表的唯一归属者**：
-    会话转写的写入、读取、清除一律经此，消费方（chat 等）不得自行拼 SQL 直连，
-    以免"内容层 owner"形同虚设、多套实现漂移。
-    """
+ 本类是 ``agent_messages`` / ``agent_session_summaries`` 两表的唯一归属者：
+ 会话转写的写入、读取、清除一律经此，消费方不得自行拼 SQL 直连，
+ 以免"内容层 owner"形同虚设、多套实现漂移。
+ """
 
     def __init__(self, db: Any):
         self._db = db
 
-    # ---- 历史写入（唯一入口） ----
+    # ---- 历史写入 ----
 
     async def append(self, ctx: Any, session_id: str, role: str, content: str) -> None:
-        """追加一条会话转写（token_count 写入时预估，读时无需再算）。"""
+        """追加一条会话转写。"""
         await self._db.execute(
             ctx, "INSERT INTO agent_messages"
                  " (session_id, role, content, at, token_count) VALUES (?,?,?,?,?)",
             (session_id, role, content, now_iso(), estimate_tokens(content)))
 
-    # ---- 历史读取（原文始终完整） ----
+    # ---- 历史读取 ----
 
     async def get_history(self, ctx: Any, session_id: str) -> list[dict]:
-        """全量历史（seq ASC）：含 seq/role/content/token_count。
+        """全量历史：含 seq/role/content/token_count。
 
-        token_count 为 NULL 时即时退回 ``estimate_tokens(content)``，保证预算有值。
-        原文绝不在此被改写（截短/摘要走窗口内视图 / 独立摘要表）。
-        """
+ token_count 为 NULL 时即时退回 ``estimate_tokens(content)``，保证预算有值。
+ 原文绝不在此被改写。
+ """
         rows = await self._db.query(
             ctx, "SELECT seq, role, content, token_count FROM agent_messages "
                  "WHERE session_id=? ORDER BY seq ASC", (session_id,))
@@ -58,7 +58,7 @@ class SessionSummaryStore:
 
     async def get_original_messages(self, ctx: Any, session_id: str,
                                    start_seq: int, end_seq: int) -> list[dict]:
-        """按需调取原文（审计 / 回溯）：完整、未截短。"""
+        """按需调取原文：完整、未截短。"""
         rows = await self._db.query(
             ctx, "SELECT seq, role, content FROM agent_messages "
                  "WHERE session_id=? AND seq BETWEEN ? AND ? ORDER BY seq ASC",
@@ -68,7 +68,7 @@ class SessionSummaryStore:
     # ---- 摘要读写 ----
 
     async def latest_summary(self, ctx: Any, session_id: str) -> str | None:
-        """当前生效的滚动摘要文本（可能为 None）。"""
+        """当前生效的滚动摘要文本。"""
         rows = await self._db.query(
             ctx, "SELECT summary FROM agent_session_summaries WHERE session_id=?",
             (session_id,))
@@ -84,7 +84,7 @@ class SessionSummaryStore:
     async def upsert_summary(self, ctx: Any, session_id: str, *,
                              summary: str, version: int,
                              covers_up_to_seq: int, tokens: int) -> None:
-        """写摘要（version 显式递增，由调用方算好）。"""
+        """写摘要。"""
         await self._db.execute(
             ctx,
             "INSERT INTO agent_session_summaries"
@@ -103,10 +103,10 @@ class SessionSummaryStore:
                  "WHERE session_id=? AND seq <= ? AND compressed_into IS NULL",
             (up_to_seq, session_id, up_to_seq))
 
-    # ---- 历史读取：对外视图（chat 等消费方经此，不直连 SQL） ----
+    # ---- 历史读取：对外视图 ----
 
     async def history(self, ctx: Any, session_id: str, limit: int | None = None) -> list[dict]:
-        """会话转写（seq ASC，含 seq/role/content/at）。limit 为 None 表示不限。"""
+        """会话转写。limit 为 None 表示不限。"""
         sql = ("SELECT seq, role, content, at FROM agent_messages "
                "WHERE session_id=? ORDER BY seq ASC")
         args: list = [session_id]
@@ -117,19 +117,19 @@ class SessionSummaryStore:
         return [dict(r) for r in rows]
 
     async def recent(self, ctx: Any, session_id: str, limit: int) -> list[dict]:
-        """最近 N 条（返回仍按 seq ASC，便于直接当上下文序列）。"""
+        """最近 N 条。"""
         rows = await self._db.query(
             ctx, "SELECT seq, role, content, at FROM agent_messages WHERE session_id=?"
                  " ORDER BY seq DESC LIMIT ?", (session_id, limit))
         return [dict(r) for r in reversed(rows)]
 
-    # ---- 会话清除（级联摘要，避免摘要残留注入已删历史） ----
+    # ---- 会话清除，级联摘要，避免摘要残留注入已删历史 ----
 
     async def delete_session(self, ctx: Any, session_id: str) -> int:
-        """清除会话：历史 + 滚动摘要**同一事务**，返回删除的历史条数。
+        """清除会话：历史 + 滚动摘要同一事务，返回删除的历史条数。
 
-        若不级联清摘要，``reset`` 后下一轮仍会把"已被删掉的历史"的前情注入模型。
-        """
+ 若不级联清摘要，``reset`` 后下一轮仍会把"已被删掉的历史"的前情注入模型。
+ """
         rows = await self._db.query(
             ctx, "SELECT COUNT(*) AS n FROM agent_messages WHERE session_id=?", (session_id,))
         n = int(rows[0]["n"]) if rows else 0

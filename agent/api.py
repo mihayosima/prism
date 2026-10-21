@@ -1,7 +1,6 @@
-"""agent.api —— 内核公共命名空间（唯一出口）。
+"""内核公共命名空间，各层一律经此导入内核符号，不直接 import 具体实现。
 
-agent 本体只准 ``from agent.api import …``；禁止 ``from agent.core import …`` 或具体实现导入。
-包边界即依赖边界。零业务词（test_agent_purity 守卫）。
+包边界即依赖边界。
 """
 
 from agent import __agent_milestone__, __version__
@@ -33,11 +32,7 @@ from agent.core.obs import (bind_request_id, configure_logging, counters_snapsho
                             new_request_id, trace_fields)
 from agent.core.request_cost import (estimate_request_cost, wire_messages,
                                      wire_tools)
-# 沙箱 confinement 后端（P0 骨架）：插件/传输层只被允许 import agent.api，而 api 不得
-# import agent.sys ⇒ 需被插件构造的**机制**必须落 core（机制 = 零业务词，如本模块）。
-# NullBackend/select_backend 供 plugins.sandbox 驱动 enforcement（不再硬编码天花板）。
-# ★ 2026-10-14 辨界：此纪律只对**机制**成立——业务特性代码（如 Skill 插件系统）不得
-# 据此沉入 core，已归位 plugins/skills（设计文档三层语义）；api 不再导出任何技能类。
+# 沙箱 confinement 后端，供 plugins.sandbox 驱动隔离档位。
 from agent.core.sandbox_backend import (BACKENDS, BRIDGE_PORTABILITY, STRENGTHS,
                                         BackendUnavailable, ConfinementBackend,
                                         ContainerBackend, NullBackend, SpawnOptions,
@@ -56,9 +51,8 @@ from agent.core.state_keys import StateKeys
 from agent.core.tokens import (clip_json, clip_text, clip_text_hard, estimate_tokens,
                                guard_source)
 
-# ---- 提示词标记 SSOT（D4）-------------------------------------------------
-# 离线 FixtureLlm 据系统提示中的标记路由确定性响应；生产侧（chat/memory/react）
-# 与夹具侧（fixtures/llm.py）一律引用本处常量，禁止第三处书写 `<!--...-->` 字面量。
+# ---- 提示词标记 ----------------------------------------------------
+# 离线 FixtureLlm 按系统提示里的这些标记路由确定性响应，字面量只在此处定义一份。
 MARK_CHAT_PLAN = "<!--chat:plan-->"
 MARK_CHAT_ANSWER = "<!--chat:answer-->"
 MARK_MEMORY_EXTRACT = "<!--memory:extract-->"
@@ -66,24 +60,21 @@ MARK_REACT_TURN = "<!--react:turn-->"
 MARK_REACT_FINAL = "<!--react:final-->"
 
 
-# ---- G2（会话级）：配置视图接缝名 ------------------------------------------
-# 适配层（run/*）把 ``view(section, session_key) -> dict`` 挂到该键上；插件侧
-# ``ctx.get(SESSION_CFG_VIEW)`` **软取**，缺失即退化为容器级配置（行为等价、不裸崩）。
-# 之所以放内核：插件不得 import 适配层，接缝名必须双方可见且不产生反向依赖。
+# ---- 配置视图接缝名 ------------------------------------------------
+# 适配层把 view(section, session_key) 挂到该键上，插件侧软取，取不到就退回容器级配置。
 SESSION_CFG_VIEW = "session.cfg_view"
 
-# ---- F1：口径校准因子（budget 写 LLM_COST_RATIO，消费方经本助手只读）----------
+# ---- 成本校准因子 --------------------------------------------------
 
-_COST_RATIO_CLAMP = (0.5, 3.0)          # 防异常样本把窗口裁到不可用/彻底放开
-_COST_RATIO_MIN_SAMPLES = 5             # 冷启动样本不足不启用（宁裸估算，不引入抖动）
+_COST_RATIO_CLAMP = (0.5, 3.0)          # 防异常样本把窗口裁到不可用或彻底放开
+_COST_RATIO_MIN_SAMPLES = 5             # 样本不足时不做校准
 
 
 def cost_factor(ctx, default: float = 1.0) -> float:
-    """估算→真实口径的校准因子（EWMA，按模型分桶；budget 维护，消费方只读）。
+    """读取估算成本的校准因子，真实计费约为估算值乘以该因子。
 
-    语义：``真实计费 ≈ 估算 × factor``。样本不足 / 未维护 / 读取异常 → 1.0
-    （退回裸估算现状，不劣化）。消费点：budget 预借判定、治理器装配预算。
-    """
+ 样本不足、未维护或读取异常时返回 default。
+ """
     try:
         stats = ctx.state.get(StateKeys.LLM_COST_RATIO) or {}
         model = (((getattr(ctx, "config", None) or {}).get("agent") or {})
@@ -93,23 +84,12 @@ def cost_factor(ctx, default: float = 1.0) -> float:
         if r <= 0 or int(m.get("samples") or 0) < _COST_RATIO_MIN_SAMPLES:
             return float(default)
         return min(_COST_RATIO_CLAMP[1], max(_COST_RATIO_CLAMP[0], r))
-    except Exception:                   # noqa: BLE001 —— 因子读取失败退裸估算，绝不阻断
+    except Exception:                   # noqa: BLE001 —— 读不到就按 default 走，不阻断
         return float(default)
 
 
-# ---- 权限档位（PERMISSION_MODE）的读写助手 ------------------------------------
-# 为什么放内核出口：该键有**两个互不相识的消费方**——approval（判定闸门）与 react
-# （工具可见性裁剪 + 状态上报）。若各自判断值形态，就会出现第二处实现（形状 SSOT 破裂）。
-# R1 补（2026-10-02）：值由**单值 str** 改为 ``dict[会话键, mode]``（与 BUDGET_SPENT 同款
-# 分桶）——此前是「会话级语义 + 容器级存储」⇒ A 会话切 bypass 会放行 B 会话在跑 run 的
-# 审批闸。读写两侧经本处归一，**已存在的 str 旧值仍被识别**（视作容器级默认）以兼容直接
-# 写 state 的既有调用点与测试。
-
-#: 权限档位助手已下沉到 ``agent.core.permissions``（内核层），此处**原样再导出**：
-#: 一是保持既有调用点（approval / react / guard）零改动；二是让 ``core`` 侧的公共组件
-#: 也能取用——api 不得反向依赖 sys，而插件与传输层又只能经 api 消费，故这类共用原语
-#: 必须落在 core。（★ 2026-10-14：权限档位本身即内核机制——与技能特性无关；技能目录
-#: 已归位 ``plugins/skills``，不再作为本处留核的理由。）
+# ---- 权限档位读写 --------------------------------------------------
+# 值是 dict[会话键, mode]，读写两侧在此归一；历史遗留的 str 值仍按容器级默认识别。
 from agent.core.permissions import current_permission_mode, set_permission_mode
 
 __all__ = [
@@ -127,7 +107,7 @@ __all__ = [
     # services
     "Services",
     "SERVICE_KEYS",
-    # 沙箱 confinement 后端（core/sandbox_backend；plugins.sandbox 经本出口取用）
+    # 沙箱 confinement 后端
     "SpawnOptions",
     "ConfinementBackend",
     "NullBackend",
@@ -140,15 +120,15 @@ __all__ = [
     "to_wsl_path",
     "BACKENDS",
     "STRENGTHS",
-    # P8：目标可移植性（桥能否在某个后端下跑；不可移植 ⇒ 降级 off 并暴露）
+    # 桥能否在某个后端下跑
     "BRIDGE_PORTABILITY",
     "runnable_in",
     "is_portable",
     "unportable_bridges",
     "call_spawn_provider",
-    # ctx.state 共享键（跨插件契约）
+    # ctx.state 共享键
     "StateKeys",
-    # 会话/租户身份原语（阶段 2.2；实现位于 core/session，纯值对象 + 纯函数）
+    # 会话与租户身份
     "SessionIdentity",
     "SessionIdError",
     "build_task_id",
@@ -158,25 +138,23 @@ __all__ = [
     "DEFAULT_TENANT",
     "DEFAULT_USER",
     "DEFAULT_SESSION",
-    # R1（请求作用域绑定）：旁路会话键/归组键的强隔离原语。消费点多为**无 ctx 入参**
-    # 的事件回调或装配期捕获的 ctx，故必须有一处公共原语可读（实现位于 core/session）。
+    # 绑定当前请求所属的会话与 run
     "set_current_session_key",
     "current_session_key",
     "set_current_run_id",
     "current_run_id",
-    # G2（会话级）：配置视图接缝名（适配层注入 / 插件软取）
+    # 配置视图接缝名
     "SESSION_CFG_VIEW",
-    # G2（会话级）：作用域配置**纯规则**（实现位于 core/scope_config；适配层经本出口取用，
-    # 不得直连 core——分层守卫 test_layered_import_direction 对此有硬断言）
+    # 作用域配置
     "DEFAULT_SESSION_LIMIT",
     "merge_overrides",
     "section_of",
     "touch",
     "evict_lru",
-    # 审计公共面（D4 转正；实现位于 core/audit）
+    # 审计公共面
     "durable",
     "now_iso",
-    # 可观测性（路线图 #5；实现位于 core/obs）：请求标识贯穿 + 结构化日志 + 进程计数器
+    # 请求标识、结构化日志与进程计数器
     "bind_request_id",
     "ensure_request_id",
     "current_request_id",
@@ -185,30 +163,30 @@ __all__ = [
     "configure_logging",
     "inc_counter",
     "counters_snapshot",
-    # F1：口径校准因子（budget 维护 / 消费方经 api 只读）
+    # 成本校准因子
     "cost_factor",
-    # 权限档位的形状容错读写（approval 与 react 两个消费方共用，避免形状判断分叉）
+    # 权限档位读写
     "current_permission_mode",
     "set_permission_mode",
-    # MCP stdio 客户端（实现位于 core/mcp_client；业务插件一律经本出口）
+    # MCP stdio 客户端
     "McpStdioClient",
-    # MCP inputSchema → 内核 task schema 的保真转换（S6/P2：enum/anyOf/default 不丢）
+    # MCP inputSchema → 内核 task schema 的保真转换
     "build_task_schema",
-    # token 原语（实现位于 core/tokens；插件/系统层一律经本出口，不得直连 core）
+    # token 估算与截断
     "estimate_tokens",
     "estimate_request_cost",
     "clip_text",
     "clip_json",
     "clip_text_hard",
     "guard_source",
-    # 请求装配原语（实现位于 core/request_cost；供 sys 层经本出口取用）
+    # 请求装配
     "wire_messages",
     "wire_tools",
-    # 配置归一/校验（实现位于 core/config_schema；装配根 profiles 经本出口取用）
+    # 配置归一与校验
     "coerce_config",
     "validate_config",
     "DEFAULT_DB_PATH",
-    # 提示词标记 SSOT（D4：离线 fixture 据此路由；`<!--` 字面量只许出现在本文件）
+    # 提示词标记 SSOT
     "MARK_CHAT_PLAN",
     "MARK_CHAT_ANSWER",
     "MARK_MEMORY_EXTRACT",
@@ -222,7 +200,7 @@ __all__ = [
     "REQUIRED_SUBSCRIBER_EVENTS",
     "EventDispatchError",
     "EventWiringError",
-    # 能力接缝契约（业务经此导入，不 import 实现）
+    # 能力接缝契约
     "LlmProvider",
     "ReactResultLike",
     # errors

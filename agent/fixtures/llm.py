@@ -1,10 +1,10 @@
-"""agent.fixtures.llm —— 离线确定性 LLM 夹具（零触网）。
+"""agent.fixtures.llm —— 离线确定性 LLM 夹具。
 
 按 system prompt 里的标记路由到 canned 结构化响应，
-保证：同一输入 → 同一输出（离线确定性）。
+保证：同一输入 → 同一输出。
 标记：chat:plan · chat:answer · memory:extract ·
-      react:turn（脚本化 tool_calls）· react:final（触顶收尾）。
-常量单一真相源在 agent.api（MARK_*，D4）。
+ react:turn· react:final。
+常量单一真相源在 agent.api。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from agent.api import (
 
 
 def _plan(user_text: str) -> dict:
-    """chat 规划 canned：按关键词路由（离线确定性）。"""
+    """chat 规划 canned：按关键词路由。"""
     t = (user_text or "").lower()
     if any(k in t for k in ("ping", "健康", "在吗")):
         return {"intent": "ping"}
@@ -34,9 +34,9 @@ def _plan(user_text: str) -> dict:
 def _route(messages: list[dict]) -> tuple[str, str]:
     """按角色取文：路由关键词只看用户消息，标记只看系统提示。
 
-    只拼接 **str** 内容：ReAct 的观察回灌消息 content 是 dict（tool_results），
-    不能参与关键词/标记匹配。
-    """
+     只拼接 str 内容：ReAct 的观察回灌消息 content 是 dict，
+     不能参与关键词/标记匹配。
+     """
     sys_text = ""
     user_text = ""
     for msg in messages or []:
@@ -60,15 +60,14 @@ def _route(messages: list[dict]) -> tuple[str, str]:
     return "default", ""
 
 
-# ---- ReAct 脚本化路由（离线确定性：同一输入 → 同一 tool_calls 序列） ----
+# ---- ReAct 脚本化路由 ----
 
 
 def _react_state(messages: list[dict]) -> tuple[int, str]:
     """(已完成轮数, 原始请求)。
 
-    轮数 = 已追加的带 tool_calls 的 assistant 消息数；请求 = **最后一个 str 用户消息**
-    （ReAct 的观察回灌是 dict content，不参与）。
-    """
+         轮数 = 已追加的带 tool_calls 的 assistant 消息数；请求 = 最后一个 str 用户消息。
+         """
     rounds = 0
     prompt = ""
     for msg in messages or []:
@@ -81,7 +80,7 @@ def _react_state(messages: list[dict]) -> tuple[int, str]:
 
 
 def _react_reply(messages: list[dict]) -> dict:
-    """按请求关键词 + 当前轮数给出脚本化回复（含 tool_calls 或最终答复）。"""
+    """按请求关键词 + 当前轮数给出脚本化回复。"""
     rounds, prompt = _react_state(messages)
     t = prompt.lower()
     if "两步" in prompt or "two-step" in t:
@@ -106,19 +105,19 @@ def _react_reply(messages: list[dict]) -> dict:
         return {"text": "", "tool_calls": [
             {"id": f"call_{rounds}", "name": "test.echo", "arguments": {"text": "loop"}}]}
     if "推进到顶" in prompt:
-        # ★ 每轮**参数递进**（故不触发无进展检测的启发式1），用于验证「跑满步数闸」
-        #   本身的用例。**不是**给「触顶」分支用的：那个被 8+ 个用例共用，其中
-        #   test_no_progress 的 A/B 依赖它每轮同参来触发启发式1 ⇒ 不能改它。
-        #   客观上「12 步同参同返回」本就是原地打转，被无进展检测拦下是对的。
+        # 每轮参数递进，用于验证「跑满步数闸」
+        # 本身的用例。不是给「触顶」分支用的：那个被 8+ 个用例共用，其中
+        # test_no_progress 的 A/B 依赖它每轮同参来触发启发式 1 ⇒ 不能改它。
+        # 客观上「12 步同参同返回」本就是原地打转，被无进展检测拦下是对的。
         return {"text": "", "tool_calls": [
             {"id": f"call_{rounds}", "name": "test.echo",
              "arguments": {"text": f"iter{rounds}"}}]}
-    if "多调用" in prompt:                    # 一步内多个调用（曾误伤无进展检测）
-        # ★ 必须复现真实误伤条件：**参数不同但返回内容相同**。
-        #   实测误伤源于 `tool_search` 连续检索不同关键词、返回**高度相似的候选列表文本**
-        #   ⇒ `hash(content)` 自然相同。若参数/内容都不同（初版用 test.echo 回显 q0..q3），
-        #   旧判据也不命中 ⇒ 用例测不到缺陷（已实测：破坏实验全绿）。
-        #   另：参数全同会命中**启发式1**（真死循环，判对），也会掩盖启发式2 的缺陷。
+    if "多调用" in prompt:                    # 一步内多个调用
+        # 必须复现真实误伤条件：参数不同但返回内容相同。
+        #   实测误伤源于 `tool_search` 连续检索不同关键词、返回高度相似的候选列表文本
+        #   ⇒ `hash(content)` 自然相同。若参数/内容都不同，
+        #   旧判据也不命中 ⇒ 用例测不到缺陷。
+        #   另：参数全同会命中启发式1，也会掩盖启发式2 的缺陷。
         if rounds == 0:
             return {"text": "", "tool_calls": [
                 {"id": f"call_{i}", "name": "test.same", "arguments": {"q": f"kw{i}"}}
@@ -141,10 +140,10 @@ def _react_reply(messages: list[dict]) -> dict:
 class FixtureLlm:
     """离线确定性 Provider。label='fixture'；interface_version=(1,0)。
 
-    路由：chat:plan → 规划 canned；chat:answer → 解说 canned；memory:extract → 记忆抽取 canned；
-    react:turn → ReAct 脚本化（tool_calls/final）；react:final → 触顶收尾 canned。
-    ``tools`` 在本 provider 下被忽略（脚本化，不解析真实工具目录）。
-    """
+     路由：chat:plan → 规划 canned；chat:answer → 解说 canned；memory:extract → 记忆抽取 canned；
+     react:turn → ReAct 脚本化；react:final → 触顶收尾 canned。
+     ``tools`` 在本 provider 下被忽略。
+     """
 
     interface_version = (1, 0)
     label = "fixture"
@@ -168,7 +167,7 @@ class FixtureLlm:
         else:
             result = {"text": "（fixture 默认响应）"}
 
-        # B5.2 离线切帧：stream 开启且非结构化调用 → 把散文切成 4 片依次 emit
+        # 离线切帧：stream 开启且非结构化"，fixture 默认响应" → 把散文切成 4 片依次 emit
         stream_on = bool((((ctx.config or {}).get("agent") or {}).get("llm") or {}).get("stream", True))
         text = result.get("text")
         if stream_on and schema is None and isinstance(text, str) and text:

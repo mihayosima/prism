@@ -1,8 +1,8 @@
-"""agent.sys.loop —— 裁决驱动主循环（loop-as-plugin）。
+"""agent.sys.loop —— 裁决驱动主循环。
 
 - ``AgentDriver`` 协议：消费方只依赖接口，不依赖具体 loop 实现 —— 换驱动 = 换插件。
-- ``ProduceDriver``：跑一次 task（``tasks.resolve`` → ``run(ctx,**params)``）：
-  重叠 skip + deadline 上限 + 单次异常捕获（不 kill 调度）。
+- ``ProduceDriver``：跑一次 task：
+ 重叠 skip + deadline 上限 + 单次异常捕获。
 """
 
 from __future__ import annotations
@@ -16,11 +16,11 @@ from agent.api import Services, StateKeys, plugin
 
 
 class AgentDriver(Protocol):
-    """驱动协议（loop-as-plugin：换驱动 = 换插件，消费方只依赖接口）。
+    """驱动协议。
 
-    ``cancel`` / ``when_idle`` 为 B6 恢复的能力（详见《B5B6-流式与取消-设计方案.md》）：
-    取消在**任意 await 点**即时生效；``when_idle`` 等驱动进入空闲，供优雅停止与 A4 提问时机用。
-    """
+ ``cancel`` / ``when_idle`` 为 B6 恢复的能力：
+ 取消在任意 await 点即时生效；``when_idle`` 等驱动进入空闲，供优雅停止与 A4 提问时机用。
+ """
 
     async def run(self, ctx, *, task: str, params: dict) -> "RunResult": ...
     async def cancel(self) -> None: ...
@@ -37,11 +37,11 @@ class RunResult:
 
 
 class ProduceDriver:
-    """裁决驱动：执行一次任务（简化 target 模型——任务=注册表里可调用的目标）。"""
+    """裁决驱动：执行一次任务。"""
 
     def __init__(self):
-        self._running: dict[str, asyncio.Task] = {}      # task 名 -> 在跑的 asyncio 任务（供 cancel）
-        self._idle = asyncio.Event()                     # S7：空闲信号（替代轮询）
+        self._running: dict[str, asyncio.Task] = {}      # task 名 -> 在跑的 asyncio 任务
+        self._idle = asyncio.Event()                     # 空闲信号
         self._idle.set()
 
     async def run(self, ctx, *, task: str, params: dict | None = None) -> RunResult:
@@ -54,7 +54,7 @@ class ProduceDriver:
         cur = asyncio.current_task()
         if cur is not None:
             self._running[task] = cur
-        self._idle.clear()                               # S7：有任务在跑 → 非空闲
+        self._idle.clear()                               # 有任务在跑 → 非空闲
         try:
             entry = ctx.tasks.resolve(ctx, task)
             if entry is None:
@@ -71,7 +71,7 @@ class ProduceDriver:
             running.discard(task)
             self._running.pop(task, None)
             if not self._running:
-                self._idle.set()                         # S7：全部结束 → 空闲
+                self._idle.set()                         # 全部结束 → 空闲
 
     async def cancel(self) -> None:
         """取消全部在跑的任务——`Task.cancel()` 在任意 await 点即时生效。"""
@@ -79,7 +79,7 @@ class ProduceDriver:
             t.cancel()
 
     async def when_idle(self) -> None:
-        """等待驱动进入空闲（无在跑任务）。供优雅停止与 A4 提问时机使用。"""
+        """等待驱动进入空闲。供优雅停止与 A4 提问时机使用。"""
         if not self._running:
             return
         await self._idle.wait()
@@ -87,7 +87,7 @@ class ProduceDriver:
 
 @plugin
 class Loop:
-    """ctx.loop —— 主循环（裁决驱动）。loop-as-plugin：可换另一个 driver 插件。"""
+    """ctx.loop —— 主循环。loop-as-plugin：可换另一个 driver 插件。"""
 
     name = "agent.loop"
     layer = "system"
