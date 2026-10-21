@@ -17,11 +17,6 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 
-[project.urls]
-Homepage = "https://github.com/mihayosima/prism"
-Repository = "https://github.com/mihayosima/prism"
-Issues = "https://github.com/mihayosima/prism/issues"
-
 # ★ 2026-10-04：依赖从"只有下限"改为"**上下界区间**"。
 # 原先全是 `>=`，意味着上游任何破坏性升级都会直接打到生产（构建不可复现）。
 # 区间写法：`>=` 保灵活性（能吃到补丁/次版本修复），`<` 挡住破坏性大版本。
@@ -45,6 +40,14 @@ dependencies = [
     #   缺它时端点在 Starlette 解析阶段就 500，连"插件未启用"的 503 都发不出去。
     "python-multipart>=0.0.9,<0.1",
 ]
+
+# 注意：``[project.urls]`` 必须排在 ``dependencies`` **之后**——TOML 里表头之后的
+# 所有键都归该表，放前面会把 dependencies 数组吞成 urls 的一个键，
+# setuptools 直接报 ``project.urls.dependencies must be string``。
+[project.urls]
+Homepage = "https://github.com/mihayosima/prism"
+Repository = "https://github.com/mihayosima/prism"
+Issues = "https://github.com/mihayosima/prism/issues"
 
 # ★ ASR 引擎运行时（**可选**）：三件套加起来数百 MB，且只在真的要用语音识别时才需要。
 #   装法：``pip install -e ".[asr]"``；不装时 ``plugins.asr`` **不崩服务**——
