@@ -194,6 +194,15 @@ class Element extends Node {
     this.value = ''
     this.disabled = false
   }
+  // 真实 <select> 有 options（HTMLOptionsCollection）。Vue 的 vModelSelect.setSelected
+  // 会读 `el.options.length` 遍历；桩若不提供，SkillsView 的 <select v-model> 一挂载就抛
+  // `Cannot read properties of undefined (reading 'length')`。空数组即可让遍历跳过
+  // （本桩不渲染 option 元素，SkillsView 的 risk 下拉本就是静态三项）。
+  get options() {
+    if (this.tagName !== 'SELECT') return undefined
+    if (!this._options) this._options = []
+    return this._options
+  }
   // Vue insertStaticContent 依赖 <template> 的 .content（惰性 DocumentFragment）
   get content() {
     if (this.tagName !== 'TEMPLATE') return undefined

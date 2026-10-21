@@ -143,6 +143,14 @@ class Element extends Node {
     this._listeners = new Map()
     this.scrollTop = 0; this.scrollHeight = 0; this.clientHeight = 0
   }
+  // 真实 <select> 有 options（HTMLOptionsCollection）。Vue 的 vModelSelect.setSelected
+  // 会读 `el.options.length` 遍历；桩若不提供，DOM 里 5 个 <select v-model>（settings/skills）
+  // 一挂载就抛 `Cannot read properties of undefined (reading 'length')`。空数组即可让遍历跳过。
+  get options() {
+    if (this.tagName !== 'SELECT') return undefined
+    if (!this._options) this._options = []
+    return this._options
+  }
   get id() { return this._attr.id || '' }
   set id(v) { this._attr.id = v }
   get className() { return this._attr.class || '' }

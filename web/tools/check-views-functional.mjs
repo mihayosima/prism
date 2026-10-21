@@ -172,6 +172,15 @@ class Element extends Node {
     this._checked = false
     this.disabled = false
   }
+  // 真实 <select> 有 options（HTMLOptionsCollection）。Vue 的 vModelSelect.setSelected
+  // 会读 `el.options.length` 遍历；桩若不提供，各视图的 <select v-model> 一挂载就抛
+  // `Cannot read properties of undefined (reading 'length')`。空数组即可让遍历跳过
+  // （本桩的 value getter 自己解析 <option>，不需要 options 承载）。
+  get options() {
+    if (this.tagName !== 'SELECT') return undefined
+    if (!this._options) this._options = []
+    return this._options
+  }
   // ★ 表单值：v-html 写在属性上，读的时候要能拿到（桩的 value 曾恒空 ⇒ 误报「回填失败」）
   get value() {
     if (this.tagName === 'SELECT' && this._value === '') {
