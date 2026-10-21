@@ -9,7 +9,7 @@
  统一互斥+ 刚性超限双通道标注 + 剩余回吐；
  chat 的 plan / narrate / prior 均经此装配。
  S3/G2：循环内上下文治理——循环预算口径
- 
+
  + 块内准备原语 ``clip_head_tail``+ messages 块通用 ``pinned``
  条目支持。
  G3–G5：MCP 源头护栏 / 记忆注入配额反推 / 工具块降载。

@@ -16,7 +16,7 @@
  create_stream_session() -> StreamSession | None
  refine(text) -> str 首版 passthrough
  vad -> VadModule | None
- describe() -> dict 
+ describe() -> dict
 
 诚实性纪律：``describe()`` 必须报告真实能力——
 模型没下载就报 ``ready=False`` 并列出缺什么，绝不返回一个"看起来能用"的

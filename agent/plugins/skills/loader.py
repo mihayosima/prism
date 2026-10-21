@@ -62,7 +62,7 @@ def _parse_meta(meta: str) -> dict:
          - ``key: value`` 单行标量
          - ``key: [a, b]`` 行内列表
          - ``key: |`` / ``key: >`` YAML 块标量：其后缩进更深的行整体作为值
- 
+
 
          块标量是为 Agent Skills 标准补的：标准里 ``description`` 常写成多行触发说明，是模型做 Match 的唯一依据；若被截断成
          首行，命中率会明显下降。
