@@ -28,7 +28,7 @@ classifiers = [
 # 重新生成锁：`uv pip compile pyproject.toml --python-version 3.12 -o requirements.lock`
 # （--no-header 不写命令注释，便于 diff；带 dev 依赖时加 `--all-extras`）
 dependencies = [
-    "fastapi>=0.142,<1.0",
+    "fastapi>=0.146.0,<1.0",
     # ★ 必须带 [standard] extras：ASR 的实时通道（/api/asr/ws）需要 uvicorn 的
     #   WebSocket 协议实现，而它**不在基础依赖里**（裸装 uvicorn 时 `websockets`/
     #   `wsproto` 都没有 ⇒ 握手直接 404，且 TestClient 仍全绿 ⇒ 极难定位）。
