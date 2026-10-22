@@ -29,7 +29,7 @@ numpy==2.5.4
     # via
     #   agent-runtime (pyproject.toml)
     #   soundfile
-opentelemetry-api==1.45.0
+opentelemetry-api==1.45.1
 pydantic==2.14.1
 pydantic-core==2.50.1
 python-multipart==0.0.32
