@@ -11,7 +11,7 @@
 #   - 委派触发率 = SUBAGENT_SPAWN / REACT_START
 
 cd "$(dirname "$0")/.." || exit 1
-PY=<用户主目录>/.workbuddy/binaries/python/versions/3.13.12.old.27804/python.exe
+PY="${PYTHON:-python}"
 
 # ★ 库选择：真实运行数据在 **agent_chat.db**（chat/前端那条链）；agent.db 是
 #   早期遗留、几乎无数据（曾误查它导致"只有 1 条"的假象）。可用 DB 环境变量覆盖。
