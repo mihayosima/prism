@@ -37,7 +37,7 @@ python-multipart==0.0.32
 redis==8.1.0
 sherpa-onnx==1.13.8
     # via agent-runtime (pyproject.toml)
-sherpa-onnx-core==1.13.8
+sherpa-onnx-core==2.0.0
     # via sherpa-onnx
 soundfile==0.14.0
     # via agent-runtime (pyproject.toml)
