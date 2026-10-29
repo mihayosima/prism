@@ -66,7 +66,7 @@ dev = [
     "soundfile>=0.13,<0.15",
 ]
 asr = [
-    "sherpa-onnx>=1.13,<2.0",     # 本地推理引擎（自带 onnxruntime，wheel 较大）
+    "sherpa-onnx>=2.0.0,<3.0",     # 本地推理引擎（自带 onnxruntime，wheel 较大）
     "soundfile>=0.13,<0.15",      # 读 wav/音频文件（模式 F 输入解码）
     "numpy>=1.26,<3.0",           # VAD 分段与 PCM 处理
 ]
